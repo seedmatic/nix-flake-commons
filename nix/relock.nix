@@ -50,7 +50,9 @@ pkgs.writeShellApplication {
   name = "relock";
   runtimeInputs = [
     pkgs.coreutils
-    pkgs.git
+    # gitMinimal: on darwin, nixpkgs' full `git` drags a ~12.8 GB closure (apple-sdk, clang,
+    # cctools) — measured on rke2lab's deploy. relock needs plain git and nothing else.
+    pkgs.gitMinimal
     pkgs.jq
     pkgs.nix
   ];
