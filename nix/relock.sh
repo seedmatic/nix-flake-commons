@@ -285,10 +285,39 @@ regen_artifact() { # $1 app
   fi
 }
 
+# `nix flake update` in $1 for the inputs that follow; its stderr lands in `update_err`.
+# Returns 1 when nix fails, and 2 when it SUCCEEDS on a stale copy.
+#
+# ⚠️ The second case is the dangerous one. Measured 2026-10-07 on ndh's private `claude-hub` input:
+# the GitHub API answered 404 Not Found, nix printed "using cached version" and exited 0, the lock
+# came out unchanged, and relock reported "already current" — on an input three commits behind its
+# branch. A fetch that did not happen must never read as one that found nothing new.
+update_err=""
+nix_update() {
+  local dir=$1 err rc=0
+  shift
+  err=$(mktemp)
+  ( cd "$dir" && nix "${registry_flag[@]}" flake update "$@" --refresh ) >/dev/null 2>"$err" || rc=1
+  if [ "$rc" = 0 ] && grep -qE 'using cached version|unable to download' "$err"; then rc=2; fi
+  update_err=$(grep -vE '^evaluation warning' "$err" || true)
+  rm -f "$err"
+  return "$rc"
+}
+
 relock_input() { # $1 input name
   printf '  %-18s ' "$1"
-  if ! ( cd "$REPO" && nix "${registry_flag[@]}" flake update "$1" --refresh ) >/dev/null 2>&1; then
+  local rc=0
+  nix_update "$REPO" "$1" || rc=$?
+  if [ "$rc" = 1 ]; then
+    git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to resolve"
+    printf '%s\n' "$update_err" | sed 's/^/    /' >&2
+    return 1
+  fi
+  if [ "$rc" = 2 ]; then
+    git -C "$REPO" checkout -q -- flake.lock
+    echo "FAILED to fetch — nix fell back to a cached copy, so the bump is NOT carried"
+    printf '%s\n' "$update_err" | grep -E 'using cached version|unable to download|error|status' | sed 's/^/    /' >&2
     return 1
   fi
   if git -C "$REPO" diff --quiet -- flake.lock; then
@@ -509,7 +538,12 @@ if [ "$do_catalog" = 1 ] && [ -n "$CATALOG" ]; then
   # The catalog branch is a different checkout with its own committed registry, so the pin is
   # re-resolved for it rather than inherited from the main one.
   set_registry_flag "$CATALOG"
-  ( cd "$CATALOG" && nix "${registry_flag[@]}" flake update @selfPinName@ --refresh )
+  if ! nix_update "$CATALOG" @selfPinName@; then
+    git -C "$CATALOG" checkout -q -- flake.lock
+    echo "FAILED: the catalog could not re-resolve @selfPinName@ (nix failed, or fell back to a cache):" >&2
+    printf '%s\n' "$update_err" | sed 's/^/    /' >&2
+    exit 1
+  fi
   pin_after=$(lockrev "$CATALOG/flake.lock" @selfPinName@)
   if [ "$pin_before" != "$pin_after" ]; then
     git -C "$CATALOG" commit -q -m "chore(flake): relock @selfPinName@ -> ${pin_after:0:9}" -- flake.lock

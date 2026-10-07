@@ -49,6 +49,12 @@ case "$*" in
       nested) jq '.nodes.x.locked.rev = "x2"' flake.lock > l && mv l flake.lock ;;
       path)   jq '.nodes.a.locked = {"type":"path","path":"/somewhere/local"}' flake.lock > l && mv l flake.lock ;;
       garbage) echo 'not json at all' > flake.lock ;;
+      # What nix does when a fetch fails and it has a copy: warn, keep going, exit 0.
+      cached)  echo "warning: error: unable to download 'https://api.github.com/repos/o/r/commits/HEAD': HTTP error 404; using cached version" >&2 ;;
+      cached-moved)
+        jq '.nodes.a.locked.rev = "stale"' flake.lock > l && mv l flake.lock
+        echo "warning: unable to download 'https://api.github.com/repos/o/r/commits/HEAD'" >&2 ;;
+      failing) echo "error: cannot fetch" >&2; exit 1 ;;
     esac ;;
   *) echo "fake nix: unexpected call: $*" >&2; exit 99 ;;
 esac
@@ -311,4 +317,32 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
   [ "$status" -eq 2 ]
   [[ "$output" == *"contradict"* ]]
   never_updated
+}
+
+@test "a fetch that fell back to a CACHE is a failure, never 'already current'" {
+  # The ndh/claude-hub case: 404 on the API, a cached copy, exit 0, an unchanged lock.
+  STUB_HAS_PACKAGES=true STUB_UPDATE=cached run "$T/relock" --no-push inputs
+  [[ "$output" == *"FAILED to fetch"*"cached copy"* ]]
+  [[ "$output" == *"using cached version"* ]]
+  [[ "$output" != *"already current"* ]]
+  [ "$(relock_commits)" -eq 0 ]
+  tree_clean
+  lock_unchanged
+}
+
+@test "a cache fallback that DID rewrite the lock is restored, not carried" {
+  STUB_HAS_PACKAGES=true STUB_UPDATE=cached-moved run "$T/relock" --no-push inputs
+  [[ "$output" == *"FAILED to fetch"* ]]
+  [[ "$output" != *"BUMPED"* ]]
+  [ "$(relock_commits)" -eq 0 ]
+  tree_clean
+  lock_unchanged
+}
+
+@test "a failing update says why, with nix's own error" {
+  STUB_HAS_PACKAGES=true STUB_UPDATE=failing run "$T/relock" --no-push inputs
+  [[ "$output" == *"FAILED to resolve"* ]]
+  [[ "$output" == *"cannot fetch"* ]]
+  [ "$(relock_commits)" -eq 0 ]
+  tree_clean
 }
