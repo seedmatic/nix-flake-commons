@@ -18,7 +18,9 @@ setup() {
   mkdir -p "$T/bin" "$T/remote/seedmatic"
   sed '/^export PATH=/d' "$RELOCK" > "$T/relock"
   sed '/^export PATH=/d' "$RELOCK_ON_BRANCH" > "$T/relock-on-branch"
-  chmod +x "$T/relock" "$T/relock-on-branch"
+  sed '/^export PATH=/d' "$RELOCK_GITHUB" > "$T/relock-github"
+  for g in GRAPH_A CYCLE_B CHAIN_B CHAIN_C; do v="RELOCK_$g"; sed '/^export PATH=/d' "${!v}" > "$T/relock-$g"; done
+  chmod +x "$T/relock" "$T/relock-on-branch" "$T/relock-github" "$T"/relock-GRAPH_A "$T"/relock-CYCLE_B "$T"/relock-CHAIN_B "$T"/relock-CHAIN_C
 
   # The fake nix. It records every call, and answers each question relock asks. Its shebang is the
   # bash on PATH, not /usr/bin/env: the Linux build sandbox does not promise /usr/bin/env.
@@ -40,6 +42,15 @@ case "$*" in
   # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
   *".program"*"getContext"*) echo '[]' ;;
   *"fake:consumer#apps."*"relock.program"*) printf '%s' "$T/bin/consumer-relock" ;;
+  *"github:seedmatic/"*"relock.program"*)
+    case "${STUB_GRAPH:-}:$*" in
+      cycle:*"github:seedmatic/peer#"*) printf '%s' "$T/relock-CYCLE_B" ;;
+      cycle:*"github:seedmatic/t#"*)    printf '%s' "$T/relock-GRAPH_A" ;;
+      chain:*"github:seedmatic/peer#"*) printf '%s' "$T/relock-CHAIN_B" ;;
+      chain:*"github:seedmatic/peer2#"*) printf '%s' "$T/relock-CHAIN_C" ;;
+      chain:*"github:seedmatic/t#"*)    printf '%s' "$T/relock-GRAPH_A" ;;
+      *) printf '%s' "$T/bin/consumer-relock" ;;
+    esac ;;
   *"regen-x.program"*) printf '%s' "$T/bin/regen-x" ;;
   *"#apps."*)     [ -n "${STUB_REGEN:-}" ] && echo '["regen-x"]' || echo '[]' ;;
   *"#packages."*) printf '{"p":"/nix/store/%s.drv"}\n' "$(cat "$T/drv")" ;;
@@ -520,4 +531,51 @@ LOCK
   [ "$status" -ne 0 ]
   [ -s "$T/visited-path" ]
   [ ! -e "$(cat "$T/visited-path")" ]
+}
+
+@test "a github: consumer is skipped when its EXACT key is listed — plain, orphan by /branch, orphan by ?ref=" {
+  printf 'seedmatic/peer\nseedmatic/peer:orphan/x\nseedmatic/peer2:feat/y\n' > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+    run "$T/relock-github" --downstream inputs
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'already visited in this pass — not relaunched' <<<"$output")" -eq 3 ]
+  [ ! -f "$T/child-env.consumer" ]
+}
+
+@test "a github: consumer whose key is listed in ANOTHER form is relaunched — keys must match exactly" {
+  printf 'github:seedmatic/peer\nseedmatic/peer:\nseedmatic/peer/orphan/x\nseedmatic/peer2\n' > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+    run "$T/relock-github" --downstream inputs
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'not relaunched' <<<"$output")" -eq 0 ]
+  [ -f "$T/child-env.consumer" ]
+}
+
+# Bare remotes for the peers: a requested relock CLONES its repo, here through the same insteadOf.
+peers() {
+  for r in "$@"; do
+    git clone -q --bare "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/$r.git"
+    git config --global url."$T/remote/seedmatic/$r.git".insteadOf "file:///nonexistent/seedmatic/$r.git"
+  done
+}
+
+@test "transitive: a github: cycle A <-> B turns once — B does not relaunch A" {
+  peers peer
+  STUB_GRAPH=cycle STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+    run "$T/relock-GRAPH_A" --downstream inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"relock(peer): not inside this repo — cloning"* ]]
+  [[ "$output" == *"github:seedmatic/t"*"already visited in this pass — not relaunched"* ]]
+  [ "$(grep -c '^DONE$' <<<"$output")" -eq 2 ]
+}
+
+@test "transitive: a github: chain A -> B -> C reaches C from A, each once, and C does not relaunch A" {
+  peers peer peer2
+  STUB_GRAPH=chain STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+    run "$T/relock-GRAPH_A" --downstream inputs
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'relock(peer): not inside this repo' <<<"$output")" -eq 1 ]
+  [ "$(grep -c 'relock(peer2): not inside this repo' <<<"$output")" -eq 1 ]
+  [[ "$output" == *"github:seedmatic/t"*"already visited in this pass — not relaunched"* ]]
+  [ "$(grep -c '^DONE$' <<<"$output")" -eq 3 ]
 }

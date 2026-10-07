@@ -29,6 +29,10 @@
   url,
   # Who to REQUEST on `--downstream`. This is the one fact a repo cannot read off its own lock: a lock
   # says who I consume, never who consumes me.
+  #
+  # Name a branch ONLY for an orphan (`github:owner/repo/<branch>`): the visited list of a pass keys a
+  # consumer by `owner/repo[:<branch>]`, the key that consumer's own relock records, and relock cannot
+  # know a consumer's default branch — so `github:owner/repo/develop` would never match `owner/repo`.
   consumers ? [ ],
   # Extra pathspecs the dirty-guard must ignore, because relock rewrites them itself. `flake.lock` is
   # always ignored; these are the repo's generated artifacts (dataplan.json, …).
@@ -51,6 +55,21 @@
   # one consumer's artifacts is the wrong way round.
   aliases ? { },
 }:
+let
+  # The branch a `github:` consumer reference names, if any: `owner/repo/<branch>` or `?ref=<branch>`.
+  refBranch =
+    c:
+    let
+      path = builtins.match "github:[^/?]+/[^/?]+/([^?]+).*" c;
+      query = builtins.match "github:[^?]*[?](.*&)?ref=([^&]+).*" c;
+    in
+    if path != null then builtins.head path else if query != null then builtins.elemAt query 1 else null;
+  namesDefault = c: builtins.elem (refBranch c) [ "develop" "main" ];
+  offending = builtins.filter namesDefault consumers;
+in
+# The rule is kept, not hoped for: a consumer naming its default branch would never match the key its
+# own relock records, and a --downstream cycle through it would never be seen as visited.
+assert offending == [ ] || throw "mkRelockApp(${name}): consumers name a default branch (${builtins.concatStringsSep ", " offending}) — name a branch ONLY for an orphan";
 pkgs.writeShellApplication {
   name = "relock";
   runtimeInputs = [

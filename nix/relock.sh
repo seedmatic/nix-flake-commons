@@ -42,7 +42,9 @@ Reconcile this repo's derived, committed artifacts. No target = ALL of them.
   catalog           the catalog branch's pin of this repo, if it has one
 
 An input bump that moves no exported derivation is DROPPED, not carried.
---downstream then REQUESTS each declared consumer's own relock.
+--downstream then REQUESTS each declared consumer's own relock, itself with --downstream: ONE such run
+reconciles and PUSHES the whole chain, each repo once (a visited list ends the cycles). Review a
+chain by walking it by hand with --no-push instead.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
 
@@ -683,15 +685,17 @@ fi
 # lock, we run the consumer's OWN relock. Off by default — it mutates another repo.
 consumers=(@consumers@)
 skipped=()
-# A consumer reference's key in the visited list: `github:owner/repo[/ref]` -> `owner/repo[:ref]`,
-# the same key that repo's own relock records. Anything else is its own key.
+# A consumer reference's key in the visited list — the key that repo's own relock records:
+# `github:owner/repo` -> `owner/repo`, and an orphan, `github:owner/repo/<branch>` or
+# `github:owner/repo?ref=<branch>`, -> `owner/repo:<branch>` (a branch may contain slashes).
+# Anything that is not `github:` is its own key.
 ref_key() {
-  local r=${1#github:} ref=""
-  r=${r%%\?*}
-  case $r in
-    */*/*) ref=${r#*/*/}; r=${r%/"$ref"} ;;
-  esac
-  if [ "$1" = "${1#github:}" ]; then printf '%s\n' "$1"; else printf '%s\n' "$r${ref:+:$ref}"; fi
+  local r=${1#github:} ref="" q="" t
+  if [ "$r" = "$1" ]; then printf '%s\n' "$1"; return; fi
+  case $r in *\?*) q=${r#*\?}; r=${r%%\?*} ;; esac
+  case $r in */*/*) ref=${r#*/*/}; r=${r%/"$ref"} ;; esac
+  case "&$q" in *"&ref="*) t=${q#*ref=}; ref=${t%%&*} ;; esac
+  printf '%s\n' "$r${ref:+:$ref}"
 }
 if [ "$downstream" = 1 ]; then
   echo "== downstream: request each consumer's own relock =="
@@ -712,7 +716,7 @@ if [ "$downstream" = 1 ]; then
       echo "FAILED — cannot evaluate $c (its error is above)"
     elif [ "$has_relock" != true ]; then
       echo "exposes no #relock yet — skipped (that app is THAT repo's to add)"
-    elif prog=$(app_program "$c#apps.@system@.relock") && "$prog"; then
+    elif prog=$(app_program "$c#apps.@system@.relock") && "$prog" --downstream; then
       echo "  ^ $c done"
     else
       echo "  ^ FAILED — $c's relock exited non-zero (its output is above)"

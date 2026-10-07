@@ -128,6 +128,29 @@
             pushFirstBranch = "first";
             catalogBranch = "cat";
           };
+          # Consumers in every form production uses, so the visited-list key is exercised on
+          # the real path — `github:`, an orphan by `/<branch>`, an orphan by `?ref=`.
+          underTestGithub = self.lib.mkRelockApp {
+            inherit pkgs;
+            name = "t";
+            slug = "seedmatic/t";
+            url = "file:///nonexistent/seedmatic/t.git";
+            consumers = [
+              "github:seedmatic/peer"
+              "github:seedmatic/peer/orphan/x"
+              "github:seedmatic/peer2?ref=feat/y&dir=z"
+            ];
+          };
+          # A --downstream graph made of REAL relocks, wired in `github:` as production is: the fake
+          # nix maps each consumer reference to one of these (STUB_GRAPH picks cycle or chain).
+          peerRelock = name: slug: consumers: self.lib.mkRelockApp {
+            inherit pkgs name slug consumers;
+            url = "file:///nonexistent/${slug}.git";
+          };
+          graphA = peerRelock "t" "seedmatic/t" [ "github:seedmatic/peer" ];
+          cycleB = peerRelock "peer" "seedmatic/peer" [ "github:seedmatic/t" ];
+          chainB = peerRelock "peer" "seedmatic/peer" [ "github:seedmatic/peer2" ];
+          chainC = peerRelock "peer2" "seedmatic/peer2" [ "github:seedmatic/t" ];
           # The same repo's OTHER flake, the one on an orphan branch.
           underTestOnBranch = self.lib.mkRelockApp {
             inherit pkgs;
@@ -141,11 +164,35 @@
           nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq ];
           RELOCK = "${underTest}/bin/relock";
           RELOCK_ON_BRANCH = "${underTestOnBranch}/bin/relock";
+          RELOCK_GITHUB = "${underTestGithub}/bin/relock";
+          RELOCK_GRAPH_A = "${graphA}/bin/relock";
+          RELOCK_CYCLE_B = "${cycleB}/bin/relock";
+          RELOCK_CHAIN_B = "${chainB}/bin/relock";
+          RELOCK_CHAIN_C = "${chainC}/bin/relock";
         } ''
           export HOME=$TMPDIR
           bats --print-output-on-failure ${./nix/relock.bats}
           touch $out
         '';
+
+      # A consumer naming its default branch is refused when the app is EVALUATED, in both forms.
+      checks.relock-refuses-default-branch =
+        let
+          refused = c: !(builtins.tryEval (self.lib.mkRelockApp {
+            inherit pkgs; name = "t"; slug = "seedmatic/t"; url = "file:///x"; consumers = [ c ];
+          }).drvPath).success;
+          accepted = c: (builtins.tryEval (self.lib.mkRelockApp {
+            inherit pkgs; name = "t"; slug = "seedmatic/t"; url = "file:///x"; consumers = [ c ];
+          }).drvPath).success;
+        in
+        assert refused "github:o/r/develop";
+        assert refused "github:o/r/main";
+        assert refused "github:o/r?ref=develop";
+        assert refused "github:o/r?dir=x&ref=main";
+        assert accepted "github:o/r";
+        assert accepted "github:o/r/seed-incluster";
+        assert accepted "github:o/r?ref=feature/ssot-manifest";
+        pkgs.runCommand "relock-refuses-default-branch" { } "touch $out";
 
       apps.relock = {
         type = "app";
