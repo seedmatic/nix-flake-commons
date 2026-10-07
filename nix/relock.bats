@@ -39,6 +39,10 @@ case "$*" in
   *"? relock"*)
     [ "${STUB_CONSUMER:-absent}" = absent ] && { echo false; exit 0; }
     echo true ;;
+  # The impact projection of the apps: each app's program context.
+  *"getContext a.program"*)
+    [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
+    printf '{"relock":["/nix/store/%s.drv"]}\n' "$(cat "$T/app-drv")" ;;
   # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
   *".program"*"getContext"*) echo '[]' ;;
   *"fake:consumer#apps."*"relock.program"*) printf '%s' "$T/bin/consumer-relock" ;;
@@ -57,6 +61,8 @@ case "$*" in
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
+      # flake-commons shipping a new relock: only an app's program moves, no package does.
+      app-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo app2 > "$T/app-drv" ;;
       nested) jq '.nodes.x.locked.rev = "x2"' flake.lock > l && mv l flake.lock ;;
       path)   jq '.nodes.a.locked = {"type":"path","path":"/somewhere/local"}' flake.lock > l && mv l flake.lock ;;
       garbage) echo 'not json at all' > flake.lock ;;
@@ -107,6 +113,7 @@ FAKE
   chmod +x "$T/bin/regen-x" "$T/bin/consumer-relock" "$T/bin/gh"
   export PATH="$T/bin:$PATH" T
   echo d1 > "$T/drv"
+  echo app1 > "$T/app-drv"
 
   # A repo whose origin ends with the slug relock was built for, so it recognises it as its own.
   git init -q --bare "$T/remote/seedmatic/t.git"
@@ -184,6 +191,29 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
   [ "$status" -eq 0 ]
   [[ "$output" == *"BUMPED"* ]]
   [ "$(relock_commits)" -eq 1 ]
+}
+
+@test "packages repo: a bump that moves ONLY an app's program is carried — relock ships itself that way" {
+  STUB_HAS_PACKAGES=true STUB_UPDATE=app-only run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+}
+
+@test "packages repo: a bump that moves neither a package nor an app is dropped" {
+  STUB_HAS_PACKAGES=true STUB_UPDATE=nested run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"NO derivation impact -> dropped"* ]]
+  [ "$(relock_commits)" -eq 0 ]
+  lock_unchanged
+}
+
+@test "a FAILING apps projection is fatal — the bump is not carried, the lock restored" {
+  STUB_HAS_PACKAGES=true STUB_APPS=fail STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -ne 0 ]
+  [ "$(relock_commits)" -eq 0 ]
+  lock_unchanged
+  tree_clean
 }
 
 @test "aggregator: a bump of a root input is carried — its inputs ARE what it exports" {

@@ -270,7 +270,8 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
     | .nodes[$nn].locked.rev // empty' "$1"
 }
 
-# The MEANINGFUL projection of a flake edge: every exported package's derivation path.
+# The MEANINGFUL projection of a flake edge: every exported derivation — each package's, and the
+# ones behind each app's program.
 # NOT a projection of the lock's fields — in a flake.lock `locked.rev` IS the content
 # identity, so deleting it would make every bump compare equal and look impact-free.
 #
@@ -290,13 +291,19 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
 # writeShellApplication wrapper sets errexit/nounset/pipefail but NOT `inherit_errexit`, so inside
 # the substitution a failing capture just continues (measured). Every failure is therefore returned
 # EXPLICITLY, and each caller decides what it means.
+#
+# An app is an exported derivation too: its `program` is a store path, measured by the derivations
+# in its string context. `apps or {}` answers only ABSENCE — an app that fails to evaluate still
+# aborts the measure.
 evalmap() {
-  local has_packages
+  local has_packages pkgs apps
   has_packages=$(nix eval --impure --json --expr "(builtins.getFlake \"git+file://$REPO\").outputs ? packages") || return 1
   if [ "$has_packages" = true ]; then
-    nix eval --json "$REPO#packages.@system@" \
-      --apply 'ps: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) ps' \
-      | jq -S .
+    pkgs=$(nix eval --json "$REPO#packages.@system@" \
+      --apply 'ps: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) ps') || return 1
+    apps=$(nix eval --impure --json --expr \
+      "builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a.program)) (((builtins.getFlake \"git+file://$REPO\").outputs.apps or { }).@system@ or { })") || return 1
+    jq -S -n --argjson p "$pkgs" --argjson a "$apps" '{packages: $p, apps: $a}'
   else
     # A `follows` root input has no lock of its own — it is an input PATH whose target is already
     # counted where it is defined — so it is left out rather than resolved. Taking its last path
