@@ -3,8 +3,8 @@
 # docs/architecture/patterns/flake-lock-propagation.adoc; built by nix-flake-commons' `lib.mkRelockApp`.
 #
 # Build-time tokens (written WITHOUT at-sigils here so replaceVars does not substitute them in this
-# comment): repoName, repoSlug, repoUrl, system, consumers, ownedArtifacts, pushFirstBranch,
-# catalogBranch, selfPinName, aliases.
+# comment): repoName, repoSlug, repoUrl, ownBranch, system, consumers, ownedArtifacts,
+# pushFirstBranch, catalogBranch, selfPinName, aliases.
 #
 # ★ WHY the name is identical in every repo: propagation is a REQUEST, and the caller must know
 # nothing about the callee beyond its name — that uniformity is what makes `nix run <any repo>#relock`
@@ -61,6 +61,17 @@ done
 #
 # Matching is on the SLUG (`owner/name`), not the url: a local checkout may speak ssh where the input
 # speaks https, and the same repo must not read as a different one because of the transport.
+#
+# ⚠️ And the slug is not enough when one repo carries SEVERAL flakes, one per branch — rke2lab's
+# develop and its orphans seed-incluster and flox-catalog. Matched on the slug alone, the orphan's
+# relock run from a develop checkout reconciled develop by the orphan's rules, and a requested run
+# cloned the default branch instead of the orphan: both silently, both reporting success. So a flake
+# that names its `branch` counts a checkout as its own only on that branch and clones that branch;
+# and a flake that names none refuses to run on the branches it has itself declared as OTHER flakes
+# of the repo (`pushFirstBranch`, `catalogBranch`).
+ownBranch="@ownBranch@"
+pushFirstBranch="@pushFirstBranch@"
+catalogBranch="@catalogBranch@"
 cur=""
 REPO=""
 if top=$(git rev-parse --show-toplevel 2>/dev/null); then
@@ -72,14 +83,27 @@ if top=$(git rev-parse --show-toplevel 2>/dev/null); then
 fi
 if [ -n "$REPO" ]; then
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+  if [ -n "$ownBranch" ] && [ "$cur" != "$ownBranch" ]; then
+    echo "REFUSING: this checkout of @repoSlug@ is on '$cur', but @repoName@ is the flake on '$ownBranch'." >&2
+    echo "Run it from a worktree of '$ownBranch', or from outside any checkout of @repoSlug@ to have" >&2
+    echo "'$ownBranch' cloned." >&2
+    exit 1
+  fi
+  if [ -z "$ownBranch" ] && { [ "$cur" = "$pushFirstBranch" ] || [ "$cur" = "$catalogBranch" ]; }; then
+    echo "REFUSING: this checkout of @repoSlug@ is on '$cur', which @repoName@ declares as ANOTHER" >&2
+    echo "flake of this repo. Run that branch's own relock from here, or this one from another checkout." >&2
+    exit 1
+  fi
   echo "relock(@repoName@): reconciling the checkout at $REPO ($cur)"
 else
   # A REQUESTED run, from somewhere that is not our checkout. We clone, reconcile and PUSH: the chain
   # is push-gated anyway (a `github:` input only ever sees what is pushed), so the remote is the only
   # place a request can usefully land. The operator's own checkout stays untouched and simply pulls.
   REPO=$(mktemp -d)/@repoName@
-  echo "relock(@repoName@): not inside this repo — cloning @repoUrl@ to reconcile and push"
-  git clone --quiet "@repoUrl@" "$REPO" || { echo "relock: cannot clone @repoUrl@" >&2; exit 1; }
+  clone_branch=()
+  if [ -n "$ownBranch" ]; then clone_branch=(--branch "$ownBranch"); fi
+  echo "relock(@repoName@): not inside this repo — cloning @repoUrl@ ${ownBranch:+($ownBranch) }to reconcile and push"
+  git clone --quiet "${clone_branch[@]}" "@repoUrl@" "$REPO" || { echo "relock: cannot clone @repoUrl@ $ownBranch" >&2; exit 1; }
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
   echo "relock(@repoName@): cloned at $cur"
 fi
@@ -313,10 +337,9 @@ relock_input() { # $1 input name
 # repo either carries such a branch or it does not, and `git worktree list` already answers
 # that. This is what lets the same implementation serve a repo like ndh, which has neither a
 # seed-incluster nor a flox-catalog branch.
-# Via variables, not the tokens inline: after substitution a token IS a literal, and shellcheck
-# rejects `[ -n "literal" ]` (SC2157) — correctly, since the test would be constant.
-pushFirstBranch="@pushFirstBranch@"
-catalogBranch="@catalogBranch@"
+# The branch names come in as variables, set at the checkout guard above, not as tokens inline:
+# after substitution a token IS a literal, and shellcheck rejects `[ -n "literal" ]` (SC2157) —
+# correctly, since the test would be constant.
 FIRST=""
 if [ -n "$pushFirstBranch" ]; then FIRST=$(wt_for_branch "$pushFirstBranch") || FIRST=""; fi
 CATALOG=""

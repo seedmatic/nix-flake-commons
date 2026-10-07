@@ -41,6 +41,11 @@
   catalogBranch ? "",
   # This repo's input name inside that catalog's lock.
   selfPinName ? name,
+  # The branch THIS flake lives on, for a flake that is not its repo's default branch — an orphan
+  # such as rke2lab's seed-incluster. The slug alone cannot tell two flakes of one repo apart, so a
+  # checkout counts as ours only on this branch, and a requested run clones this branch. "" for a
+  # flake on the default branch.
+  branch ? "",
   # The repo's OWN words for some of its regen apps — `{ plans = "regen-dataplan"; }` — accepted as
   # targets and listed in `--help`. Declared by the repo, because a factory in the root that names
   # one consumer's artifacts is the wrong way round.
@@ -66,6 +71,7 @@ pkgs.writeShellApplication {
       repoUrl = url;
       repoName = name;
       repoSlug = slug;
+      ownBranch = branch;
       system = pkgs.stdenv.hostPlatform.system;
       consumers = pkgs.lib.concatStringsSep " " (map (c: ''"${c}"'') consumers);
       ownedArtifacts = pkgs.lib.concatStringsSep " " (map (a: "':!${a}'") ownedArtifacts);

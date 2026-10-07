@@ -17,7 +17,8 @@ setup() {
 
   mkdir -p "$T/bin" "$T/remote/seedmatic"
   sed '/^export PATH=/d' "$RELOCK" > "$T/relock"
-  chmod +x "$T/relock"
+  sed '/^export PATH=/d' "$RELOCK_ON_BRANCH" > "$T/relock-on-branch"
+  chmod +x "$T/relock" "$T/relock-on-branch"
 
   # The fake nix. It records every call, and answers each question relock asks. Its shebang is the
   # bash on PATH, not /usr/bin/env: the Linux build sandbox does not promise /usr/bin/env.
@@ -69,7 +70,18 @@ FAKE
  "x":{"locked":{"type":"github","rev":"x1"}}},"root":"root","version":7}
 LOCK
   git add flake.nix flake.lock artifact.json && git commit -qm init && git push -qu origin HEAD 2>/dev/null
+  DEFAULT=$(git rev-parse --abbrev-ref HEAD)
+  # A requested run clones the factory's url; send it to the local bare instead.
+  git config --global url."$T/remote/seedmatic/t.git".insteadOf "file:///nonexistent/seedmatic/t.git"
 }
+
+# The repo's OTHER flake: an orphan branch, pushed, so a clone can take it.
+mk_orphan() {
+  git -C "$T/work" checkout -q --orphan orphan
+  git -C "$T/work" commit -qm orphan
+  git -C "$T/work" push -qu origin orphan 2>/dev/null
+}
+never_updated() { ! grep -q "flake update" "$T/calls" 2>/dev/null; }
 
 relock_commits() { git -C "$T/work" log --format=%s | grep -c '^chore(' || true; }
 # The tree AFTER the fact, not just the exit code: a failure path must leave nothing behind.
@@ -199,4 +211,53 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
   STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   grep -q -- "--flake-registry $T/work/flake-registry.json flake update" "$T/calls"
+}
+
+@test "a branch-scoped flake REFUSES a checkout of its repo on another branch" {
+  # The slug matches, so without the branch check this reconciled the default branch by the
+  # orphan's rules, and said nothing.
+  mk_orphan
+  git -C "$T/work" checkout -q "$DEFAULT"
+  STUB_HAS_PACKAGES=true run "$T/relock-on-branch" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING"*"'$DEFAULT'"*"'orphan'"* ]]
+  never_updated
+  tree_clean
+}
+
+@test "a branch-scoped flake reconciles a checkout on its own branch" {
+  mk_orphan
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock-on-branch" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reconciling the checkout at $T/work (orphan)"* ]]
+  [[ "$output" == *"DONE"* ]]
+}
+
+@test "a requested run of a branch-scoped flake clones ITS branch, not the default one" {
+  mk_orphan
+  git -C "$T/work" checkout -q "$DEFAULT"
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock-on-branch" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cloned at orphan"* ]]
+  [[ "$output" == *"DONE"* ]]
+}
+
+@test "a requested run of a flake with no branch still clones the default branch" {
+  mk_orphan
+  git -C "$T/work" checkout -q "$DEFAULT"
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cloned at $DEFAULT"* ]]
+}
+
+@test "a flake with no branch REFUSES a checkout on a branch it declares as another flake" {
+  # The reverse confusion: the default flake's relock, run from the orphan's worktree.
+  git -C "$T/work" checkout -q -b first
+  STUB_HAS_PACKAGES=true run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING"*"'first'"*"ANOTHER"* ]]
+  never_updated
+  tree_clean
 }

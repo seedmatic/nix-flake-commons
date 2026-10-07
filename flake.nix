@@ -125,11 +125,21 @@
             url = "file:///nonexistent/seedmatic/t.git";
             consumers = [ "fake:consumer" ];
             aliases = { plans = "regen-dataplan"; };
+            pushFirstBranch = "first";
+          };
+          # The same repo's OTHER flake, the one on an orphan branch.
+          underTestOnBranch = self.lib.mkRelockApp {
+            inherit pkgs;
+            name = "t-orphan";
+            slug = "seedmatic/t";
+            url = "file:///nonexistent/seedmatic/t.git";
+            branch = "orphan";
           };
         in
         pkgs.runCommand "relock-bats" {
           nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq ];
           RELOCK = "${underTest}/bin/relock";
+          RELOCK_ON_BRANCH = "${underTestOnBranch}/bin/relock";
         } ''
           export HOME=$TMPDIR
           bats --print-output-on-failure ${./nix/relock.bats}
