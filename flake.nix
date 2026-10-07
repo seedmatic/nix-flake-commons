@@ -130,7 +130,57 @@
 
   };
 
+  # The aggregator's first outputs: the shared `relock` tool, and this repo's own use of it.
+  #
+  # `lib.mkRelockApp` is here because this is the ROOT every seedmatic flake already consumes — a
+  # tool the whole chain shares belongs where the whole chain already points, rather than in one
+  # leaf the others would have to take a new edge to. And this repo is a USER of it, not only its
+  # host: it has third-party inputs of its own to bump, and relock measures an aggregator's impact
+  # on the revisions it locks, since its inputs are what it exports.
+  #
+  # `consumers` stays empty on purpose: from here, the closure that needs reconciling is the forward
+  # one — the inputs. The eight repos that follow this one pick a bump up at their own relock.
   outputs = { self, nixpkgs, flake-utils, home-manager, ... }:
-    {};
+    {
+      lib.mkRelockApp = import ./nix/relock.nix;
+    }
+    // flake-utils.lib.eachDefaultSystem (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
+      # Behaviour tests for relock, run by `nix flake check`. They cover what shellcheck — already a
+      # gate of every build — cannot see: the failure paths, where every defect this script had was
+      # a silence. The instance under test is built by the SAME factory, with aliases and a consumer
+      # declared so those paths are exercised populated rather than empty.
+      checks.relock =
+        let
+          underTest = self.lib.mkRelockApp {
+            inherit pkgs;
+            name = "t";
+            slug = "seedmatic/t";
+            url = "file:///nonexistent/seedmatic/t.git";
+            consumers = [ "fake:consumer" ];
+            aliases = { plans = "regen-dataplan"; };
+          };
+        in
+        pkgs.runCommand "relock-bats" {
+          nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq ];
+          RELOCK = "${underTest}/bin/relock";
+        } ''
+          export HOME=$TMPDIR
+          bats --print-output-on-failure ${./nix/relock.bats}
+          touch $out
+        '';
+
+      apps.relock = {
+        type = "app";
+        program = "${
+          self.lib.mkRelockApp {
+            inherit pkgs;
+            name = "nix-flake-commons";
+            slug = "seedmatic/nix-flake-commons";
+            url = "https://github.com/seedmatic/nix-flake-commons.git";
+          }
+        }/bin/relock";
+        meta.description = "Reconcile THIS repo's locks: bump each input, DROP any bump that moves nothing it exports, push";
+      };
+    });
 
 }
