@@ -66,6 +66,31 @@ if [ "$nopush" = 1 ] && [ "$downstream" = 1 ]; then
   exit 2
 fi
 
+# Every repo is reconciled AT MOST ONCE per pass, however the consumers are wired. The chain has
+# cycles — rke2lab <-> ndh — and the derivation guard alone cannot end them while a repo's outputs
+# move on every commit, so --downstream would turn forever. The pass therefore carries a VISITED
+# list: a FILE, not a variable, because a variable flows only from parent to child, and in a
+# diamond (A->B, A->C, B->C) A would never learn that B had already visited C. The first relock of
+# a pass creates it and removes it on exit; each relock checks for its own key before doing
+# anything else, and adds it. A consumer's relock inherits the path through the environment.
+visit_branch="@ownBranch@"
+visit_key="@repoSlug@${visit_branch:+:$visit_branch}"
+# Only the creator removes it. An INHERITED path that no longer exists is a broken pass, and starting
+# again from an empty list would silently void the very guarantee this file exists to give.
+if [ -z "${RELOCK_VISITED_FILE:-}" ]; then
+  RELOCK_VISITED_FILE=$(mktemp)
+  export RELOCK_VISITED_FILE
+  trap 'rm -f "$RELOCK_VISITED_FILE"' EXIT
+elif [ ! -f "$RELOCK_VISITED_FILE" ]; then
+  echo "relock(@repoName@): the visited list of this pass ($RELOCK_VISITED_FILE) is gone — refusing to start over" >&2
+  exit 1
+fi
+if grep -qxF -- "$visit_key" "$RELOCK_VISITED_FILE" 2>/dev/null; then
+  echo "relock(@repoName@): already visited in this pass — skipped"
+  exit 0
+fi
+printf '%s\n' "$visit_key" >> "$RELOCK_VISITED_FILE"
+
 # The GitHub token, for the PRIVATE inputs (measured 2026-10-07: without one, nix fetched ndh's
 # private claude-hub input as a 404 and fell back to a stale cache). Taken from `gh auth token` at
 # each run rather than stored: the copy that used to live in nix.conf expired and nobody noticed.
@@ -657,13 +682,32 @@ fi
 # Crossing a repo boundary is a REQUEST, never a reach-in: we do not edit a consumer's
 # lock, we run the consumer's OWN relock. Off by default — it mutates another repo.
 consumers=(@consumers@)
+skipped=()
+# A consumer reference's key in the visited list: `github:owner/repo[/ref]` -> `owner/repo[:ref]`,
+# the same key that repo's own relock records. Anything else is its own key.
+ref_key() {
+  local r=${1#github:} ref=""
+  r=${r%%\?*}
+  case $r in
+    */*/*) ref=${r#*/*/}; r=${r%/"$ref"} ;;
+  esac
+  if [ "$1" = "${1#github:}" ]; then printf '%s\n' "$1"; else printf '%s\n' "$r${ref:+:$ref}"; fi
+}
 if [ "$downstream" = 1 ]; then
   echo "== downstream: request each consumer's own relock =="
   # A request, so a failure here is not fatal — but it is SAID, with the consumer's name and its own
   # stderr. The first version ran `nix run "$c#relock" 2>/dev/null` and answered every failure with
   # "exposes no #relock yet": a consumer whose relock CRASHED read exactly like one that has none.
+  # A consumer already visited in this pass is not relaunched — that is what ends a cycle. But if
+  # THIS run committed, that consumer pins a repo that just moved, so the gap is SAID at the end
+  # rather than left to be noticed: the loop stops, the drift stays visible.
   for c in "${consumers[@]}"; do
     printf '  %-28s ' "$c"
+    if grep -qxF -- "$(ref_key "$c")" "$RELOCK_VISITED_FILE"; then
+      echo "already visited in this pass — not relaunched"
+      if [ "$committed" = 1 ]; then skipped+=("$c"); fi
+      continue
+    fi
     if ! has_relock=$(nix eval --json "$c#apps.@system@" --apply 'as: as ? relock'); then
       echo "FAILED — cannot evaluate $c (its error is above)"
     elif [ "$has_relock" != true ]; then
@@ -677,4 +721,8 @@ if [ "$downstream" = 1 ]; then
 else
   echo "consumers NOT notified (pass --downstream): ${consumers[*]}"
 fi
+for c in "${skipped[@]}"; do
+  echo "NOTE: $c was not relaunched (already visited in this pass) although @repoName@ moved:" \
+    "run its relock on the next pass"
+done
 echo "DONE"

@@ -26,6 +26,7 @@ setup() {
   cat >> "$T/bin/nix" <<'FAKE'
 echo "$*" >> "$T/calls"
 printf '%s\n' "${NIX_CONFIG:-}" >> "$T/nix-config"
+[ -n "${RELOCK_VISITED_FILE:-}" ] && printf '%s\n' "$RELOCK_VISITED_FILE" > "$T/visited-path"
 case "$*" in
   *"outputs ? packages"*)
     n=$(( $(cat "$T/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/probes"
@@ -406,6 +407,7 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
   [[ "$output" == *"fake:consumer done"* ]]
   [ -f "$T/child-env.consumer" ]
   ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.consumer"
+  grep -q '^RELOCK_VISITED_FILE=' "$T/child-env.consumer"
 }
 
 @test "no token from gh: said, and the run goes on without one" {
@@ -443,4 +445,79 @@ LOCK
   [ "$(relock_commits)" -eq 1 ]
   [ "$(jq -r '.nodes.a.locked.rev' "$T/work/flake.lock")" = "a1" ]
   tree_clean
+}
+
+@test "a repo already visited in this pass is skipped before anything else" {
+  printf 'seedmatic/t\n' > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already visited in this pass"* ]]
+  [ ! -s "$T/calls" ]
+}
+
+@test "a cycle A <-> B turns once: B's request back to A is skipped" {
+  # B is a stand-in consumer whose own relock requests A again, as ndh's does for rke2lab.
+  printf '#!%s\ncat "$RELOCK_VISITED_FILE" > "$T/visited-seen-by-b"\n"$T/relock" --downstream inputs > "$T/inner-a.out" 2>&1\n' "$(command -v bash)" > "$T/bin/consumer-relock"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+  [ "$status" -eq 0 ]
+  grep -qx 'seedmatic/t' "$T/visited-seen-by-b"
+  grep -q "already visited in this pass" "$T/inner-a.out"
+  [ "$(grep -c '^DONE$' <<<"$output")" -eq 1 ]
+}
+
+@test "a chain A -> B -> C visits each once, and C's request back to A is skipped" {
+  # B and C honour the same protocol as any relock: skip if listed, else add their key.
+  for x in b c; do
+    next=$([ "$x" = b ] && echo "$T/bin/relock-c" || echo "$T/relock --downstream inputs")
+    printf '#!%s\ngrep -qx %s "$RELOCK_VISITED_FILE" && exit 0\necho %s >> "$RELOCK_VISITED_FILE"\ncp "$RELOCK_VISITED_FILE" "$T/visited-at-%s"\n%s > "$T/after-%s.out" 2>&1\n' \
+      "$(command -v bash)" "seedmatic/$x" "seedmatic/$x" "$x" "$next" "$x" > "$T/bin/relock-$x"
+    chmod +x "$T/bin/relock-$x"
+  done
+  cp "$T/bin/relock-b" "$T/bin/consumer-relock"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+  [ "$status" -eq 0 ]
+  [ "$(cat "$T/visited-at-c")" = "$(printf 'seedmatic/t\nseedmatic/b\nseedmatic/c')" ]
+  grep -q "already visited in this pass" "$T/after-c.out"
+}
+
+@test "an inherited visited list that no longer exists fails the run, it does not start over" {
+  RELOCK_VISITED_FILE="$T/gone" STUB_HAS_PACKAGES=true run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is gone — refusing to start over"* ]]
+  [ ! -s "$T/calls" ]
+}
+
+@test "a consumer already visited is not relaunched, and the gap is said when this run moved" {
+  # The diamond case: the consumer was reached through another path of the same pass.
+  printf 'fake:consumer\n' > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_CONSUMER=ok \
+    run "$T/relock" --downstream inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"fake:consumer"*"already visited in this pass — not relaunched"* ]]
+  [[ "$output" == *"NOTE: fake:consumer was not relaunched (already visited in this pass) although t moved"* ]]
+  [ ! -f "$T/child-env.consumer" ]
+}
+
+@test "no note when the skipped consumer missed nothing — this run moved nothing" {
+  printf 'fake:consumer\n' > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+    run "$T/relock" --downstream inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not relaunched"* ]]
+  [[ "$output" != *"NOTE:"* ]]
+}
+
+@test "only the creator removes the visited list" {
+  printf 'x\n' > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [ -f "$T/visited" ]
+  grep -qx 'seedmatic/t' "$T/visited"
+}
+
+@test "the creator removes the visited list on exit, even when the run fails" {
+  STUB_HAS_PACKAGES=fail STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -ne 0 ]
+  [ -s "$T/visited-path" ]
+  [ ! -e "$(cat "$T/visited-path")" ]
 }
