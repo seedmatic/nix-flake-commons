@@ -41,11 +41,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    cachix = {
-      url = "github:cachix/cachix";
-      inputs.flake-compat.follows = "flake-compat";
-    };
-
     chromium-bin = {
       url = "github:lrworth/chromium-bin-flake";
     };
