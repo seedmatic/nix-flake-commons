@@ -1245,7 +1245,6 @@
         "nixpkgs": "nixpkgs_12",
         "nixpkgs-unstable": "nixpkgs-unstable",
         "nvfetcher": "nvfetcher",
-        "socket-vmnet": "socket-vmnet",
         "sops-nix": "sops-nix",
         "treefmt-nix": "treefmt-nix"
       }
@@ -1264,45 +1263,6 @@
         "owner": "rust-lang",
         "ref": "nightly",
         "repo": "rust-analyzer",
-        "type": "github"
-      }
-    },
-    "socket-vmnet": {
-      "inputs": {
-        "flake-commons": [],
-        "flake-compat": [
-          "socket-vmnet",
-          "flake-commons",
-          "flake-compat"
-        ],
-        "nixpkgs": [
-          "socket-vmnet",
-          "flake-commons",
-          "nixpkgs"
-        ],
-        "nvfetcher": [
-          "socket-vmnet",
-          "flake-commons",
-          "nvfetcher"
-        ],
-        "utils": [
-          "socket-vmnet",
-          "flake-commons",
-          "flake-utils"
-        ]
-      },
-      "locked": {
-        "lastModified": 1760312638,
-        "narHash": "sha256-jDuQtZ4JGay3L96oq6ZkWW9eXVxZ+Z5jEA+55ltvTKY=",
-        "owner": "nxmatic",
-        "repo": "nix-socket-vmnet",
-        "rev": "0cfbc260852a1e200b5c651c21e304b7c55fee65",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nxmatic",
-        "ref": "develop",
-        "repo": "nix-socket-vmnet",
         "type": "github"
       }
     },

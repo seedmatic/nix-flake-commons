@@ -95,17 +95,6 @@
       url = "github:nxmatic/nix-maven-mvnd/develop";
     };
 
-    # ★ socket-vmnet inputs a flake-commons of its OWN (`github:nxmatic/nix-flake-commons/develop` —
-    # the old org, too), and that copy re-aggregates everything: an older flake-commons nested inside
-    # this one. The empty follows makes its flake-commons the ROOT — this flake — a fixpoint, so the
-    # copy is never fetched. It takes only flake-compat, nixpkgs, nvfetcher and flake-utils from it,
-    # all of which the root provides.
-    socket-vmnet = {
-      flake = true;
-      url = "github:nxmatic/nix-socket-vmnet/develop";
-      inputs.flake-commons.follows = "";
-    };
-
   };
 
   # The aggregator's first outputs: the shared `relock` tool, and this repo's own use of it.
