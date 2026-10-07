@@ -126,6 +126,7 @@
             consumers = [ "fake:consumer" ];
             aliases = { plans = "regen-dataplan"; };
             pushFirstBranch = "first";
+            catalogBranch = "cat";
           };
           # The same repo's OTHER flake, the one on an orphan branch.
           underTestOnBranch = self.lib.mkRelockApp {

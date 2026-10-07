@@ -261,3 +261,54 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
   never_updated
   tree_clean
 }
+
+remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/dev/null || echo none; }
+
+@test "--no-push commits in the checkout, pushes NOTHING, and prints how to resume" {
+  before=$(remote_rev "$DEFAULT")
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+  [ "$(remote_rev "$DEFAULT")" = "$before" ]
+  [[ "$output" == *"1 commit(s) ahead"* ]]
+  [[ "$output" == *"To resume where this stopped:"*"git -C '$T/work' push"* ]]
+  [[ "$output" == *"DONE (not pushed)"* ]]
+}
+
+@test "--no-push does not push the push-first branch either, and says what its input resolves" {
+  git -C "$T/work" branch first && git -C "$T/work" push -q origin first 2>/dev/null
+  first_remote=$(remote_rev first)
+  git -C "$T/work" worktree add -q "$T/first" first
+  echo x > "$T/first/x" && git -C "$T/first" add x && git -C "$T/first" commit -qm ahead
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [ "$(remote_rev first)" = "$first_remote" ]
+  [[ "$output" == *"first NOT pushed: its input resolves the remote head ${first_remote:0:9}"* ]]
+  [[ "$output" == *"git -C '$T/first' push origin 'first' && git -C '$T/work' push"* ]]
+}
+
+@test "--no-push skips the catalog hop after a commit, and resumes it with envs" {
+  git -C "$T/work" branch cat && git -C "$T/work" worktree add -q "$T/cat" cat
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"catalog hop SKIPPED"* ]]
+  [[ "$output" != *"re-pinning the catalog"* ]]
+  [[ "$output" == *"&& (cd '$T/work' && nix run .#relock -- envs)"* ]]
+  ! grep -q "lock-envs" "$T/calls"
+}
+
+@test "--no-push refuses a requested run: unpushed commits in a clone would be lost" {
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true run "$T/relock" --no-push inputs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--no-push needs a checkout"* ]]
+  [[ "$output" != *"cloned at"* ]]
+}
+
+@test "--no-push with --downstream is refused: a consumer sees only what is pushed" {
+  STUB_HAS_PACKAGES=true run "$T/relock" --no-push --downstream inputs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"contradict"* ]]
+  never_updated
+}

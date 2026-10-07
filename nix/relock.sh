@@ -13,6 +13,7 @@
 # repo supplies only what is ITS OWN — its url, its artifacts, its branches, its consumers.
 
 downstream=0
+nopush=0
 targets=()
 
 # A repo's own words for some of its regen apps (`plans` → `regen-dataplan`), declared where that
@@ -25,9 +26,10 @@ for kv in "${aliases[@]}"; do alias_of[${kv%%=*}]=${kv#*=}; done
 for a in "$@"; do
   case $a in
     --downstream) downstream=1 ;;
+    --no-push) nopush=1 ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream] [target...]
+relock [--downstream | --no-push] [target...]
 
 Reconcile this repo's derived, committed artifacts. No target = ALL of them.
 
@@ -41,6 +43,8 @@ Reconcile this repo's derived, committed artifacts. No target = ALL of them.
 
 An input bump that moves no exported derivation is DROPPED, not carried.
 --downstream then REQUESTS each declared consumer's own relock.
+--no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
+reviewed; it prints the exact command that resumes where it stopped.
 USAGE
       if [ "${#aliases[@]}" -gt 0 ]; then
         printf '\nAliases this repo declares:\n'
@@ -51,6 +55,12 @@ USAGE
     *) targets+=("$a") ;;
   esac
 done
+# A consumer only ever sees what is pushed, so requesting one after a run that pushed nothing would
+# relock it against the revision this run did NOT carry — and report success.
+if [ "$nopush" = 1 ] && [ "$downstream" = 1 ]; then
+  echo "relock: --no-push and --downstream contradict each other — a consumer sees only what is pushed" >&2
+  exit 2
+fi
 
 # WHOSE repo this reconciles — its OWN, always, and resolved rather than assumed.
 #
@@ -99,6 +109,14 @@ else
   # A REQUESTED run, from somewhere that is not our checkout. We clone, reconcile and PUSH: the chain
   # is push-gated anyway (a `github:` input only ever sees what is pushed), so the remote is the only
   # place a request can usefully land. The operator's own checkout stays untouched and simply pulls.
+  # Unpushed commits in a throwaway clone would vanish with it: --no-push needs the operator's checkout.
+  if [ "$nopush" = 1 ]; then
+    on=""
+    if [ -n "$ownBranch" ]; then on=" on $ownBranch"; fi
+    echo "relock: --no-push needs a checkout of @repoSlug@$on — run it from there;" >&2
+    echo "        in a clone, the unpushed commits would be lost with it" >&2
+    exit 2
+  fi
   REPO=$(mktemp -d)/@repoName@
   clone_branch=()
   if [ -n "$ownBranch" ]; then clone_branch=(--branch "$ownBranch"); fi
@@ -376,7 +394,15 @@ echo
 
 # Our own branches first: an orphan-branch INPUT resolves github:, which sees only what is
 # pushed.
-if [ -n "$FIRST" ]; then
+if [ -n "$FIRST" ] && [ "$nopush" = 1 ]; then
+  # Honest, not silent: the inputs below still resolve github:, so they see the REMOTE head, which
+  # may be behind this worktree.
+  echo "== own branches: NOT pushed (--no-push) =="
+  first_remote=$(git -C "$FIRST" ls-remote origin "refs/heads/$pushFirstBranch" | cut -c1-9)
+  echo "  $pushFirstBranch NOT pushed: its input resolves the remote head ${first_remote:-<none>}," \
+    "not this worktree's $(git -C "$FIRST" rev-parse --short=9 HEAD)"
+  echo
+elif [ -n "$FIRST" ]; then
   echo "== own branches: push before resolving =="
   git -C "$FIRST" push origin "$pushFirstBranch"
   echo "  $pushFirstBranch @ $(git -C "$FIRST" rev-parse --short=9 HEAD) pushed"
@@ -436,8 +462,10 @@ done
 if [ "$committed" = 1 ] && [ "$do_catalog" = 0 ] && [ -n "$CATALOG" ]; then
   do_catalog=1
   env_targets=("")
-  echo "  (committed here ⇒ re-pinning the catalog and re-locking every env)"
-  echo
+  if [ "$nopush" = 0 ]; then
+    echo "  (committed here ⇒ re-pinning the catalog and re-locking every env)"
+    echo
+  fi
 fi
 
 # Push whatever the artifacts did. The catalog hop resolves
@@ -445,6 +473,28 @@ fi
 # worktree — so pushing only on a change was the hole: any other commit left HEAD
 # unpushed and the catalog silently pinned an older rev while reporting a clean bump
 # (measured 2026-09-30: catalog at 9ccd89923 while HEAD was fec07de85).
+if [ "$nopush" = 1 ]; then
+  ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+  echo "== NOT pushed (--no-push) =="
+  echo "  @repoName@ ($cur): $ahead commit(s) ahead of its upstream — review them with:"
+  echo "    git -C '$REPO' log --stat '@{u}..HEAD'"
+  resume=()
+  if [ -n "$FIRST" ]; then resume+=("git -C '$FIRST' push origin '$pushFirstBranch'"); fi
+  resume+=("git -C '$REPO' push")
+  # The catalog hop measures the revision a push landed, so it can only follow a push. `envs`, not
+  # `catalog`: the catalog target alone re-pins without re-locking a single env.
+  if [ -n "$CATALOG" ] && { [ "$do_catalog" = 1 ] || [ "$committed" = 1 ]; }; then
+    echo "  catalog hop SKIPPED: it measures the revision a push landed"
+    resume+=("(cd '$REPO' && nix run .#relock -- envs)")
+  fi
+  echo
+  echo "To resume where this stopped:"
+  printf '  %s' "${resume[0]}"
+  for r in "${resume[@]:1}"; do printf ' && %s' "$r"; done
+  echo
+  echo "DONE (not pushed)"
+  exit 0
+fi
 git -C "$REPO" push
 pushed_head=$(git -C "$REPO" rev-parse HEAD)
 echo "  @repoName@ @ ${pushed_head:0:9} pushed"
