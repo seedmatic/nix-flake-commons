@@ -62,14 +62,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    devenv = {
-      url = "github:cachix/devenv/latest";
-      inputs.cachix.follows = "cachix";
-      inputs.flake-compat.follows = "flake-compat";
-      inputs.nix.follows = "nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     home-manager = {
       url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
