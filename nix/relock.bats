@@ -156,7 +156,8 @@ LOCK
   git add flake.nix flake.lock artifact.json && git commit -qm init && git push -qu origin HEAD 2>/dev/null
   DEFAULT=$(git rev-parse --abbrev-ref HEAD)
   # A requested run clones the factory's url; send it to the local bare instead.
-  git config --global url."$T/remote/seedmatic/t.git".insteadOf "file:///nonexistent/seedmatic/t.git"
+  # A file:// url, because git ignores --depth for a plain local path: the clone must REALLY be shallow.
+  git config --global url."file://$T/remote/seedmatic/t.git".insteadOf "file:///nonexistent/seedmatic/t.git"
 }
 
 # The repo's OTHER flake: an orphan branch, pushed, so a clone can take it.
@@ -609,6 +610,19 @@ LOCK
   [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
 }
 
+@test "a requested run clones shallow, and its bump is measured and pushed fast-forward" {
+  before=$(remote_rev "$DEFAULT")
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  clone=$(printf '%s\n' "$output" | sed -n "s/^  t ($DEFAULT) : //p")
+  [ -n "$clone" ]
+  [ "$(git -C "$clone" rev-parse --is-shallow-repository)" = true ]
+  [[ "$output" == *"BUMPED"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
+  [ "$(git -C "$T/remote/seedmatic/t.git" rev-parse "$DEFAULT^")" = "$before" ]
+}
+
 @test "a coupling that persists is a clear failure, and leaves nothing behind" {
   two_inputs
   STUB_HAS_PACKAGES=true STUB_UPDATE=coupled-forever run "$T/relock" --no-push inputs
@@ -718,7 +732,7 @@ LOCK
 peers() {
   for r in "$@"; do
     git clone -q --bare "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/$r.git"
-    git config --global url."$T/remote/seedmatic/$r.git".insteadOf "file:///nonexistent/seedmatic/$r.git"
+    git config --global url."file://$T/remote/seedmatic/$r.git".insteadOf "file:///nonexistent/seedmatic/$r.git"
   done
 }
 

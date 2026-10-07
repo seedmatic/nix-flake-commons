@@ -187,11 +187,12 @@ else
   fi
   # Canonical, because nix refuses a git+file flake whose path crosses a symlink once its tree is
   # dirty — and a bumped lock makes it dirty. TMPDIR may well cross one (macOS: /tmp -> private/tmp).
-  REPO=$(cd "$(mktemp -d)" && pwd -P)/@repoName@
+  REPO=$(realpath "$(mktemp -d)")/@repoName@
   clone_branch=()
   if [ -n "$ownBranch" ]; then clone_branch=(--branch "$ownBranch"); fi
   echo "relock(@repoName@): not inside this repo — cloning @repoUrl@ ${ownBranch:+($ownBranch) }to reconcile and push"
-  git clone --quiet "${clone_branch[@]}" "@repoUrl@" "$REPO" || { echo "relock: cannot clone @repoUrl@ $ownBranch" >&2; exit 1; }
+  # Shallow: a requested run reads no history, it bumps the tip and pushes it.
+  git clone --quiet --depth=1 "${clone_branch[@]}" "@repoUrl@" "$REPO" || { echo "relock: cannot clone @repoUrl@ $ownBranch" >&2; exit 1; }
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
   echo "relock(@repoName@): cloned at $cur"
 fi
