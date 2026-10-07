@@ -328,7 +328,8 @@ regen_artifact() { # $1 app
 }
 
 # `nix flake update` in $1 for the inputs that follow; its stderr lands in `update_err`.
-# Returns 1 when nix fails, and 2 when it SUCCEEDS on a stale copy.
+# Returns 1 when nix fails, 2 when it SUCCEEDS on a stale copy, and 3 when it fails because the
+# lock would make one input follow an input of another that does not exist (see `deferred`).
 #
 # ⚠️ The second case is the dangerous one. Measured 2026-10-07 on ndh's private `claude-hub` input:
 # the GitHub API answered 404 Not Found, nix printed "using cached version" and exited 0, the lock
@@ -341,15 +342,37 @@ nix_update() {
   err=$(mktemp)
   ( cd "$dir" && nix "${registry_flag[@]}" flake update "$@" --refresh ) >/dev/null 2>"$err" || rc=1
   if [ "$rc" = 0 ] && grep -qE 'using cached version|unable to download' "$err"; then rc=2; fi
+  if [ "$rc" = 1 ] && grep -q 'follows a non-existent input' "$err"; then rc=3; fi
   update_err=$(grep -vE '^evaluation warning' "$err" || true)
   rm -f "$err"
   return "$rc"
 }
 
+# Inputs whose bump had to wait for another one. Measured 2026-10-07 on rke2lab: ndh, as locked,
+# followed `flake-commons/socket-vmnet`; bumping flake-commons FIRST — alphabetical order — removed
+# that input, and nix refused the whole lock. Bumping ndh first would have worked. But no FIXED order
+# is right: the next coupling may run the other way, a new ndh following an input only the new
+# flake-commons has. So the order is discovered, not chosen: such a bump is set aside with its lock
+# restored, retried ONCE after every other target, and only then reported as failed.
+deferred=()
+retrying=0
+
 relock_input() { # $1 input name
   printf '  %-18s ' "$1"
   local rc=0
   nix_update "$REPO" "$1" || rc=$?
+  if [ "$rc" = 3 ]; then
+    git -C "$REPO" checkout -q -- flake.lock
+    if [ "$retrying" = 0 ]; then
+      deferred+=("$1")
+      echo "deferred — it is coupled to another input's bump; retried after the others"
+      return 0
+    fi
+    echo "FAILED — still coupled after the other bumps; nothing carried"
+    printf '%s\n' "$update_err" | grep 'follows a non-existent input' | sed 's/^/    /' >&2
+    echo "    the inputs named above can only move together: nix flake update <both>, then relock" >&2
+    return 1
+  fi
   if [ "$rc" = 1 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to resolve"
@@ -525,6 +548,13 @@ for t in "${targets[@]}"; do
       fi ;;
   esac
 done
+
+if [ "${#deferred[@]}" -gt 0 ]; then
+  echo "== deferred inputs: retried once, after the others =="
+  retrying=1
+  for i in "${deferred[@]}"; do relock_input "$i" || true; done
+  echo
+fi
 
 # Anything committed here must TRAVEL: the catalog pins rke2lab and the envs resolve
 # through it, so a change that stops at this repo is a change the nodes never see. The

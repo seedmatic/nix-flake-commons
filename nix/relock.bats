@@ -54,6 +54,18 @@ case "$*" in
         jq '.nodes.a.locked.rev = "stale"' flake.lock > l && mv l flake.lock
         echo "warning: unable to download 'https://api.github.com/repos/o/r/commits/HEAD'" >&2 ;;
       failing) echo "error: cannot fetch" >&2; exit 1 ;;
+      # The ndh/flake-commons coupling: `a`, as locked, follows an input of `b` that only the OLD
+      # `b` has, so bumping `b` alone is fine but bumping `a` must wait — or, `-forever`, never works.
+      coupled|coupled-forever)
+        case "$*" in
+          *"flake update b "*)
+            jq '.nodes.b.locked.rev = "b2"' flake.lock > l && mv l flake.lock; echo d-b > "$T/drv"; touch "$T/b-moved" ;;
+          *"flake update a "*)
+            if [ "$STUB_UPDATE" = coupled-forever ] || [ ! -f "$T/b-moved" ]; then
+              echo "error: input 'a/x' follows a non-existent input 'b/x'" >&2; exit 1
+            fi
+            jq '.nodes.a.locked.rev = "a2"' flake.lock > l && mv l flake.lock; echo d-a > "$T/drv" ;;
+        esac ;;
     esac ;;
   *) echo "fake nix: unexpected call: $*" >&2; exit 99 ;;
 esac
@@ -401,4 +413,34 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
   [ "$status" -eq 0 ]
   [[ "$output" == *"no GitHub token"* ]]
   ! grep -q "extra-access-tokens" "$T/nix-config"
+}
+
+# A lock with two real root inputs, `a` alphabetically first.
+two_inputs() {
+  cat > "$T/work/flake.lock" <<'LOCK'
+{"nodes":{"root":{"inputs":{"a":"a","b":"b"}},
+ "a":{"locked":{"type":"github","rev":"a1"}},
+ "b":{"locked":{"type":"github","rev":"b1"}}},"root":"root","version":7}
+LOCK
+  git -C "$T/work" commit -qam two-inputs
+}
+
+@test "a bump coupled to another input's waits for it, then is carried — whatever the order" {
+  two_inputs
+  STUB_HAS_PACKAGES=true STUB_UPDATE=coupled run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"deferred"* ]]
+  [ "$(relock_commits)" -eq 2 ]
+  [ "$(git -C "$T/work" log --format=%s -2 | tr '\n' '|')" = "chore(flake): relock a|chore(flake): relock b|" ]
+  [ "$(jq -r '.nodes.a.locked.rev + .nodes.b.locked.rev' "$T/work/flake.lock")" = "a2b2" ]
+}
+
+@test "a coupling that persists is a clear failure, and leaves nothing behind" {
+  two_inputs
+  STUB_HAS_PACKAGES=true STUB_UPDATE=coupled-forever run "$T/relock" --no-push inputs
+  [[ "$output" == *"FAILED — still coupled"* ]]
+  [[ "$output" == *"follows a non-existent input"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+  [ "$(jq -r '.nodes.a.locked.rev' "$T/work/flake.lock")" = "a1" ]
+  tree_clean
 }
