@@ -56,8 +56,11 @@ case "$*" in
       *) printf '%s' "$T/bin/consumer-relock" ;;
     esac ;;
   *"regen-x.program"*) printf '%s' "$T/bin/regen-x" ;;
+  *"lock-envs.program"*) printf '%s' "$T/bin/lock-envs" ;;
   *"#apps."*)     [ -n "${STUB_REGEN:-}" ] && echo '["regen-x"]' || echo '[]' ;;
   *"#packages."*) printf '{"p":"/nix/store/%s.drv"}\n' "$(cat "$T/drv")" ;;
+  # The catalog re-pinning this repo (`selfPinName` defaults to the name, `t`) at STUB_PIN.
+  *"flake update t "*) jq --arg r "$STUB_PIN" '.nodes.t.locked.rev = $r' flake.lock > l && mv l flake.lock ;;
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
@@ -110,7 +113,12 @@ FAKE
 [ "${STUB_GH:-ok}" = fail ] && { echo "not logged in" >&2; exit 1; }
 echo SIMULATED-GH-TOKEN
 FAKE
-  chmod +x "$T/bin/regen-x" "$T/bin/consumer-relock" "$T/bin/gh"
+  # The catalog's lock-envs: it commits a re-locked env, as the real one does on a real bump.
+  printf '#!%s\n' "$(command -v bash)" > "$T/bin/lock-envs"
+  cat >> "$T/bin/lock-envs" <<'FAKE'
+echo relocked >> env.lock && git add env.lock && git commit -qm "chore(flox): relock env"
+FAKE
+  chmod +x "$T/bin/regen-x" "$T/bin/consumer-relock" "$T/bin/gh" "$T/bin/lock-envs"
   export PATH="$T/bin:$PATH" T
   echo d1 > "$T/drv"
   echo app1 > "$T/app-drv"
@@ -138,6 +146,16 @@ mk_orphan() {
   git -C "$T/work" checkout -q --orphan orphan
   git -C "$T/work" commit -qm orphan
   git -C "$T/work" push -qu origin orphan 2>/dev/null
+}
+# The catalog branch, pushed and checked out in its own worktree, pinning this repo at an old rev.
+mk_cat() {
+  git -C "$T/work" branch cat
+  git -C "$T/work" push -qu origin cat 2>/dev/null
+  git -C "$T/work" worktree add -q "$T/cat" cat
+  cat > "$T/cat/flake.lock" <<'LOCK'
+{"nodes":{"root":{"inputs":{"t":"t"}},"t":{"locked":{"type":"github","rev":"old"}}},"root":"root","version":7}
+LOCK
+  git -C "$T/cat" commit -qm pin -- flake.lock && git -C "$T/cat" push -q 2>/dev/null
 }
 never_updated() { ! grep -q "flake update" "$T/calls" 2>/dev/null; }
 
@@ -377,6 +395,57 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
   [[ "$output" != *"re-pinning the catalog"* ]]
   [[ "$output" == *"&& (cd '$T/work' && nix run .#relock -- envs)"* ]]
   ! grep -q "lock-envs" "$T/calls"
+}
+
+@test "--no-push runs the catalog hop when HEAD is already on the remote — committed there, pushed nowhere" {
+  mk_cat
+  head=$(git -C "$T/work" rev-parse HEAD)
+  cat_remote=$(remote_rev cat)
+  work_remote=$(remote_rev "$DEFAULT")
+  STUB_HAS_PACKAGES=true STUB_PIN=$head run "$T/relock" --no-push envs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is already on its remote — the catalog hop runs, and pushes nothing"* ]]
+  [[ "$output" == *"verified: catalog pins t ${head:0:9}"* ]]
+  [[ "$output" == *"cat NOT pushed: 2 commit(s) in $T/cat (cat)"* ]]
+  [[ "$output" == *"git -C '$T/cat' push"* ]]
+  [[ "$output" == *"DONE (not pushed)"* ]]
+  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = "$head" ]
+  [ "$(remote_rev cat)" = "$cat_remote" ]
+  [ "$(remote_rev "$DEFAULT")" = "$work_remote" ]
+}
+
+@test "--no-push skips the catalog hop for a commit an EARLIER run left unpushed — measured, not remembered" {
+  mk_cat
+  echo y > "$T/work/y" && git -C "$T/work" add y && git -C "$T/work" commit -qm earlier
+  cat_remote=$(remote_rev cat)
+  STUB_HAS_PACKAGES=true STUB_PIN=unused run "$T/relock" --no-push envs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"catalog hop SKIPPED"* ]]
+  [[ "$output" == *"&& (cd '$T/work' && nix run .#relock -- envs)"* ]]
+  ! grep -q "lock-envs" "$T/calls"
+  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = old ]
+  [ "$(remote_rev cat)" = "$cat_remote" ]
+}
+
+@test "--no-push: a fetch that fails is fatal to the catalog hop, never read as landed" {
+  mk_cat
+  # The url keeps its slug, so the checkout is still recognised as this repo's; only the fetch fails.
+  mv "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/t.git.gone"
+  STUB_HAS_PACKAGES=true STUB_PIN=x run "$T/relock" --no-push envs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot tell whether"* ]]
+  ! grep -q "lock-envs" "$T/calls"
+  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = old ]
+}
+
+@test "--no-push: a branch with no upstream is fatal to the catalog hop, never read as landed" {
+  mk_cat
+  git -C "$T/work" branch -q --unset-upstream
+  STUB_HAS_PACKAGES=true STUB_PIN=x run "$T/relock" --no-push envs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot tell whether"* ]]
+  ! grep -q "lock-envs" "$T/calls"
+  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = old ]
 }
 
 @test "--no-push refuses a requested run: unpushed commits in a clone would be lost" {

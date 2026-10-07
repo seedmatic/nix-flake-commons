@@ -608,7 +608,30 @@ fi
 # worktree — so pushing only on a change was the hole: any other commit left HEAD
 # unpushed and the catalog silently pinned an older rev while reporting a clean bump
 # (measured 2026-09-30: catalog at 9ccd89923 while HEAD was fec07de85).
+#
+# The catalog hop pins the revision the REMOTE answers, so under --no-push it runs only when that
+# revision is already there: nothing between the upstream, freshly fetched, and HEAD. Which commits
+# this run made does not answer it — a commit left unpushed by an earlier run counts the same.
+# Not knowing is fatal: a failed fetch or a missing upstream must never read as "landed".
+landed() { # -> 0 HEAD is on the remote, 1 it is not, 2 cannot tell
+  local unpushed
+  git -C "$REPO" fetch --quiet || return 2
+  git -C "$REPO" rev-parse --verify --quiet '@{u}' >/dev/null || return 2
+  unpushed=$(git -C "$REPO" rev-list '@{u}..HEAD') || return 2
+  [ -z "$unpushed" ] || return 1
+}
 if [ "$nopush" = 1 ]; then
+  hop=0
+  if [ -n "$CATALOG" ] && { [ "$do_catalog" = 1 ] || [ "$committed" = 1 ]; }; then
+    rc=0
+    landed || rc=$?
+    if [ "$rc" = 2 ]; then
+      echo "relock: cannot tell whether $cur is on its remote (fetch failed, or no upstream) —" >&2
+      echo "        refusing the catalog hop rather than pinning a revision that may not be there" >&2
+      exit 1
+    fi
+    if [ "$rc" = 0 ]; then hop=1; fi
+  fi
   ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
   echo "== NOT pushed (--no-push) =="
   echo "  @repoName@ ($cur): $ahead commit(s) ahead of its upstream — review them with:"
@@ -616,24 +639,29 @@ if [ "$nopush" = 1 ]; then
   resume=()
   if [ -n "$FIRST" ]; then resume+=("git -C '$FIRST' push origin '$pushFirstBranch'"); fi
   resume+=("git -C '$REPO' push")
-  # The catalog hop measures the revision a push landed, so it can only follow a push. `envs`, not
-  # `catalog`: the catalog target alone re-pins without re-locking a single env.
-  if [ -n "$CATALOG" ] && { [ "$do_catalog" = 1 ] || [ "$committed" = 1 ]; }; then
-    echo "  catalog hop SKIPPED: it measures the revision a push landed"
+  # `envs`, not `catalog`: the catalog target alone re-pins without re-locking a single env.
+  if [ -n "$CATALOG" ] && { [ "$do_catalog" = 1 ] || [ "$committed" = 1 ]; } && [ "$hop" = 0 ]; then
+    echo "  catalog hop SKIPPED: $cur has commits its remote does not have, and the hop pins the remote's"
     resume+=("(cd '$REPO' && nix run .#relock -- envs)")
   fi
   echo
-  echo "To resume where this stopped:"
-  printf '  %s' "${resume[0]}"
-  for r in "${resume[@]:1}"; do printf ' && %s' "$r"; done
+  if [ "$hop" = 0 ]; then
+    echo "To resume where this stopped:"
+    printf '  %s' "${resume[0]}"
+    for r in "${resume[@]:1}"; do printf ' && %s' "$r"; done
+    echo
+    echo "DONE (not pushed)"
+    exit 0
+  fi
+  pushed_head=$(git -C "$REPO" rev-parse HEAD)
+  echo "  @repoName@ @ ${pushed_head:0:9} is already on its remote — the catalog hop runs, and pushes nothing"
   echo
-  echo "DONE (not pushed)"
-  exit 0
+else
+  git -C "$REPO" push
+  pushed_head=$(git -C "$REPO" rev-parse HEAD)
+  echo "  @repoName@ @ ${pushed_head:0:9} pushed"
+  echo
 fi
-git -C "$REPO" push
-pushed_head=$(git -C "$REPO" rev-parse HEAD)
-echo "  @repoName@ @ ${pushed_head:0:9} pushed"
-echo
 
 # ⚠️ `-n "$CATALOG"` is load-bearing, and its absence was a latent defect: the header claims this
 # implementation serves a repo with no such branch, yet an unguarded hop would `lockrev "/flake.lock"`
@@ -677,9 +705,19 @@ if [ "$do_catalog" = 1 ] && [ -n "$CATALOG" ]; then
     echo "catalog tracks and that the push above reached the remote." >&2
     exit 1
   fi
-  echo "  verified: catalog pins @selfPinName@ ${pushed_head:0:9} — the revision this run pushed"
+  echo "  verified: catalog pins @selfPinName@ ${pushed_head:0:9} — the revision on the remote"
   ahead=$(git -C "$CATALOG" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
-  if [ "${ahead:-0}" -gt 0 ] 2>/dev/null; then
+  if [ "$nopush" = 1 ]; then
+    echo "  @catalogBranch@ NOT pushed: $ahead commit(s) in $CATALOG (@catalogBranch@) — review them with:"
+    echo "    git -C '$CATALOG' log --stat '@{u}..HEAD'"
+    echo
+    echo "To resume where this stopped:"
+    printf '  '
+    if [ -n "$FIRST" ]; then printf '%s && ' "git -C '$FIRST' push origin '$pushFirstBranch'"; fi
+    printf '%s\n' "git -C '$CATALOG' push"
+    echo "DONE (not pushed)"
+    exit 0
+  elif [ "${ahead:-0}" -gt 0 ] 2>/dev/null; then
     git -C "$CATALOG" push
     echo "  @catalogBranch@ pushed $ahead commit(s)"
   else
