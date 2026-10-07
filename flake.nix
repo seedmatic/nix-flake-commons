@@ -100,11 +100,6 @@
       url = "github:nxmatic/nix-socket-vmnet/develop";
     };
 
-    zen-browser = {
-      flake = true;
-      url = "github:nxmatic/nix-zen-browser/develop";
-    };
-
   };
 
   # The aggregator's first outputs: the shared `relock` tool, and this repo's own use of it.
