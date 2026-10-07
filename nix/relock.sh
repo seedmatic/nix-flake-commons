@@ -45,6 +45,10 @@ An input bump that moves no exported derivation is DROPPED, not carried.
 --downstream then REQUESTS each declared consumer's own relock.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
+
+GitHub token: read from `gh auth token` at each run and handed ONLY to relock's own nix calls,
+as extra-access-tokens appended to NIX_CONFIG. Never written anywhere, never exported, and never
+passed to the programs those calls build (regen apps, lock-envs, a consumer's relock).
 USAGE
       if [ "${#aliases[@]}" -gt 0 ]; then
         printf '\nAliases this repo declares:\n'
@@ -61,6 +65,43 @@ if [ "$nopush" = 1 ] && [ "$downstream" = 1 ]; then
   echo "relock: --no-push and --downstream contradict each other — a consumer sees only what is pushed" >&2
   exit 2
 fi
+
+# The GitHub token, for the PRIVATE inputs (measured 2026-10-07: without one, nix fetched ndh's
+# private claude-hub input as a 404 and fell back to a stale cache). Taken from `gh auth token` at
+# each run rather than stored: the copy that used to live in nix.conf expired and nobody noticed.
+#
+# ⚠️ Scoped to relock's OWN nix calls, and that is the whole design. The variable is NOT exported,
+# and `nix` below is a function that appends the token to NIX_CONFIG for that one process only —
+# APPENDED, as extra-access-tokens, because NIX_CONFIG may already carry settings (the flox hook
+# puts the flake registry there) and `access-tokens` would replace nix.conf's. A token in a
+# process-wide variable is how GH_TOKEN once leaked into an editor; and `nix run` would hand its
+# environment to the program it starts, which is why apps are built here and run without it.
+gh_token=""
+if command -v gh >/dev/null 2>&1 && gh_token=$(gh auth token 2>/dev/null) && [ -n "$gh_token" ]; then
+  :
+else
+  gh_token=""
+  echo "relock: no GitHub token ('gh auth token' gave none) — private inputs will fail to fetch" >&2
+fi
+nix() {
+  if [ -n "$gh_token" ]; then
+    NIX_CONFIG="${NIX_CONFIG:+$NIX_CONFIG
+}extra-access-tokens = github.com=$gh_token" command nix "$@"
+  else
+    command nix "$@"
+  fi
+}
+
+# An app's program, BUILT with the token, so that running it afterwards needs no fetch and gets no
+# token. `nix build` refuses the program string itself, so its context's derivations are built.
+app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program path on stdout
+  local prog d
+  local -a drvs=()
+  prog=$(nix eval --raw "$1.program") || return 1
+  mapfile -t drvs < <(nix eval --json "$1.program" --apply 'p: builtins.attrNames (builtins.getContext p)' | jq -r '.[]') || return 1
+  for d in "${drvs[@]}"; do nix build --no-link "$d^*" || return 1; done
+  printf '%s\n' "$prog"
+}
 
 # WHOSE repo this reconciles — its OWN, always, and resolved rather than assumed.
 #
@@ -263,10 +304,11 @@ regen_artifact() { # $1 app
   local err
   err=$(mktemp)
   local -a moved=()
-  if ! ( cd "$REPO" && nix run ".#$1" ) >/dev/null 2>"$err"; then
+  local prog
+  if ! prog=$(cd "$REPO" && app_program ".#apps.@system@.$1" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
     mapfile -t moved < <(git -C "$REPO" diff --name-only)
     if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
-    echo "FAILED (nix run .#$1) — restored ${moved[*]:-nothing}"
+    echo "FAILED (regen app $1) — restored ${moved[*]:-nothing}"
     sed 's/^/    /' "$err" >&2
     rm -f "$err"
     return 1
@@ -555,10 +597,11 @@ if [ "$do_catalog" = 1 ] && [ -n "$CATALOG" ]; then
   # lock-envs applies the same guard one level down: it re-locks and commits only real
   # derivation bumps, dropping locked-url churn.
   for e in "${env_targets[@]}"; do
+    lock_envs=$(cd "$CATALOG" && app_program ".#apps.@system@.lock-envs")
     if [ -z "$e" ]; then
-      ( cd "$CATALOG" && nix run .#lock-envs )
+      ( cd "$CATALOG" && "$lock_envs" )
     else
-      ( cd "$CATALOG" && nix run .#lock-envs -- "$e" )
+      ( cd "$CATALOG" && "$lock_envs" "$e" )
     fi
   done
   # ASSERT the landing rather than trust the bump report: a lagging push, a stale
@@ -595,7 +638,7 @@ if [ "$downstream" = 1 ]; then
       echo "FAILED — cannot evaluate $c (its error is above)"
     elif [ "$has_relock" != true ]; then
       echo "exposes no #relock yet — skipped (that app is THAT repo's to add)"
-    elif nix run "$c#relock"; then
+    elif prog=$(app_program "$c#apps.@system@.relock") && "$prog"; then
       echo "  ^ $c done"
     else
       echo "  ^ FAILED — $c's relock exited non-zero (its output is above)"

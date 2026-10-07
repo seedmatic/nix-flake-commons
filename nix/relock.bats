@@ -25,6 +25,7 @@ setup() {
   printf '#!%s\n' "$(command -v bash)" > "$T/bin/nix"
   cat >> "$T/bin/nix" <<'FAKE'
 echo "$*" >> "$T/calls"
+printf '%s\n' "${NIX_CONFIG:-}" >> "$T/nix-config"
 case "$*" in
   *"outputs ? packages"*)
     n=$(( $(cat "$T/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/probes"
@@ -35,13 +36,11 @@ case "$*" in
   *"? relock"*)
     [ "${STUB_CONSUMER:-absent}" = absent ] && { echo false; exit 0; }
     echo true ;;
-  *"run fake:consumer#relock"*)
-    [ "$STUB_CONSUMER" = fail ] && { echo "consumer boom" >&2; exit 3; }
-    exit 0 ;;
+  # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
+  *".program"*"getContext"*) echo '[]' ;;
+  *"fake:consumer#apps."*"relock.program"*) printf '%s' "$T/bin/consumer-relock" ;;
+  *"regen-x.program"*) printf '%s' "$T/bin/regen-x" ;;
   *"#apps."*)     [ -n "${STUB_REGEN:-}" ] && echo '["regen-x"]' || echo '[]' ;;
-  *"run .#regen-x"*)
-    if [ "$STUB_REGEN" = fail ]; then echo '{"half":1}' > artifact.json; echo "regen boom" >&2; exit 4; fi
-    echo '{"fresh":1}' > artifact.json ;;
   *"#packages."*) printf '{"p":"/nix/store/%s.drv"}\n' "$(cat "$T/drv")" ;;
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
@@ -60,6 +59,28 @@ case "$*" in
 esac
 FAKE
   chmod +x "$T/bin/nix"
+
+  # The programs relock runs ITSELF, after building them. Each records the environment it got.
+  printf '#!%s\n' "$(command -v bash)" > "$T/bin/regen-x"
+  cat >> "$T/bin/regen-x" <<'FAKE'
+env > "$T/child-env.regen"
+if [ "$STUB_REGEN" = fail ]; then echo '{"half":1}' > artifact.json; echo "regen boom" >&2; exit 4; fi
+echo '{"fresh":1}' > artifact.json
+FAKE
+  printf '#!%s\n' "$(command -v bash)" > "$T/bin/consumer-relock"
+  cat >> "$T/bin/consumer-relock" <<'FAKE'
+env > "$T/child-env.consumer"
+[ "$STUB_CONSUMER" = fail ] && { echo "consumer boom" >&2; exit 3; }
+exit 0
+FAKE
+  # `gh auth token`, simulated: a stand-in value, never a real token.
+  printf '#!%s\n' "$(command -v bash)" > "$T/bin/gh"
+  cat >> "$T/bin/gh" <<'FAKE'
+[ "$1 $2" = "auth token" ] || exit 2
+[ "${STUB_GH:-ok}" = fail ] && { echo "not logged in" >&2; exit 1; }
+echo SIMULATED-GH-TOKEN
+FAKE
+  chmod +x "$T/bin/regen-x" "$T/bin/consumer-relock" "$T/bin/gh"
   export PATH="$T/bin:$PATH" T
   echo d1 > "$T/drv"
 
@@ -176,7 +197,7 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 
 @test "a failed regen leaves nothing dirty, commits nothing, and says why" {
   STUB_HAS_PACKAGES=true STUB_REGEN=fail run "$T/relock" artifacts
-  [[ "$output" == *"FAILED (nix run .#regen-x)"* ]]
+  [[ "$output" == *"FAILED (regen app regen-x)"* ]]
   [[ "$output" == *"regen boom"* ]]
   [ "$(relock_commits)" -eq 0 ]
   tree_clean
@@ -345,4 +366,39 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
   [[ "$output" == *"cannot fetch"* ]]
   [ "$(relock_commits)" -eq 0 ]
   tree_clean
+}
+
+@test "the gh token reaches relock's own nix calls, appended — an inherited NIX_CONFIG survives" {
+  NIX_CONFIG="flake-registry = /somewhere/registry.json" STUB_HAS_PACKAGES=true STUB_UPDATE=none \
+    run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  grep -q "extra-access-tokens = github.com=SIMULATED-GH-TOKEN" "$T/nix-config"
+  grep -q "flake-registry = /somewhere/registry.json" "$T/nix-config"
+  ! grep -q "^access-tokens" "$T/nix-config"
+}
+
+@test "the token is never printed" {
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_REGEN=ok run "$T/relock" --no-push
+  [[ "$output" != *"SIMULATED-GH-TOKEN"* ]]
+}
+
+@test "a regen app is run WITHOUT the token" {
+  STUB_HAS_PACKAGES=true STUB_REGEN=ok run "$T/relock" --no-push artifacts
+  [[ "$output" == *"REGENERATED"* ]]
+  [ -f "$T/child-env.regen" ]
+  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.regen"
+}
+
+@test "a consumer's relock is run WITHOUT the token" {
+  STUB_HAS_PACKAGES=true STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+  [[ "$output" == *"fake:consumer done"* ]]
+  [ -f "$T/child-env.consumer" ]
+  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.consumer"
+}
+
+@test "no token from gh: said, and the run goes on without one" {
+  STUB_GH=fail STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no GitHub token"* ]]
+  ! grep -q "extra-access-tokens" "$T/nix-config"
 }
