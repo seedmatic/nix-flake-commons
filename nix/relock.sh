@@ -349,8 +349,8 @@ nix_update() {
 }
 
 # Inputs whose bump had to wait for another one. Measured 2026-10-07 on rke2lab: ndh, as locked,
-# followed `flake-commons/socket-vmnet`; bumping flake-commons FIRST — alphabetical order — removed
-# that input, and nix refused the whole lock. Bumping ndh first would have worked. But no FIXED order
+# followed an input of flake-commons that the newer flake-commons had dropped; bumping flake-commons
+# FIRST — alphabetical order — removed that input, and nix refused the whole lock. Bumping ndh first would have worked. But no FIXED order
 # is right: the next coupling may run the other way, a new ndh following an input only the new
 # flake-commons has. So the order is discovered, not chosen: such a bump is set aside with its lock
 # restored, retried ONCE after every other target, and only then reported as failed.
