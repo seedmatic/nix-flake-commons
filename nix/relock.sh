@@ -185,7 +185,9 @@ else
     echo "        in a clone, the unpushed commits would be lost with it" >&2
     exit 2
   fi
-  REPO=$(mktemp -d)/@repoName@
+  # Canonical, because nix refuses a git+file flake whose path crosses a symlink once its tree is
+  # dirty — and a bumped lock makes it dirty. TMPDIR may well cross one (macOS: /tmp -> private/tmp).
+  REPO=$(cd "$(mktemp -d)" && pwd -P)/@repoName@
   clone_branch=()
   if [ -n "$ownBranch" ]; then clone_branch=(--branch "$ownBranch"); fi
   echo "relock(@repoName@): not inside this repo — cloning @repoUrl@ ${ownBranch:+($ownBranch) }to reconcile and push"
@@ -391,6 +393,17 @@ nix_update() {
 deferred=()
 retrying=0
 
+# Every target that FAILED in this run, named. A failure does not stop the others, and what did
+# succeed is still pushed — but the run then ends non-zero with the list, so a requesting run reads
+# a failure, not "done", and counts it in its own list in turn, up to the root.
+failed=()
+finish() { # $1 the word for success
+  if [ "${#failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
+  echo "FAILED: ${#failed[@]} target(s)"
+  printf '  %s\n' "${failed[@]}"
+  exit 1
+}
+
 relock_input() { # $1 input name
   printf '  %-18s ' "$1"
   local rc=0
@@ -547,12 +560,12 @@ for t in "${targets[@]}"; do
     # Every generated artifact this repo knows how to re-derive.
     artifacts)
       echo "== artifacts (every regen-* app) =="
-      while read -r app; do regen_artifact "$app" || true; done < <(regen_apps)
+      while read -r app; do regen_artifact "$app" || failed+=("regen $app"); done < <(regen_apps)
       echo ;;
-    regen-*)  echo "== $t ==" ; regen_artifact "$t" || true ; echo ;;
+    regen-*)  echo "== $t ==" ; regen_artifact "$t" || failed+=("regen $t") ; echo ;;
     inputs)
       echo "== inputs =="
-      while read -r i; do relock_input "$i" || true; done < <(all_inputs)
+      while read -r i; do relock_input "$i" || failed+=("input $i"); done < <(all_inputs)
       echo ;;
     # ⚠️ The env locks are NOT taken here. They resolve `path:../../..#<attr>` against the
     # CATALOG's flake, so locking before its rke2lab pin moves records the OLD derivation
@@ -574,7 +587,7 @@ for t in "${targets[@]}"; do
     *)
       if all_inputs | grep -qx -- "$t"; then
         echo "== input $t =="
-        relock_input "$t" || true
+        relock_input "$t" || failed+=("input $t")
         echo
       else
         echo "relock: unknown target '$t' (try --help)" >&2
@@ -586,7 +599,7 @@ done
 if [ "${#deferred[@]}" -gt 0 ]; then
   echo "== deferred inputs: retried once, after the others =="
   retrying=1
-  for i in "${deferred[@]}"; do relock_input "$i" || true; done
+  for i in "${deferred[@]}"; do relock_input "$i" || failed+=("input $i"); done
   echo
 fi
 
@@ -650,8 +663,7 @@ if [ "$nopush" = 1 ]; then
     printf '  %s' "${resume[0]}"
     for r in "${resume[@]:1}"; do printf ' && %s' "$r"; done
     echo
-    echo "DONE (not pushed)"
-    exit 0
+    finish "DONE (not pushed)"
   fi
   pushed_head=$(git -C "$REPO" rev-parse HEAD)
   echo "  @repoName@ @ ${pushed_head:0:9} is already on its remote — the catalog hop runs, and pushes nothing"
@@ -715,8 +727,7 @@ if [ "$do_catalog" = 1 ] && [ -n "$CATALOG" ]; then
     printf '  '
     if [ -n "$FIRST" ]; then printf '%s && ' "git -C '$FIRST' push origin '$pushFirstBranch'"; fi
     printf '%s\n' "git -C '$CATALOG' push"
-    echo "DONE (not pushed)"
-    exit 0
+    finish "DONE (not pushed)"
   elif [ "${ahead:-0}" -gt 0 ] 2>/dev/null; then
     git -C "$CATALOG" push
     echo "  @catalogBranch@ pushed $ahead commit(s)"
@@ -759,12 +770,14 @@ if [ "$downstream" = 1 ]; then
     fi
     if ! has_relock=$(nix eval --json "$c#apps.@system@" --apply 'as: as ? relock'); then
       echo "FAILED — cannot evaluate $c (its error is above)"
+      failed+=("consumer $c")
     elif [ "$has_relock" != true ]; then
       echo "exposes no #relock yet — skipped (that app is THAT repo's to add)"
     elif prog=$(app_program "$c#apps.@system@.relock") && "$prog" --downstream; then
       echo "  ^ $c done"
     else
       echo "  ^ FAILED — $c's relock exited non-zero (its output is above)"
+      failed+=("consumer $c")
     fi
   done
 else
@@ -774,4 +787,4 @@ for c in "${skipped[@]}"; do
   echo "NOTE: $c was not relaunched (already visited in this pass) although @repoName@ moved:" \
     "run its relock on the next pass"
 done
-echo "DONE"
+finish "DONE"

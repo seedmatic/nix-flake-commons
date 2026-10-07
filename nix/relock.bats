@@ -29,6 +29,18 @@ setup() {
 echo "$*" >> "$T/calls"
 printf '%s\n' "${NIX_CONFIG:-}" >> "$T/nix-config"
 [ -n "${RELOCK_VISITED_FILE:-}" ] && printf '%s\n' "$RELOCK_VISITED_FILE" > "$T/visited-path"
+# What nix does with a git+file flake whose path crosses a symlink: fine while the tree is clean,
+# refused once it is dirty — and a bumped lock makes it dirty.
+for a in "$@"; do
+  case $a in
+    *git+file://*) p=${a#*git+file://}; p=${p%%\"*} ;;
+    /*\#*) p=${a%%#*} ;;
+    *) continue ;;
+  esac
+  if [ -d "$p" ] && [ "$(cd "$p" && pwd -P)" != "$p" ] && [ -n "$(git -C "$p" status --porcelain --untracked-files=no)" ]; then
+    echo "error: path '$p' is a symlink" >&2; exit 1
+  fi
+done
 case "$*" in
   *"outputs ? packages"*)
     n=$(( $(cat "$T/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/probes"
@@ -64,6 +76,12 @@ case "$*" in
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
+      # Two inputs, one of which cannot be resolved: the other must still be carried.
+      one-fails)
+        case "$*" in
+          *"flake update a "*) jq '.nodes.a.locked.rev = "a2"' flake.lock > l && mv l flake.lock; echo d-a > "$T/drv" ;;
+          *"flake update b "*) echo "error: cannot fetch b" >&2; exit 1 ;;
+        esac ;;
       # flake-commons shipping a new relock: only an app's program moves, no package does.
       app-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo app2 > "$T/app-drv" ;;
       nested) jq '.nodes.x.locked.rev = "x2"' flake.lock > l && mv l flake.lock ;;
@@ -252,6 +270,8 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 
 @test "a re-aim at a local checkout is refused, and the lock is restored" {
   STUB_HAS_PACKAGES=true STUB_UPDATE=path run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: 1 target(s)"* ]]
   [[ "$output" == *"LOCAL lock REFUSED"* ]]
   [ "$(relock_commits)" -eq 0 ]
   tree_clean
@@ -261,6 +281,8 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 @test "an unreadable lock after an update is NOT waved through the local-lock guard" {
   # An empty answer from the guard's own read is what "not local" looks like.
   STUB_HAS_PACKAGES=true STUB_UPDATE=garbage run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to read the updated lock"* ]]
   [ "$(relock_commits)" -eq 0 ]
   tree_clean
@@ -269,6 +291,8 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 
 @test "a failed regen leaves nothing dirty, commits nothing, and says why" {
   STUB_HAS_PACKAGES=true STUB_REGEN=fail run "$T/relock" artifacts
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: 1 target(s)"* ]]
   [[ "$output" == *"FAILED (regen app regen-x)"* ]]
   [[ "$output" == *"regen boom"* ]]
   [ "$(relock_commits)" -eq 0 ]
@@ -285,6 +309,8 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 
 @test "--downstream: a consumer whose relock FAILS is said so, with its stderr" {
   STUB_HAS_PACKAGES=true STUB_CONSUMER=fail run "$T/relock" --downstream inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: 1 target(s)"* ]]
   [[ "$output" == *"FAILED — fake:consumer's relock exited non-zero"* ]]
   [[ "$output" == *"consumer boom"* ]]
   [[ "$output" != *"exposes no #relock"* ]]
@@ -292,6 +318,7 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 
 @test "--downstream: a consumer with no relock is skipped as such" {
   STUB_HAS_PACKAGES=true STUB_CONSUMER=absent run "$T/relock" --downstream inputs
+  [ "$status" -eq 0 ]
   [[ "$output" == *"exposes no #relock yet"* ]]
 }
 
@@ -466,6 +493,8 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
 @test "a fetch that fell back to a CACHE is a failure, never 'already current'" {
   # The ndh/claude-hub case: 404 on the API, a cached copy, exit 0, an unchanged lock.
   STUB_HAS_PACKAGES=true STUB_UPDATE=cached run "$T/relock" --no-push inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to fetch"*"cached copy"* ]]
   [[ "$output" == *"using cached version"* ]]
   [[ "$output" != *"already current"* ]]
@@ -476,6 +505,8 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
 
 @test "a cache fallback that DID rewrite the lock is restored, not carried" {
   STUB_HAS_PACKAGES=true STUB_UPDATE=cached-moved run "$T/relock" --no-push inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to fetch"* ]]
   [[ "$output" != *"BUMPED"* ]]
   [ "$(relock_commits)" -eq 0 ]
@@ -485,6 +516,8 @@ remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/d
 
 @test "a failing update says why, with nix's own error" {
   STUB_HAS_PACKAGES=true STUB_UPDATE=failing run "$T/relock" --no-push inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to resolve"* ]]
   [[ "$output" == *"cannot fetch"* ]]
   [ "$(relock_commits)" -eq 0 ]
@@ -547,9 +580,40 @@ LOCK
   [ "$(jq -r '.nodes.a.locked.rev + .nodes.b.locked.rev' "$T/work/flake.lock")" = "a2b2" ]
 }
 
+@test "one input that fails among others: the others are carried and pushed, the run ends non-zero naming it" {
+  two_inputs
+  STUB_HAS_PACKAGES=true STUB_UPDATE=one-fails run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"BUMPED"* ]]
+  [[ "$output" == *"FAILED to resolve"* ]]
+  [[ "$output" == *"FAILED: 1 target(s)"*"input b"* ]]
+  [[ "$output" != *"DONE"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = a2 ]
+}
+
+@test "a consumer that fails is counted: the requesting run ends non-zero and names it" {
+  STUB_HAS_PACKAGES=true STUB_CONSUMER=fail run "$T/relock" --downstream inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: 1 target(s)"*"consumer fake:consumer"* ]]
+  [[ "$output" != *"DONE"* ]]
+}
+
+@test "a requested run measures its bumps in a clone under a TMPDIR that crosses a symlink" {
+  mkdir -p "$T/realtmp" && ln -s "$T/realtmp" "$T/linktmp"
+  mkdir -p "$T/outside" && cd "$T/outside"
+  TMPDIR="$T/linktmp" STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cloned at $DEFAULT"* ]]
+  [[ "$output" == *"BUMPED"* ]]
+  [[ "$output" != *"is a symlink"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
+}
+
 @test "a coupling that persists is a clear failure, and leaves nothing behind" {
   two_inputs
   STUB_HAS_PACKAGES=true STUB_UPDATE=coupled-forever run "$T/relock" --no-push inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED: 1 target(s)"* ]]
   [[ "$output" == *"FAILED — still coupled"* ]]
   [[ "$output" == *"follows a non-existent input"* ]]
   [ "$(relock_commits)" -eq 1 ]
