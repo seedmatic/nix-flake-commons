@@ -105,11 +105,6 @@
       url = "github:nxmatic/nix-zen-browser/develop";
     };
 
-    ripvcs = {
-      flake = true;
-      url = "github:nxmatic/nix-ripvcs/develop";
-    };
-
   };
 
   # The aggregator's first outputs: the shared `relock` tool, and this repo's own use of it.
