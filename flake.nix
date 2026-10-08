@@ -105,8 +105,12 @@
   # host: it has third-party inputs of its own to bump, and relock measures an aggregator's impact
   # on the revisions it locks, since its inputs are what it exports.
   #
-  # `consumers` stays empty on purpose: from here, the closure that needs reconciling is the forward
-  # one — the inputs. The eight repos that follow this one pick a bump up at their own relock.
+  # `consumers` names every flake that pins this one and that no other relock reaches: flox-controller,
+  # flox-nri-plugin and seed-incluster, whose one consumer, rke2lab, forces their inputs by `follows`
+  # and so never relocks them; seat-roster, which nobody pins; then rke2lab. The first of them to
+  # commit requests rke2lab, which carries ndh, nnh and nch behind it; the next ones only NOTE that
+  # rke2lab pins them one commit behind — harmless, the follows keep that commit out of rke2lab's
+  # closure. flox-catalog is not listed: rke2lab's catalog hop is its relock.
   outputs = { self, nixpkgs, flake-utils, home-manager, ... }:
     {
       lib.mkRelockApp = import ./nix/relock.nix;
@@ -151,6 +155,18 @@
           cycleB = peerRelock "peer" "seedmatic/peer" [ "github:seedmatic/t" ];
           chainB = peerRelock "peer" "seedmatic/peer" [ "github:seedmatic/peer2" ];
           chainC = peerRelock "peer2" "seedmatic/peer2" [ "github:seedmatic/t" ];
+          # The root's shape: it requests an orphan of a repo AND that repo, and the orphan requests
+          # the repo too. Two flakes of one repo are two visits, never one.
+          rootR = peerRelock "t" "seedmatic/t" [ "github:seedmatic/peer/orphan" "github:seedmatic/peer" ];
+          rootOrphan = self.lib.mkRelockApp {
+            inherit pkgs;
+            name = "peer-orphan";
+            slug = "seedmatic/peer";
+            url = "file:///nonexistent/seedmatic/peer.git";
+            branch = "orphan";
+            consumers = [ "github:seedmatic/peer" ];
+          };
+          rootPeer = peerRelock "peer" "seedmatic/peer" [ ];
           # The same repo's OTHER flake, the one on an orphan branch.
           underTestOnBranch = self.lib.mkRelockApp {
             inherit pkgs;
@@ -169,6 +185,9 @@
           RELOCK_CYCLE_B = "${cycleB}/bin/relock";
           RELOCK_CHAIN_B = "${chainB}/bin/relock";
           RELOCK_CHAIN_C = "${chainC}/bin/relock";
+          RELOCK_ROOT_R = "${rootR}/bin/relock";
+          RELOCK_ROOT_ORPHAN = "${rootOrphan}/bin/relock";
+          RELOCK_ROOT_PEER = "${rootPeer}/bin/relock";
         } ''
           export HOME=$TMPDIR
           bats --print-output-on-failure ${./nix/relock.bats}
@@ -202,9 +221,16 @@
             name = "nix-flake-commons";
             slug = "seedmatic/nix-flake-commons";
             url = "https://github.com/seedmatic/nix-flake-commons.git";
+            consumers = [
+              "github:seedmatic/flox-controller"
+              "github:seedmatic/flox-nri-plugin"
+              "github:seedmatic/seat-roster"
+              "github:seedmatic/rke2lab/seed-incluster"
+              "github:seedmatic/rke2lab"
+            ];
           }
         }/bin/relock";
-        meta.description = "Reconcile THIS repo's locks: bump each input, DROP any bump that moves nothing it exports, push";
+        meta.description = "Reconcile THIS repo's locks: bump each input, DROP any bump that moves nothing it exports, push. --downstream requests each declared consumer's own relock";
       };
     });
 

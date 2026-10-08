@@ -195,6 +195,19 @@ else
   git clone --quiet --depth=1 "${clone_branch[@]}" "@repoUrl@" "$REPO" || { echo "relock: cannot clone @repoUrl@ $ownBranch" >&2; exit 1; }
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
   echo "relock(@repoName@): cloned at $cur"
+  # The catalog hop is this repo's OWN act, so a requested run owes it as much as a local one. A
+  # clone carries no worktree of the catalog branch, so the branch is checked out here, tracking its
+  # remote, and a catalog branch the remote does not have is a failure, not a skip.
+  # A shallow clone is single-branch: the branch is added to origin's refspec, or `--track` refuses it.
+  if [ -n "$catalogBranch" ]; then
+    if ! git -C "$REPO" remote set-branches --add origin "$catalogBranch" \
+      || ! git -C "$REPO" fetch --quiet --depth=1 origin "$catalogBranch" \
+      || ! git -C "$REPO" worktree add --quiet --track -b "$catalogBranch" "${REPO%/*}/$catalogBranch" "origin/$catalogBranch"; then
+      echo "relock: cannot check out @repoName@'s catalog branch '$catalogBranch' from @repoUrl@ —" >&2
+      echo "        refusing to reconcile without the hop that carries this repo to its envs" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # The registry that resolves a repo's INDIRECT inputs, pinned by a CLI flag rather than left to

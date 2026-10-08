@@ -19,8 +19,9 @@ setup() {
   sed '/^export PATH=/d' "$RELOCK" > "$T/relock"
   sed '/^export PATH=/d' "$RELOCK_ON_BRANCH" > "$T/relock-on-branch"
   sed '/^export PATH=/d' "$RELOCK_GITHUB" > "$T/relock-github"
-  for g in GRAPH_A CYCLE_B CHAIN_B CHAIN_C; do v="RELOCK_$g"; sed '/^export PATH=/d' "${!v}" > "$T/relock-$g"; done
-  chmod +x "$T/relock" "$T/relock-on-branch" "$T/relock-github" "$T"/relock-GRAPH_A "$T"/relock-CYCLE_B "$T"/relock-CHAIN_B "$T"/relock-CHAIN_C
+  for g in GRAPH_A CYCLE_B CHAIN_B CHAIN_C ROOT_R ROOT_ORPHAN ROOT_PEER; do v="RELOCK_$g"; sed '/^export PATH=/d' "${!v}" > "$T/relock-$g"; done
+  chmod +x "$T/relock" "$T/relock-on-branch" "$T/relock-github" "$T"/relock-GRAPH_A "$T"/relock-CYCLE_B "$T"/relock-CHAIN_B "$T"/relock-CHAIN_C \
+    "$T"/relock-ROOT_R "$T"/relock-ROOT_ORPHAN "$T"/relock-ROOT_PEER
 
   # The fake nix. It records every call, and answers each question relock asks. Its shebang is the
   # bash on PATH, not /usr/bin/env: the Linux build sandbox does not promise /usr/bin/env.
@@ -65,14 +66,19 @@ case "$*" in
       chain:*"github:seedmatic/peer#"*) printf '%s' "$T/relock-CHAIN_B" ;;
       chain:*"github:seedmatic/peer2#"*) printf '%s' "$T/relock-CHAIN_C" ;;
       chain:*"github:seedmatic/t#"*)    printf '%s' "$T/relock-GRAPH_A" ;;
+      root:*"github:seedmatic/peer/orphan#"*) printf '%s' "$T/relock-ROOT_ORPHAN" ;;
+      root:*"github:seedmatic/peer#"*)  printf '%s' "$T/relock-ROOT_PEER" ;;
       *) printf '%s' "$T/bin/consumer-relock" ;;
     esac ;;
   *"regen-x.program"*) printf '%s' "$T/bin/regen-x" ;;
   *"lock-envs.program"*) printf '%s' "$T/bin/lock-envs" ;;
   *"#apps."*)     [ -n "${STUB_REGEN:-}" ] && echo '["regen-x"]' || echo '[]' ;;
   *"#packages."*) printf '{"p":"/nix/store/%s.drv"}\n' "$(cat "$T/drv")" ;;
-  # The catalog re-pinning this repo (`selfPinName` defaults to the name, `t`) at STUB_PIN.
-  *"flake update t "*) jq --arg r "$STUB_PIN" '.nodes.t.locked.rev = $r' flake.lock > l && mv l flake.lock ;;
+  # The catalog re-pinning this repo (`selfPinName` defaults to the name, `t`) at STUB_PIN —
+  # `@remote` for the head the remote answers, when the test cannot know it before the run.
+  *"flake update t "*)
+    r=$STUB_PIN; [ "$r" = @remote ] && r=$(git -C "$T/remote/seedmatic/t.git" rev-parse HEAD)
+    jq --arg r "$r" '.nodes.t.locked.rev = $r' flake.lock > l && mv l flake.lock ;;
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
@@ -373,6 +379,7 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 @test "a requested run of a flake with no branch still clones the default branch" {
   mk_orphan
   git -C "$T/work" checkout -q "$DEFAULT"
+  mk_cat
   mkdir -p "$T/outside" && cd "$T/outside"
   STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
@@ -600,9 +607,10 @@ LOCK
 }
 
 @test "a requested run measures its bumps in a clone under a TMPDIR that crosses a symlink" {
+  mk_cat
   mkdir -p "$T/realtmp" && ln -s "$T/realtmp" "$T/linktmp"
   mkdir -p "$T/outside" && cd "$T/outside"
-  TMPDIR="$T/linktmp" STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+  TMPDIR="$T/linktmp" STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_PIN=@remote run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"cloned at $DEFAULT"* ]]
   [[ "$output" == *"BUMPED"* ]]
@@ -611,9 +619,10 @@ LOCK
 }
 
 @test "a requested run clones shallow, and its bump is measured and pushed fast-forward" {
+  mk_cat
   before=$(remote_rev "$DEFAULT")
   mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_PIN=@remote run "$T/relock" inputs
   [ "$status" -eq 0 ]
   clone=$(printf '%s\n' "$output" | sed -n "s/^  t ($DEFAULT) : //p")
   [ -n "$clone" ]
@@ -621,6 +630,27 @@ LOCK
   [[ "$output" == *"BUMPED"* ]]
   [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
   [ "$(git -C "$T/remote/seedmatic/t.git" rev-parse "$DEFAULT^")" = "$before" ]
+}
+
+@test "a requested run carries its catalog: the hop runs in the clone and pushes the pin of what it pushed" {
+  mk_cat
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_PIN=@remote run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"cat : <no worktree>"* ]]
+  [[ "$output" == *"verified: catalog pins t"* ]]
+  grep -q "lock-envs" "$T/calls"
+  [ "$(git -C "$T/remote/seedmatic/t.git" show cat:flake.lock | jq -r .nodes.t.locked.rev)" = "$(remote_rev "$DEFAULT")" ]
+}
+
+@test "a requested run whose catalog branch is not on the remote fails, it does not skip the hop" {
+  before=$(remote_rev "$DEFAULT")
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot check out t's catalog branch 'cat'"* ]]
+  never_updated
+  [ "$(remote_rev "$DEFAULT")" = "$before" ]
 }
 
 @test "a coupling that persists is a clear failure, and leaves nothing behind" {
@@ -754,5 +784,19 @@ peers() {
   [ "$(grep -c 'relock(peer): not inside this repo' <<<"$output")" -eq 1 ]
   [ "$(grep -c 'relock(peer2): not inside this repo' <<<"$output")" -eq 1 ]
   [[ "$output" == *"github:seedmatic/t"*"already visited in this pass — not relaunched"* ]]
+  [ "$(grep -c '^DONE$' <<<"$output")" -eq 3 ]
+}
+
+@test "transitive: an orphan of a repo and the repo are two visits — the root reaches both, each once" {
+  mk_orphan
+  git -C "$T/work" checkout -q "$DEFAULT"
+  peers peer
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_GRAPH=root STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+    run "$T/relock-ROOT_R" --downstream inputs
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'relock(peer-orphan): cloned at orphan' <<<"$output")" -eq 1 ]
+  [ "$(grep -c 'relock(peer): cloned at' <<<"$output")" -eq 1 ]
+  [[ "$output" == *"github:seedmatic/peer "*"already visited in this pass — not relaunched"* ]]
   [ "$(grep -c '^DONE$' <<<"$output")" -eq 3 ]
 }
