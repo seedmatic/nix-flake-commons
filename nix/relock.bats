@@ -643,12 +643,23 @@ LOCK
   [ "$(git -C "$T/remote/seedmatic/t.git" show cat:flake.lock | jq -r .nodes.t.locked.rev)" = "$(remote_rev "$DEFAULT")" ]
 }
 
+@test "a requested run's catalog is a clone of its own, full — never a worktree linked to the shallow clone" {
+  mk_cat
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  cat=$(printf '%s\n' "$output" | sed -n 's/^  cat : //p')
+  [ -n "$cat" ] && [ -d "$cat" ]
+  [ "$(git -C "$cat" rev-parse --absolute-git-dir)" = "$(cd "$cat" && pwd -P)/.git" ]
+  [ "$(git -C "$cat" rev-parse --is-shallow-repository)" = false ]
+}
+
 @test "a requested run whose catalog branch is not on the remote fails, it does not skip the hop" {
   before=$(remote_rev "$DEFAULT")
   mkdir -p "$T/outside" && cd "$T/outside"
   STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -ne 0 ]
-  [[ "$output" == *"cannot check out t's catalog branch 'cat'"* ]]
+  [[ "$output" == *"cannot clone t's catalog branch 'cat'"* ]]
   never_updated
   [ "$(remote_rev "$DEFAULT")" = "$before" ]
 }

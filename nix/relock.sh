@@ -152,6 +152,7 @@ pushFirstBranch="@pushFirstBranch@"
 catalogBranch="@catalogBranch@"
 cur=""
 REPO=""
+catalogClone=""
 if top=$(git rev-parse --show-toplevel 2>/dev/null); then
   origin=$(git -C "$top" remote get-url origin 2>/dev/null || true)
   origin=${origin%.git}
@@ -196,14 +197,14 @@ else
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
   echo "relock(@repoName@): cloned at $cur"
   # The catalog hop is this repo's OWN act, so a requested run owes it as much as a local one. A
-  # clone carries no worktree of the catalog branch, so the branch is checked out here, tracking its
-  # remote, and a catalog branch the remote does not have is a failure, not a skip.
-  # A shallow clone is single-branch: the branch is added to origin's refspec, or `--track` refuses it.
+  # clone carries no checkout of the catalog branch, so the branch is cloned here, and a catalog
+  # branch the remote does not have is a failure, not a skip.
+  # ⚠️ A clone of its OWN, full: nix reads a flake through libgit2, which does not see the shallow
+  # boundary of a worktree linked to a shallow clone and fails on the tip's missing parent.
   if [ -n "$catalogBranch" ]; then
-    if ! git -C "$REPO" remote set-branches --add origin "$catalogBranch" \
-      || ! git -C "$REPO" fetch --quiet --depth=1 origin "$catalogBranch" \
-      || ! git -C "$REPO" worktree add --quiet --track -b "$catalogBranch" "${REPO%/*}/$catalogBranch" "origin/$catalogBranch"; then
-      echo "relock: cannot check out @repoName@'s catalog branch '$catalogBranch' from @repoUrl@ —" >&2
+    catalogClone="${REPO%/*}/$catalogBranch"
+    if ! git clone --quiet --single-branch --branch "$catalogBranch" "@repoUrl@" "$catalogClone"; then
+      echo "relock: cannot clone @repoName@'s catalog branch '$catalogBranch' from @repoUrl@ —" >&2
       echo "        refusing to reconcile without the hop that carries this repo to its envs" >&2
       exit 1
     fi
@@ -516,7 +517,7 @@ relock_input() { # $1 input name
 FIRST=""
 if [ -n "$pushFirstBranch" ]; then FIRST=$(wt_for_branch "$pushFirstBranch") || FIRST=""; fi
 CATALOG=""
-if [ -n "$catalogBranch" ]; then CATALOG=$(wt_for_branch "$catalogBranch") || CATALOG=""; fi
+if [ -n "$catalogBranch" ]; then CATALOG=$(wt_for_branch "$catalogBranch") || CATALOG="$catalogClone"; fi
 
 # There WAS a pre-flight check here: read `original.ref` out of the catalog's lock and refuse
 # if it differed from the branch we stand on. It is gone, and not because it was inconvenient.
