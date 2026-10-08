@@ -43,6 +43,13 @@ for a in "$@"; do
   fi
 done
 case "$*" in
+  # The repo's flake-commons pin, which names the pass's tool when a pass starts outside the tool's repo.
+  *"flake metadata"*)
+    if [ -n "${STUB_FC_METADATA:-}" ]; then printf '%s\n' "$STUB_FC_METADATA"; else
+      printf '%s\n' '{"locks":{"root":"root","nodes":{"root":{"inputs":{"flake-commons":"fc"}},"fc":{"locked":{"type":"github","owner":"seedmatic","repo":"nix-flake-commons","rev":"fc1"}}}}}'
+    fi ;;
+  # The code identity of the tool at that reference: the running tool's own, unless a case says otherwise.
+  *"#lib.relockToolId"*) printf '%s' "${STUB_TOOL_ID:-$RELOCK_TOOL_ID}" ;;
   *"outputs ? packages"*)
     n=$(( $(cat "$T/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/probes"
     mode=$STUB_HAS_PACKAGES
@@ -678,7 +685,7 @@ LOCK
 
 @test "a repo already visited in this pass is skipped before anything else" {
   printf 'seedmatic/t\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true run "$T/relock" inputs
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"already visited in this pass"* ]]
   [ ! -s "$T/calls" ]
@@ -719,7 +726,7 @@ LOCK
 @test "a consumer already visited is not relaunched, and the gap is said when this run moved" {
   # The diamond case: the consumer was reached through another path of the same pass.
   printf 'fake:consumer\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_CONSUMER=ok \
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_CONSUMER=ok \
     run "$T/relock" --downstream inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"fake:consumer"*"already visited in this pass — not relaunched"* ]]
@@ -729,7 +736,7 @@ LOCK
 
 @test "no note when the skipped consumer missed nothing — this run moved nothing" {
   printf 'fake:consumer\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
     run "$T/relock" --downstream inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"not relaunched"* ]]
@@ -738,7 +745,7 @@ LOCK
 
 @test "only the creator removes the visited list" {
   printf 'x\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [ -f "$T/visited" ]
   grep -qx 'seedmatic/t' "$T/visited"
@@ -753,7 +760,7 @@ LOCK
 
 @test "a github: consumer is skipped when its EXACT key is listed — plain, orphan by /branch, orphan by ?ref=" {
   printf 'seedmatic/peer\nseedmatic/peer:orphan/x\nseedmatic/peer2:feat/y\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
     run "$T/relock-github" --downstream inputs
   [ "$status" -eq 0 ]
   [ "$(grep -c 'already visited in this pass — not relaunched' <<<"$output")" -eq 3 ]
@@ -762,7 +769,7 @@ LOCK
 
 @test "a github: consumer whose key is listed in ANOTHER form is relaunched — keys must match exactly" {
   printf 'github:seedmatic/peer\nseedmatic/peer:\nseedmatic/peer/orphan/x\nseedmatic/peer2\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
     run "$T/relock-github" --downstream inputs
   [ "$status" -eq 0 ]
   [ "$(grep -c 'not relaunched' <<<"$output")" -eq 0 ]
@@ -810,4 +817,43 @@ peers() {
   [ "$(grep -c 'relock(peer): cloned at' <<<"$output")" -eq 1 ]
   [[ "$output" == *"github:seedmatic/peer "*"already visited in this pass — not relaunched"* ]]
   [ "$(grep -c '^DONE$' <<<"$output")" -eq 3 ]
+}
+
+@test "a requested run of another tool than the pass's refuses before anything, and is not marked visited" {
+  : > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID=another STUB_HAS_PACKAGES=true STUB_UPDATE=rev \
+    run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: relock(t) is tool $RELOCK_TOOL_ID, but this pass runs tool another"* ]]
+  never_updated
+  [ ! -s "$T/visited" ]
+  [ "$(relock_commits)" -eq 0 ]
+}
+
+@test "an inherited pass that names no tool refuses — a requester that does not carry one is another relock" {
+  : > "$T/visited"
+  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"this pass runs tool <none named>"* ]]
+  never_updated
+}
+
+@test "--downstream builds each consumer's relock on the pass's tool, and no override writes a lock" {
+  STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"on the pass's tool github:seedmatic/nix-flake-commons/fc1"* ]]
+  grep -q -- '--override-input flake-commons github:seedmatic/nix-flake-commons/fc1 fake:consumer#apps\..*\.relock\.program' "$T/calls"
+  ! grep -q -- 'fake:consumer#apps.*relock.program' <(grep -v -- '--override-input' "$T/calls")
+  ! grep -q -- '--commit-lock-file' "$T/calls"
+  [ -f "$T/child-env.consumer" ]
+}
+
+@test "a pass whose tool reference holds other code refuses --downstream before anything moves" {
+  before=$(remote_rev "$DEFAULT")
+  STUB_TOOL_ID=other STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING --downstream: github:seedmatic/nix-flake-commons/fc1 is tool other"* ]]
+  never_updated
+  [ ! -f "$T/child-env.consumer" ]
+  [ "$(remote_rev "$DEFAULT")" = "$before" ]
 }

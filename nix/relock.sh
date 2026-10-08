@@ -4,7 +4,7 @@
 #
 # Build-time tokens (written WITHOUT at-sigils here so replaceVars does not substitute them in this
 # comment): repoName, repoSlug, repoUrl, ownBranch, system, consumers, ownedArtifacts,
-# pushFirstBranch, catalogBranch, selfPinName, aliases.
+# pushFirstBranch, catalogBranch, selfPinName, aliases, toolId, toolSlug.
 #
 # ★ WHY the name is identical in every repo: propagation is a REQUEST, and the caller must know
 # nothing about the callee beyond its name — that uniformity is what makes `nix run <any repo>#relock`
@@ -45,6 +45,10 @@ An input bump that moves no exported derivation is DROPPED, not carried.
 --downstream then REQUESTS each declared consumer's own relock, itself with --downstream: ONE such run
 reconciles and PUSHES the whole chain, each repo once (a visited list ends the cycles). Review a
 chain by walking it by hand with --no-push instead.
+A pass runs ONE relock everywhere: every consumer's is built with `--override-input flake-commons`
+on the tool of the run that started the pass, and a relock of any other code refuses. Started from
+nix-flake-commons, that tool is its pushed HEAD; started from another repo, it is that repo's
+flake-commons pin. A consumer's own flake-commons pin is then bumped like any other input.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
 
@@ -79,12 +83,21 @@ visit_branch="@ownBranch@"
 visit_key="@repoSlug@${visit_branch:+:$visit_branch}"
 # Only the creator removes it. An INHERITED path that no longer exists is a broken pass, and starting
 # again from an empty list would silently void the very guarantee this file exists to give.
+# The pass also carries the identity of its TOOL. Each repo would otherwise run the relock of its own
+# flake-commons pin, so a fix to relock reached a repo only on the pass AFTER the one that bumped it
+# there. The creator names the tool; a requested run of any other code refuses before anything.
 if [ -z "${RELOCK_VISITED_FILE:-}" ]; then
   RELOCK_VISITED_FILE=$(mktemp)
   export RELOCK_VISITED_FILE
   trap 'rm -f "$RELOCK_VISITED_FILE"' EXIT
+  RELOCK_PASS_TOOL_ID="@toolId@"
+  export RELOCK_PASS_TOOL_ID
 elif [ ! -f "$RELOCK_VISITED_FILE" ]; then
   echo "relock(@repoName@): the visited list of this pass ($RELOCK_VISITED_FILE) is gone — refusing to start over" >&2
+  exit 1
+elif [ "${RELOCK_PASS_TOOL_ID:-}" != "@toolId@" ]; then
+  echo "REFUSING: relock(@repoName@) is tool @toolId@, but this pass runs tool ${RELOCK_PASS_TOOL_ID:-<none named>}:" >&2
+  echo "          one pass runs one relock — its requester must build this one on the pass's tool" >&2
   exit 1
 fi
 if grep -qxF -- "$visit_key" "$RELOCK_VISITED_FILE" 2>/dev/null; then
@@ -121,11 +134,14 @@ nix() {
 
 # An app's program, BUILT with the token, so that running it afterwards needs no fetch and gets no
 # token. `nix build` refuses the program string itself, so its context's derivations are built.
+# Empty but for a consumer's relock, which is built on the pass's tool (see the downstream block). An
+# override never writes a lock: nothing here passes --commit-lock-file.
+tool_override=()
 app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program path on stdout
   local prog d
   local -a drvs=()
-  prog=$(nix eval --raw "$1.program") || return 1
-  mapfile -t drvs < <(nix eval --json "$1.program" --apply 'p: builtins.attrNames (builtins.getContext p)' | jq -r '.[]') || return 1
+  prog=$(nix eval --raw "${tool_override[@]}" "$1.program") || return 1
+  mapfile -t drvs < <(nix eval --json "${tool_override[@]}" "$1.program" --apply 'p: builtins.attrNames (builtins.getContext p)' | jq -r '.[]') || return 1
   for d in "${drvs[@]}"; do nix build --no-link "$d^*" || return 1; done
   printf '%s\n' "$prog"
 }
@@ -150,6 +166,8 @@ app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program pat
 ownBranch="@ownBranch@"
 pushFirstBranch="@pushFirstBranch@"
 catalogBranch="@catalogBranch@"
+ownSlug="@repoSlug@"
+toolSlug="@toolSlug@"
 cur=""
 REPO=""
 catalogClone=""
@@ -264,6 +282,34 @@ if [ -n "$dirty" ]; then
   echo "derivation change could not be attributed. Commit or set them aside:" >&2
   printf '%s\n' "$dirty" >&2
   exit 1
+fi
+
+# The pass's tool as a FETCHABLE reference, named once by the creator of a --downstream pass and
+# proven before anything moves: every consumer's relock is built from it, so a reference nobody can
+# fetch, or one that holds other code than the tool running here, would fail at the first consumer.
+# From the tool's own repo it is HEAD — which a dirty tree or an unpushed commit cannot pass for —
+# and from any other repo the flake-commons pin, which must be a `github:` lock of its own.
+if [ "$downstream" = 1 ] && [ -z "${RELOCK_PASS_TOOL_REF:-}" ]; then
+  if [ "$ownSlug" = "$toolSlug" ]; then
+    RELOCK_PASS_TOOL_REF="github:$toolSlug/$(git -C "$REPO" rev-parse HEAD)"
+  elif ! fc_locked=$(nix flake metadata --json "$REPO" | jq -ce '.locks as $l | $l.nodes[$l.root].inputs["flake-commons"] as $n
+      | if ($n|type) == "string" then $l.nodes[$n].locked | select(.type == "github") else empty end'); then
+    echo "REFUSING --downstream: @repoName@ has no flake-commons pin of its own on github: — start the" >&2
+    echo "          pass from the repo whose relock it should run" >&2
+    exit 1
+  else
+    RELOCK_PASS_TOOL_REF="github:$(jq -r '"\(.owner)/\(.repo)/\(.rev)"' <<<"$fc_locked")"
+  fi
+  if ! pass_tool=$(nix eval --raw "$RELOCK_PASS_TOOL_REF#lib.relockToolId"); then
+    echo "REFUSING --downstream: the pass's tool $RELOCK_PASS_TOOL_REF cannot be fetched (unpushed?)" >&2
+    exit 1
+  fi
+  if [ "$pass_tool" != "@toolId@" ]; then
+    echo "REFUSING --downstream: $RELOCK_PASS_TOOL_REF is tool $pass_tool, not the one running here (@toolId@)" >&2
+    echo "          — commit and push the relock you mean to run, or run the one that is pushed" >&2
+    exit 1
+  fi
+  export RELOCK_PASS_TOOL_REF
 fi
 
 wt_for_branch() {
@@ -769,7 +815,8 @@ ref_key() {
   printf '%s\n' "$r${ref:+:$ref}"
 }
 if [ "$downstream" = 1 ]; then
-  echo "== downstream: request each consumer's own relock =="
+  echo "== downstream: request each consumer's own relock, on the pass's tool $RELOCK_PASS_TOOL_REF =="
+  tool_override=(--override-input flake-commons "$RELOCK_PASS_TOOL_REF")
   # A request, so a failure here is not fatal — but it is SAID, with the consumer's name and its own
   # stderr. The first version ran `nix run "$c#relock" 2>/dev/null` and answered every failure with
   # "exposes no #relock yet": a consumer whose relock CRASHED read exactly like one that has none.
@@ -783,7 +830,7 @@ if [ "$downstream" = 1 ]; then
       if [ "$committed" = 1 ]; then skipped+=("$c"); fi
       continue
     fi
-    if ! has_relock=$(nix eval --json "$c#apps.@system@" --apply 'as: as ? relock'); then
+    if ! has_relock=$(nix eval --json "${tool_override[@]}" "$c#apps.@system@" --apply 'as: as ? relock'); then
       echo "FAILED — cannot evaluate $c (its error is above)"
       failed+=("consumer $c")
     elif [ "$has_relock" != true ]; then

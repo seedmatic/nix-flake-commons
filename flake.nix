@@ -111,9 +111,19 @@
   # commit requests rke2lab, which carries ndh, nnh and nch behind it; the next ones only NOTE that
   # rke2lab pins them one commit behind — harmless, the follows keep that commit out of rke2lab's
   # closure. flox-catalog is not listed: rke2lab's catalog hop is its relock.
+  #
+  # A pass runs ONE tool everywhere, and that tool is known by its CODE, not by this repo's revision:
+  # a commit here that touches neither file must not make every repo read as running another relock.
   outputs = { self, nixpkgs, flake-utils, home-manager, ... }:
+    let
+      relockToolId = builtins.hashString "sha256" (builtins.readFile ./nix/relock.sh + builtins.readFile ./nix/relock.nix);
+    in
     {
-      lib.mkRelockApp = import ./nix/relock.nix;
+      lib.mkRelockApp = args: import ./nix/relock.nix (args // {
+        toolId = relockToolId;
+        toolSlug = "seedmatic/nix-flake-commons";
+      });
+      lib.relockToolId = relockToolId;
     }
     // flake-utils.lib.eachDefaultSystem (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
       # Behaviour tests for relock, run by `nix flake check`. They cover what shellcheck — already a
@@ -185,6 +195,7 @@
           RELOCK_CYCLE_B = "${cycleB}/bin/relock";
           RELOCK_CHAIN_B = "${chainB}/bin/relock";
           RELOCK_CHAIN_C = "${chainC}/bin/relock";
+          RELOCK_TOOL_ID = self.lib.relockToolId;
           RELOCK_ROOT_R = "${rootR}/bin/relock";
           RELOCK_ROOT_ORPHAN = "${rootOrphan}/bin/relock";
           RELOCK_ROOT_PEER = "${rootPeer}/bin/relock";

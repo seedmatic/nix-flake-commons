@@ -54,6 +54,10 @@
   # targets and listed in `--help`. Declared by the repo, because a factory in the root that names
   # one consumer's artifacts is the wrong way round.
   aliases ? { },
+  # Injected by `lib.mkRelockApp`, never passed by a repo: the tool's identity (a hash of its code)
+  # and the repo it is fetched from, so that a pass can build every relock it requests from ONE tool.
+  toolId,
+  toolSlug,
 }:
 let
   # The branch a `github:` consumer reference names, if any: `owner/repo/<branch>` or `?ref=<branch>`.
@@ -86,6 +90,8 @@ pkgs.writeShellApplication {
         selfPinName
         pushFirstBranch
         catalogBranch
+        toolId
+        toolSlug
         ;
       repoUrl = url;
       repoName = name;
