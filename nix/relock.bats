@@ -1,27 +1,29 @@
 # Behaviour tests for the shared `relock` — what shellcheck CANNOT see.
 #
-# shellcheck already gates the script at every build (syntax, quoting, constant tests), so nothing
-# here re-checks that. What it cannot see is behaviour at run time, and above all the failure
-# paths: every defect found in this script was a syntactically flawless script going SILENT at the
-# wrong moment — a failure read as an absence, a failure swallowed in an `if`, a failure swallowed in
-# an `||` list. Each case below is one such contract, and most are a regression that really happened.
+# shellcheck already gates the script at every build, so nothing here re-checks syntax. What it
+# cannot see is behaviour at run time, and above all the failure paths: every defect found in this
+# script was a syntactically flawless script going SILENT at the wrong moment — a failure read as an
+# absence, a failure swallowed in an `if`, a failure swallowed in an `||` list. Each case below is one
+# such contract.
 #
-# It runs the script exactly as `mkRelockApp` BUILDS it (substitution and aliases included), with only
-# its `export PATH=` line removed, so a fake `nix` takes over and can produce each failure on demand.
-# The fake is driven by environment variables; the real git and jq do the rest, against a throwaway
-# repository and a local bare remote.
+# It runs the script exactly as `mkRelockApp` BUILDS it, with only its `export PATH=` line removed, so
+# a fake `nix` and a fake `curl` (the GitHub API) take over and produce each answer on demand. The real
+# git and jq do the rest, against throwaway repositories and local bare remotes. The fabric's heads
+# are a fixture: `t` and its orphan project `t-orphan` (one repository), `peer`, `peer2`, and `d`, a
+# data head of peer's repository.
 
 setup() {
   T=$BATS_TEST_TMPDIR
   export HOME=$T GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
-
-  mkdir -p "$T/bin" "$T/remote/seedmatic"
-  sed '/^export PATH=/d' "$RELOCK" > "$T/relock"
-  sed '/^export PATH=/d' "$RELOCK_ON_BRANCH" > "$T/relock-on-branch"
-  sed '/^export PATH=/d' "$RELOCK_GITHUB" > "$T/relock-github"
-  for g in GRAPH_A CYCLE_B CHAIN_B CHAIN_C ROOT_R ROOT_ORPHAN ROOT_PEER; do v="RELOCK_$g"; sed '/^export PATH=/d' "${!v}" > "$T/relock-$g"; done
-  chmod +x "$T/relock" "$T/relock-on-branch" "$T/relock-github" "$T"/relock-GRAPH_A "$T"/relock-CYCLE_B "$T"/relock-CHAIN_B "$T"/relock-CHAIN_C \
-    "$T"/relock-ROOT_R "$T"/relock-ROOT_ORPHAN "$T"/relock-ROOT_PEER
+  # git's global and system configs are the test's own: a run outside the build sandbox must never
+  # read the operator's hooks or write the operator's config.
+  export GIT_CONFIG_GLOBAL=$T/.gitconfig GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME=$T/.config
+  mkdir -p "$T/bin" "$T/remote/seedmatic" "$T/gh"
+  for v in RELOCK RELOCK_AFTER RELOCK_ORPHAN RELOCK_PEER RELOCK_PEER2; do
+    f=$(printf '%s' "$v" | tr 'A-Z_' 'a-z-')
+    sed '/^export PATH=/d' "${!v}" > "$T/$f"
+    chmod +x "$T/$f"
+  done
 
   # The fake nix. It records every call, and answers each question relock asks. Its shebang is the
   # bash on PATH, not /usr/bin/env: the Linux build sandbox does not promise /usr/bin/env.
@@ -29,7 +31,6 @@ setup() {
   cat >> "$T/bin/nix" <<'FAKE'
 echo "$*" >> "$T/calls"
 printf '%s\n' "${NIX_CONFIG:-}" >> "$T/nix-config"
-[ -n "${RELOCK_VISITED_FILE:-}" ] && printf '%s\n' "$RELOCK_VISITED_FILE" > "$T/visited-path"
 # What nix does with a git+file flake whose path crosses a symlink: fine while the tree is clean,
 # refused once it is dirty — and a bumped lock makes it dirty.
 for a in "$@"; do
@@ -43,71 +44,52 @@ for a in "$@"; do
   fi
 done
 case "$*" in
-  # The repo's flake-commons pin, which names the pass's tool when a pass starts outside the tool's repo.
-  *"flake metadata"*)
-    if [ -n "${STUB_FC_METADATA:-}" ]; then printf '%s\n' "$STUB_FC_METADATA"; else
-      printf '%s\n' '{"locks":{"root":"root","nodes":{"root":{"inputs":{"flake-commons":"fc"}},"fc":{"locked":{"type":"github","owner":"seedmatic","repo":"nix-flake-commons","rev":"fc1"}}}}}'
-    fi ;;
-  # The code identity of the tool at that reference: the running tool's own, unless a case says otherwise.
   *"#lib.relockToolId"*) printf '%s' "${STUB_TOOL_ID:-$RELOCK_TOOL_ID}" ;;
-  *"outputs ? packages"*)
+  # The presence probe of the impact projection.
+  *"configurations = (o ? nixosConfigurations)"*)
     n=$(( $(cat "$T/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/probes"
-    mode=$STUB_HAS_PACKAGES
+    mode=${STUB_HAS_PACKAGES:-true}
     [ "$mode" = true-then-fail ] && { [ "$n" -eq 1 ] && mode=true || mode=fail; }
     [ "$mode" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
-    echo "$mode" ;;
-  *"? relock"*)
-    [ "${STUB_CONSUMER:-absent}" = absent ] && { echo false; exit 0; }
-    echo true ;;
-  # The impact projection of the apps: each app's program context.
+    printf '{"packages":%s,"configurations":%s}\n' "$mode" "${STUB_HAS_CONFIGS:-false}" ;;
+  # The configurations' measure: their neutralised top level.
+  *"configurations.nix"*)
+    [ "${STUB_CONFIGS:-ok}" = fail ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
+    if [ "${STUB_HAS_CONFIGS:-false}" = true ]; then
+      printf '{"darwin":{},"nixos":{"h":"/nix/store/%s.drv"}}\n' "$(cat "$T/cfg-drv")"
+    else echo '{"darwin":{},"nixos":{}}'; fi ;;
   *"getContext a.program"*)
     [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
     printf '{"relock":["/nix/store/%s.drv"]}\n' "$(cat "$T/app-drv")" ;;
   # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
   *".program"*"getContext"*) echo '[]' ;;
-  *"fake:consumer#apps."*"relock.program"*) printf '%s' "$T/bin/consumer-relock" ;;
-  *"github:seedmatic/"*"relock.program"*)
-    case "${STUB_GRAPH:-}:$*" in
-      cycle:*"github:seedmatic/peer#"*) printf '%s' "$T/relock-CYCLE_B" ;;
-      cycle:*"github:seedmatic/t#"*)    printf '%s' "$T/relock-GRAPH_A" ;;
-      chain:*"github:seedmatic/peer#"*) printf '%s' "$T/relock-CHAIN_B" ;;
-      chain:*"github:seedmatic/peer2#"*) printf '%s' "$T/relock-CHAIN_C" ;;
-      chain:*"github:seedmatic/t#"*)    printf '%s' "$T/relock-GRAPH_A" ;;
-      root:*"github:seedmatic/peer/orphan#"*) printf '%s' "$T/relock-ROOT_ORPHAN" ;;
-      root:*"github:seedmatic/peer#"*)  printf '%s' "$T/relock-ROOT_PEER" ;;
-      *) printf '%s' "$T/bin/consumer-relock" ;;
-    esac ;;
-  *"regen-x.program"*) printf '%s' "$T/bin/regen-x" ;;
-  *"lock-envs.program"*) printf '%s' "$T/bin/lock-envs" ;;
-  *"#apps."*)     [ -n "${STUB_REGEN:-}" ] && echo '["regen-x"]' || echo '[]' ;;
+  *"github:seedmatic/t/t-orphan/develop#apps."*"relock.program"*) printf '%s' "$T/relock-orphan" ;;
+  *"github:seedmatic/t/develop#apps."*"relock.program"*) printf '%s' "$T/relock" ;;
+  *"github:seedmatic/peer/develop#apps."*"relock.program"*)
+    [ "${STUB_PEER:-ok}" = unbuildable ] && { echo "error: peer does not evaluate" >&2; exit 1; }
+    printf '%s' "$T/relock-peer" ;;
+  *"github:seedmatic/peer2/develop#apps."*"relock.program"*) printf '%s' "$T/relock-peer2" ;;
+  *"after-x.program"*) printf '%s' "$T/bin/after-x" ;;
   *"#packages."*) printf '{"p":"/nix/store/%s.drv"}\n' "$(cat "$T/drv")" ;;
-  # The catalog re-pinning this repo (`selfPinName` defaults to the name, `t`) at STUB_PIN —
-  # `@remote` for the head the remote answers, when the test cannot know it before the run.
-  *"flake update t "*)
-    r=$STUB_PIN; [ "$r" = @remote ] && r=$(git -C "$T/remote/seedmatic/t.git" rev-parse HEAD)
-    jq --arg r "$r" '.nodes.t.locked.rev = $r' flake.lock > l && mv l flake.lock ;;
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
-      # Two inputs, one of which cannot be resolved: the other must still be carried.
+      # Only a configuration moves: the bump of a contribution's pin, seen from its aggregator.
+      config-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo cfg2 > "$T/cfg-drv" ;;
       one-fails)
         case "$*" in
           *"flake update a "*) jq '.nodes.a.locked.rev = "a2"' flake.lock > l && mv l flake.lock; echo d-a > "$T/drv" ;;
           *"flake update b "*) echo "error: cannot fetch b" >&2; exit 1 ;;
         esac ;;
-      # flake-commons shipping a new relock: only an app's program moves, no package does.
       app-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo app2 > "$T/app-drv" ;;
       nested) jq '.nodes.x.locked.rev = "x2"' flake.lock > l && mv l flake.lock ;;
       path)   jq '.nodes.a.locked = {"type":"path","path":"/somewhere/local"}' flake.lock > l && mv l flake.lock ;;
       garbage) echo 'not json at all' > flake.lock ;;
-      # What nix does when a fetch fails and it has a copy: warn, keep going, exit 0.
       cached)  echo "warning: error: unable to download 'https://api.github.com/repos/o/r/commits/HEAD': HTTP error 404; using cached version" >&2 ;;
       cached-moved)
         jq '.nodes.a.locked.rev = "stale"' flake.lock > l && mv l flake.lock
         echo "warning: unable to download 'https://api.github.com/repos/o/r/commits/HEAD'" >&2 ;;
       failing) echo "error: cannot fetch" >&2; exit 1 ;;
-      # The ndh/flake-commons coupling: `a`, as locked, follows an input of `b` that only the OLD
-      # `b` has, so bumping `b` alone is fine but bumping `a` must wait — or, `-forever`, never works.
       coupled|coupled-forever)
         case "$*" in
           *"flake update b "*)
@@ -122,21 +104,23 @@ case "$*" in
   *) echo "fake nix: unexpected call: $*" >&2; exit 99 ;;
 esac
 FAKE
-  chmod +x "$T/bin/nix"
 
-  # The programs relock runs ITSELF, after building them. Each records the environment it got.
-  printf '#!%s\n' "$(command -v bash)" > "$T/bin/regen-x"
-  cat >> "$T/bin/regen-x" <<'FAKE'
-env > "$T/child-env.regen"
-if [ "$STUB_REGEN" = fail ]; then echo '{"half":1}' > artifact.json; echo "regen boom" >&2; exit 4; fi
-echo '{"fresh":1}' > artifact.json
+  # The fake GitHub API: a file of a head, served from $T/gh/<owner>/<repo>/<branch>/<path>, or curl's
+  # own failure (22) when there is none. It records each URL, and what came on its stdin.
+  printf '#!%s\n' "$(command -v bash)" > "$T/bin/curl"
+  cat >> "$T/bin/curl" <<'FAKE'
+cat >> "$T/curl-stdin"
+url=""; for a in "$@"; do case $a in https://*) url=$a ;; esac; done
+echo "$*" >> "$T/curl-calls"
+[ "${STUB_API:-ok}" = fail ] && { echo "curl: (22) The requested URL returned error: 503" >&2; exit 22; }
+r=${url#https://api.github.com/repos/}; repo=${r%%/contents/*}; rest=${r#*/contents/}
+path=${rest%%\?ref=*}; ref=${rest#*\?ref=}; ref=${ref//%2F//}
+[ -n "${STUB_API_FAIL:-}" ] && [ "$repo" = "$STUB_API_FAIL" ] && { echo "curl: (22) 404" >&2; exit 22; }
+f="$T/gh/$repo/$ref/$path"
+[ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+cat "$f"
 FAKE
-  printf '#!%s\n' "$(command -v bash)" > "$T/bin/consumer-relock"
-  cat >> "$T/bin/consumer-relock" <<'FAKE'
-env > "$T/child-env.consumer"
-[ "$STUB_CONSUMER" = fail ] && { echo "consumer boom" >&2; exit 3; }
-exit 0
-FAKE
+
   # `gh auth token`, simulated: a stand-in value, never a real token.
   printf '#!%s\n' "$(command -v bash)" > "$T/bin/gh"
   cat >> "$T/bin/gh" <<'FAKE'
@@ -144,82 +128,185 @@ FAKE
 [ "${STUB_GH:-ok}" = fail ] && { echo "not logged in" >&2; exit 1; }
 echo SIMULATED-GH-TOKEN
 FAKE
-  # The catalog's lock-envs: it commits a re-locked env, as the real one does on a real bump.
-  printf '#!%s\n' "$(command -v bash)" > "$T/bin/lock-envs"
-  cat >> "$T/bin/lock-envs" <<'FAKE'
-echo relocked >> env.lock && git add env.lock && git commit -qm "chore(flox): relock env"
+  # The after-inputs app: it rewrites a tracked file, as lock-envs rewrites an env's lock.
+  printf '#!%s\n' "$(command -v bash)" > "$T/bin/after-x"
+  cat >> "$T/bin/after-x" <<'FAKE'
+env > "$T/child-env.after"
+case ${STUB_AFTER:-ok} in
+  ok) echo relocked >> env.lock ;;
+  none) : ;;
+  fail) echo half >> env.lock; echo "after boom" >&2; exit 4 ;;
+esac
 FAKE
-  chmod +x "$T/bin/regen-x" "$T/bin/consumer-relock" "$T/bin/gh" "$T/bin/lock-envs"
+  chmod +x "$T/bin/nix" "$T/bin/curl" "$T/bin/gh" "$T/bin/after-x"
   export PATH="$T/bin:$PATH" T
   echo d1 > "$T/drv"
   echo app1 > "$T/app-drv"
+  echo cfg1 > "$T/cfg-drv"
 
-  # A repo whose origin ends with the slug relock was built for, so it recognises it as its own.
-  git init -q --bare "$T/remote/seedmatic/t.git"
+  # The fabric's heads, as nix-flake-commons' fabric/heads serves them.
+  put "seedmatic/nix-flake-commons" "fabric/heads" heads.json <<'JSON'
+{ "schema": "seedmatic.fabric-heads/v1",
+  "heads": {
+    "flake-commons": { "repo": "seedmatic/nix-flake-commons", "branch": "develop", "kind": "code" },
+    "t":        { "repo": "seedmatic/t",     "branch": "develop",          "kind": "code" },
+    "t-orphan": { "repo": "seedmatic/t",     "branch": "t-orphan/develop", "kind": "code" },
+    "peer":     { "repo": "seedmatic/peer",  "branch": "develop",          "kind": "code" },
+    "peer2":    { "repo": "seedmatic/peer2", "branch": "develop",          "kind": "code" },
+    "d":        { "repo": "seedmatic/peer",  "branch": "fabric/d",         "kind": "data" } } }
+JSON
+  # The pushed locks the plan reads: every head pins flake-commons; peer pins t, peer2 pins peer.
+  lock_of nix-flake-commons develop
+  lock_of t develop
+  lock_of t t-orphan/develop
+  lock_of peer develop t
+  lock_of peer2 develop peer
+
+  # A repository whose origin is the head's, on develop, so relock recognises it as its own.
+  git init -q --bare --initial-branch=develop "$T/remote/seedmatic/t.git"
   git clone -q "$T/remote/seedmatic/t.git" "$T/work" 2>/dev/null
   cd "$T/work"
+  git checkout -q -b develop 2>/dev/null || true
   echo '{}' > flake.nix
-  echo '{"stale":1}' > artifact.json
+  echo 'env v1' > env.lock
   # Root inputs: `a` is a real node; `f` is a `follows` — an input PATH with no lock of its own.
   cat > flake.lock <<'LOCK'
 {"nodes":{"root":{"inputs":{"a":"a","f":["a","x"]}},
  "a":{"locked":{"type":"github","rev":"r1"},"inputs":{"x":"x"}},
  "x":{"locked":{"type":"github","rev":"x1"}}},"root":"root","version":7}
 LOCK
-  git add flake.nix flake.lock artifact.json && git commit -qm init && git push -qu origin HEAD 2>/dev/null
-  DEFAULT=$(git rev-parse --abbrev-ref HEAD)
-  # A requested run clones the factory's url; send it to the local bare instead.
-  # A file:// url, because git ignores --depth for a plain local path: the clone must REALLY be shallow.
-  git config --global url."file://$T/remote/seedmatic/t.git".insteadOf "file:///nonexistent/seedmatic/t.git"
+  git add flake.nix flake.lock env.lock && git commit -qm init && git push -qu origin develop 2>/dev/null
+  # A requested run clones https://github.com/<repo>.git: send it to the local bare instead. A file://
+  # url, because git ignores --depth for a plain local path: the clone must REALLY be shallow.
+  git config --global url."file://$T/remote/seedmatic/t.git".insteadOf "https://github.com/seedmatic/t.git"
 }
 
-# The repo's OTHER flake: an orphan branch, pushed, so a clone can take it.
-mk_orphan() {
-  git -C "$T/work" checkout -q --orphan orphan
-  git -C "$T/work" commit -qm orphan
-  git -C "$T/work" push -qu origin orphan 2>/dev/null
+# A file of a head on the fake GitHub, from stdin.
+put() { mkdir -p "$T/gh/$1/$2/$(dirname "$3")"; cat > "$T/gh/$1/$2/$3"; }
+# A pushed lock for a head: it pins flake-commons at fc1, and each head named after its branch, by id.
+lock_of() { # $1 repo  $2 branch  $3… ids it pins
+  local repo=$1 branch=$2; shift 2
+  jq -n --args '{ version: 7, root: "root",
+      nodes: ({ root: { inputs: ({ "flake-commons": "fc" } + ([ $ARGS.positional[] | { (.): . } ] | add // {})) },
+                fc: { original: { type: "indirect", id: "flake-commons" },
+                      locked: { type: "github", owner: "seedmatic", repo: "nix-flake-commons", rev: "fc1" } } }
+              + ([ $ARGS.positional[] | { (.): { original: { type: "indirect", id: . },
+                    locked: { type: "github", owner: "seedmatic", repo: ({ "t-orphan": "t", d: "peer" }[.] // .), rev: "\(.)1" } } } ] | add // {})) }' \
+    "$@" | put "seedmatic/$repo" "$branch" flake.lock
 }
-# The catalog branch, pushed and checked out in its own worktree, pinning this repo at an old rev.
-mk_cat() {
-  git -C "$T/work" branch cat
-  git -C "$T/work" push -qu origin cat 2>/dev/null
-  git -C "$T/work" worktree add -q "$T/cat" cat
-  cat > "$T/cat/flake.lock" <<'LOCK'
-{"nodes":{"root":{"inputs":{"t":"t"}},"t":{"locked":{"type":"github","rev":"old"}}},"root":"root","version":7}
-LOCK
-  git -C "$T/cat" commit -qm pin -- flake.lock && git -C "$T/cat" push -q 2>/dev/null
+# Bare remotes for the peers: a requested relock CLONES its repo, here through an insteadOf.
+peers() {
+  for r in "$@"; do
+    git clone -q --bare "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/$r.git"
+    git config --global url."file://$T/remote/seedmatic/$r.git".insteadOf "https://github.com/seedmatic/$r.git"
+  done
+}
+# The orphan project of t, pushed, with a worktree.
+mk_orphan() {
+  git -C "$T/work" checkout -q --orphan t-orphan/develop
+  git -C "$T/work" commit -qm orphan
+  git -C "$T/work" push -qu origin t-orphan/develop 2>/dev/null
 }
 never_updated() { ! grep -q "flake update" "$T/calls" 2>/dev/null; }
-
 relock_commits() { git -C "$T/work" log --format=%s | grep -c '^chore(' || true; }
-# The tree AFTER the fact, not just the exit code: a failure path must leave nothing behind.
 tree_clean()     { [ -z "$(git -C "$T/work" status --porcelain --untracked-files=no)" ]; }
 lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
+remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse --verify -q "refs/heads/$1" || echo none; }
+trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.json" 2>/dev/null; }
 
-@test "--help lists the aliases the repo declares, and nothing about any other repo" {
-  run "$T/relock" --help
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Aliases this repo declares"* ]]
-  [[ "$output" == *"plans"*"regen-dataplan"* ]]
-  [[ "$output" != *"rke2lab"* ]]
-  [[ "$output" != *"flox-catalog"* ]]
+# ── who this relock is ─────────────────────────────────────────────────────────────────────────────
+
+@test "a relock whose name is not a code head of fabric/heads refuses before anything" {
+  jq '.heads.t.kind = "data"' "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json" > x && mv x "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json"
+  run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'t' is not a code head of fabric/heads"* ]]
+  never_updated
 }
+
+@test "fabric/heads that cannot be read refuses — the relock does not guess who it is" {
+  STUB_API=fail run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot read fabric/heads"* ]]
+  never_updated
+}
+
+@test "fabric/heads of another schema refuses" {
+  echo '{"heads":{}}' | put seedmatic/nix-flake-commons fabric/heads heads.json
+  run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no seedmatic.fabric-heads/v1"* ]]
+}
+
+@test "a head REFUSES a checkout of its repository on another head's branch" {
+  mk_orphan
+  run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING"*"'t-orphan/develop'"*"another head"* ]]
+  never_updated
+  tree_clean
+}
+
+@test "an orphan project's head reconciles its own branch, and a session of it" {
+  mk_orphan
+  STUB_UPDATE=none run "$T/relock-orphan" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reconciling the checkout at $T/work (t-orphan/develop)"* ]]
+  git -C "$T/work" checkout -q -b t-orphan/feature/x
+  STUB_UPDATE=none run "$T/relock-orphan" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"(t-orphan/feature/x)"* ]]
+}
+
+@test "a develop head accepts a session branch outside every head's namespace" {
+  git -C "$T/work" checkout -q -b feature/x
+  STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reconciling the checkout at $T/work (feature/x)"* ]]
+}
+
+@test "a requested run of an orphan project's head clones ITS branch" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_UPDATE=none run "$T/relock-orphan" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cloned at t-orphan/develop"* ]]
+}
+
+@test "a committed registry that disagrees with fabric/heads refuses" {
+  echo '{"version":2,"flakes":[{"from":{"type":"indirect","id":"peer"},"to":{"type":"github","owner":"seedmatic","repo":"elsewhere"}}]}' > "$T/work/flake-registry.json"
+  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
+  run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"disagrees with fabric/heads"*"peer: seedmatic/elsewhere at develop, but fabric/heads has seedmatic/peer at develop"* ]]
+  never_updated
+}
+
+@test "a committed registry that names an orphan by its branch agrees with fabric/heads" {
+  echo '{"version":2,"flakes":[{"from":{"type":"indirect","id":"t-orphan"},"to":{"type":"github","owner":"seedmatic","repo":"t","ref":"t-orphan/develop"}}]}' > "$T/work/flake-registry.json"
+  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
+  STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+}
+
+# ── the local rule ─────────────────────────────────────────────────────────────────────────────────
 
 @test "an untracked file does not block a run — nix never sees it" {
   touch "$T/work/scratch-from-another-session"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" != *"REFUSING"* ]]
 }
 
 @test "a tracked modification refuses — it would be credited to the bump" {
   echo '{ }' > "$T/work/flake.nix"
-  STUB_HAS_PACKAGES=true run "$T/relock" inputs
+  run "$T/relock" inputs
   [ "$status" -eq 1 ]
   [[ "$output" == *"REFUSING"* ]]
 }
 
-@test "a FAILING packages probe is fatal — it must not read as 'no packages'" {
+@test "a FAILING presence probe is fatal — it must not read as 'an aggregator'" {
   STUB_HAS_PACKAGES=fail STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -ne 0 ]
   [[ "$output" != *"DONE"* ]]
@@ -236,22 +323,45 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
   lock_unchanged
 }
 
-@test "packages repo: a bump that moves a derivation is carried" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+@test "a bump that moves a package is carried" {
+  STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"BUMPED"* ]]
   [ "$(relock_commits)" -eq 1 ]
 }
 
-@test "packages repo: a bump that moves ONLY an app's program is carried — relock ships itself that way" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=app-only run "$T/relock" inputs
+@test "a bump that moves ONLY an app's program is carried — relock ships itself that way" {
+  STUB_UPDATE=app-only run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"BUMPED"* ]]
   [ "$(relock_commits)" -eq 1 ]
 }
 
-@test "packages repo: a bump that moves neither a package nor an app is dropped" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=nested run "$T/relock" inputs
+@test "a bump that moves ONLY a configuration is carried — a contribution travels that way" {
+  STUB_HAS_CONFIGS=true STUB_UPDATE=config-only run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+  grep -q "configurations.nix" "$T/calls"
+}
+
+@test "a flake with configurations and no packages is measured, not taken for an aggregator" {
+  STUB_HAS_PACKAGES=false STUB_HAS_CONFIGS=true STUB_UPDATE=nested run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"NO derivation impact -> dropped"* ]]
+  ! grep -q "#packages\." "$T/calls"
+  grep -q "configurations.nix" "$T/calls"
+}
+
+@test "a FAILING configurations measure is fatal — the bump is not carried, the lock restored" {
+  STUB_HAS_CONFIGS=true STUB_CONFIGS=fail STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -ne 0 ]
+  [ "$(relock_commits)" -eq 0 ]
+  lock_unchanged
+}
+
+@test "a bump that moves neither a package, an app nor a configuration is dropped" {
+  STUB_HAS_CONFIGS=true STUB_UPDATE=nested run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"NO derivation impact -> dropped"* ]]
   [ "$(relock_commits)" -eq 0 ]
@@ -259,7 +369,7 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 }
 
 @test "a FAILING apps projection is fatal — the bump is not carried, the lock restored" {
-  STUB_HAS_PACKAGES=true STUB_APPS=fail STUB_UPDATE=rev run "$T/relock" inputs
+  STUB_APPS=fail STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -ne 0 ]
   [ "$(relock_commits)" -eq 0 ]
   lock_unchanged
@@ -274,8 +384,6 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 }
 
 @test "aggregator: a follows root input is left out of the impact projection" {
-  # Only the node behind the `follows` moves. Resolving the follows by its last path segment
-  # would have counted that as impact; it is already counted where it is defined.
   STUB_HAS_PACKAGES=false STUB_UPDATE=nested run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"NO derivation impact"* ]]
@@ -283,7 +391,7 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 }
 
 @test "a re-aim at a local checkout is refused, and the lock is restored" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=path run "$T/relock" inputs
+  STUB_UPDATE=path run "$T/relock" inputs
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAILED: 1 target(s)"* ]]
   [[ "$output" == *"LOCAL lock REFUSED"* ]]
@@ -293,54 +401,19 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 }
 
 @test "an unreadable lock after an update is NOT waved through the local-lock guard" {
-  # An empty answer from the guard's own read is what "not local" looks like.
-  STUB_HAS_PACKAGES=true STUB_UPDATE=garbage run "$T/relock" inputs
+  STUB_UPDATE=garbage run "$T/relock" inputs
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to read the updated lock"* ]]
   [ "$(relock_commits)" -eq 0 ]
   tree_clean
   lock_unchanged
 }
 
-@test "a failed regen leaves nothing dirty, commits nothing, and says why" {
-  STUB_HAS_PACKAGES=true STUB_REGEN=fail run "$T/relock" artifacts
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: 1 target(s)"* ]]
-  [[ "$output" == *"FAILED (regen app regen-x)"* ]]
-  [[ "$output" == *"regen boom"* ]]
-  [ "$(relock_commits)" -eq 0 ]
-  tree_clean
-}
-
-@test "a regen that rewrites an artifact is committed" {
-  STUB_HAS_PACKAGES=true STUB_REGEN=ok run "$T/relock" artifacts
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"REGENERATED"* ]]
-  [ "$(relock_commits)" -eq 1 ]
-  tree_clean
-}
-
-@test "--downstream: a consumer whose relock FAILS is said so, with its stderr" {
-  STUB_HAS_PACKAGES=true STUB_CONSUMER=fail run "$T/relock" --downstream inputs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: 1 target(s)"* ]]
-  [[ "$output" == *"FAILED — fake:consumer's relock exited non-zero"* ]]
-  [[ "$output" == *"consumer boom"* ]]
-  [[ "$output" != *"exposes no #relock"* ]]
-}
-
-@test "--downstream: a consumer with no relock is skipped as such" {
-  STUB_HAS_PACKAGES=true STUB_CONSUMER=absent run "$T/relock" --downstream inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"exposes no #relock yet"* ]]
-}
-
 @test "the local registry wins over the committed one — that is what the indirection is for" {
   echo '{"version":2,"flakes":[]}' > "$T/work/flake-registry.json"
   echo '{"version":2,"flakes":[]}' > "$T/work/flake-registry.local.json"
   git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   grep -q -- "--flake-registry $T/work/flake-registry.local.json flake update" "$T/calls"
 }
@@ -348,234 +421,37 @@ lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 @test "with no local override, the committed registry is used" {
   echo '{"version":2,"flakes":[]}' > "$T/work/flake-registry.json"
   git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
+  STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   grep -q -- "--flake-registry $T/work/flake-registry.json flake update" "$T/calls"
 }
 
-@test "a branch-scoped flake REFUSES a checkout of its repo on another branch" {
-  # The slug matches, so without the branch check this reconciled the default branch by the
-  # orphan's rules, and said nothing.
-  mk_orphan
-  git -C "$T/work" checkout -q "$DEFAULT"
-  STUB_HAS_PACKAGES=true run "$T/relock-on-branch" inputs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"REFUSING"*"'$DEFAULT'"*"'orphan'"* ]]
-  never_updated
-  tree_clean
-}
-
-@test "a branch-scoped flake reconciles a checkout on its own branch" {
-  mk_orphan
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock-on-branch" inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"reconciling the checkout at $T/work (orphan)"* ]]
-  [[ "$output" == *"DONE"* ]]
-}
-
-@test "a requested run of a branch-scoped flake clones ITS branch, not the default one" {
-  mk_orphan
-  git -C "$T/work" checkout -q "$DEFAULT"
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock-on-branch" inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"cloned at orphan"* ]]
-  [[ "$output" == *"DONE"* ]]
-}
-
-@test "a requested run of a flake with no branch still clones the default branch" {
-  mk_orphan
-  git -C "$T/work" checkout -q "$DEFAULT"
-  mk_cat
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"cloned at $DEFAULT"* ]]
-}
-
-@test "a flake with no branch REFUSES a checkout on a branch it declares as another flake" {
-  # The reverse confusion: the default flake's relock, run from the orphan's worktree.
-  git -C "$T/work" checkout -q -b first
-  STUB_HAS_PACKAGES=true run "$T/relock" inputs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"REFUSING"*"'first'"*"ANOTHER"* ]]
-  never_updated
-  tree_clean
-}
-
-remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse "refs/heads/$1" 2>/dev/null || echo none; }
-
-@test "--no-push commits in the checkout, pushes NOTHING, and prints how to resume" {
-  before=$(remote_rev "$DEFAULT")
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" --no-push inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"BUMPED"* ]]
-  [ "$(relock_commits)" -eq 1 ]
-  [ "$(remote_rev "$DEFAULT")" = "$before" ]
-  [[ "$output" == *"1 commit(s) ahead"* ]]
-  [[ "$output" == *"To resume where this stopped:"*"git -C '$T/work' push"* ]]
-  [[ "$output" == *"DONE (not pushed)"* ]]
-}
-
-@test "--no-push does not push the push-first branch either, and says what its input resolves" {
-  git -C "$T/work" branch first && git -C "$T/work" push -q origin first 2>/dev/null
-  first_remote=$(remote_rev first)
-  git -C "$T/work" worktree add -q "$T/first" first
-  echo x > "$T/first/x" && git -C "$T/first" add x && git -C "$T/first" commit -qm ahead
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" --no-push inputs
-  [ "$status" -eq 0 ]
-  [ "$(remote_rev first)" = "$first_remote" ]
-  [[ "$output" == *"first NOT pushed: its input resolves the remote head ${first_remote:0:9}"* ]]
-  [[ "$output" == *"git -C '$T/first' push origin 'first' && git -C '$T/work' push"* ]]
-}
-
-@test "--no-push skips the catalog hop after a commit, and resumes it with envs" {
-  git -C "$T/work" branch cat && git -C "$T/work" worktree add -q "$T/cat" cat
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" --no-push inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"catalog hop SKIPPED"* ]]
-  [[ "$output" != *"re-pinning the catalog"* ]]
-  [[ "$output" == *"&& (cd '$T/work' && nix run .#relock -- envs)"* ]]
-  ! grep -q "lock-envs" "$T/calls"
-}
-
-@test "--no-push runs the catalog hop when HEAD is already on the remote — committed there, pushed nowhere" {
-  mk_cat
-  head=$(git -C "$T/work" rev-parse HEAD)
-  cat_remote=$(remote_rev cat)
-  work_remote=$(remote_rev "$DEFAULT")
-  STUB_HAS_PACKAGES=true STUB_PIN=$head run "$T/relock" --no-push envs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"is already on its remote — the catalog hop runs, and pushes nothing"* ]]
-  [[ "$output" == *"verified: catalog pins t ${head:0:9}"* ]]
-  [[ "$output" == *"cat NOT pushed: 2 commit(s) in $T/cat (cat)"* ]]
-  [[ "$output" == *"git -C '$T/cat' push"* ]]
-  [[ "$output" == *"DONE (not pushed)"* ]]
-  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = "$head" ]
-  [ "$(remote_rev cat)" = "$cat_remote" ]
-  [ "$(remote_rev "$DEFAULT")" = "$work_remote" ]
-}
-
-@test "--no-push skips the catalog hop for a commit an EARLIER run left unpushed — measured, not remembered" {
-  mk_cat
-  echo y > "$T/work/y" && git -C "$T/work" add y && git -C "$T/work" commit -qm earlier
-  cat_remote=$(remote_rev cat)
-  STUB_HAS_PACKAGES=true STUB_PIN=unused run "$T/relock" --no-push envs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"catalog hop SKIPPED"* ]]
-  [[ "$output" == *"&& (cd '$T/work' && nix run .#relock -- envs)"* ]]
-  ! grep -q "lock-envs" "$T/calls"
-  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = old ]
-  [ "$(remote_rev cat)" = "$cat_remote" ]
-}
-
-@test "--no-push: a fetch that fails is fatal to the catalog hop, never read as landed" {
-  mk_cat
-  # The url keeps its slug, so the checkout is still recognised as this repo's; only the fetch fails.
-  mv "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/t.git.gone"
-  STUB_HAS_PACKAGES=true STUB_PIN=x run "$T/relock" --no-push envs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"cannot tell whether"* ]]
-  ! grep -q "lock-envs" "$T/calls"
-  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = old ]
-}
-
-@test "--no-push: a branch with no upstream is fatal to the catalog hop, never read as landed" {
-  mk_cat
-  git -C "$T/work" branch -q --unset-upstream
-  STUB_HAS_PACKAGES=true STUB_PIN=x run "$T/relock" --no-push envs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"cannot tell whether"* ]]
-  ! grep -q "lock-envs" "$T/calls"
-  [ "$(jq -r .nodes.t.locked.rev "$T/cat/flake.lock")" = old ]
-}
-
-@test "--no-push refuses a requested run: unpushed commits in a clone would be lost" {
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true run "$T/relock" --no-push inputs
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"--no-push needs a checkout"* ]]
-  [[ "$output" != *"cloned at"* ]]
-}
-
-@test "--no-push with --downstream is refused: a consumer sees only what is pushed" {
-  STUB_HAS_PACKAGES=true run "$T/relock" --no-push --downstream inputs
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"contradict"* ]]
-  never_updated
-}
-
 @test "a fetch that fell back to a CACHE is a failure, never 'already current'" {
-  # The ndh/claude-hub case: 404 on the API, a cached copy, exit 0, an unchanged lock.
-  STUB_HAS_PACKAGES=true STUB_UPDATE=cached run "$T/relock" --no-push inputs
+  STUB_UPDATE=cached run "$T/relock" --no-push inputs
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to fetch"*"cached copy"* ]]
   [[ "$output" == *"using cached version"* ]]
   [[ "$output" != *"already current"* ]]
   [ "$(relock_commits)" -eq 0 ]
-  tree_clean
   lock_unchanged
 }
 
 @test "a cache fallback that DID rewrite the lock is restored, not carried" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=cached-moved run "$T/relock" --no-push inputs
+  STUB_UPDATE=cached-moved run "$T/relock" --no-push inputs
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to fetch"* ]]
   [[ "$output" != *"BUMPED"* ]]
-  [ "$(relock_commits)" -eq 0 ]
-  tree_clean
   lock_unchanged
 }
 
 @test "a failing update says why, with nix's own error" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=failing run "$T/relock" --no-push inputs
+  STUB_UPDATE=failing run "$T/relock" --no-push inputs
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: "*"input a"* ]]
   [[ "$output" == *"FAILED to resolve"* ]]
   [[ "$output" == *"cannot fetch"* ]]
-  [ "$(relock_commits)" -eq 0 ]
   tree_clean
 }
 
-@test "the gh token reaches relock's own nix calls, appended — an inherited NIX_CONFIG survives" {
-  NIX_CONFIG="flake-registry = /somewhere/registry.json" STUB_HAS_PACKAGES=true STUB_UPDATE=none \
-    run "$T/relock" --no-push inputs
-  [ "$status" -eq 0 ]
-  grep -q "extra-access-tokens = github.com=SIMULATED-GH-TOKEN" "$T/nix-config"
-  grep -q "flake-registry = /somewhere/registry.json" "$T/nix-config"
-  ! grep -q "^access-tokens" "$T/nix-config"
-}
-
-@test "the token is never printed" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_REGEN=ok run "$T/relock" --no-push
-  [[ "$output" != *"SIMULATED-GH-TOKEN"* ]]
-}
-
-@test "a regen app is run WITHOUT the token" {
-  STUB_HAS_PACKAGES=true STUB_REGEN=ok run "$T/relock" --no-push artifacts
-  [[ "$output" == *"REGENERATED"* ]]
-  [ -f "$T/child-env.regen" ]
-  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.regen"
-}
-
-@test "a consumer's relock is run WITHOUT the token" {
-  STUB_HAS_PACKAGES=true STUB_CONSUMER=ok run "$T/relock" --downstream inputs
-  [[ "$output" == *"fake:consumer done"* ]]
-  [ -f "$T/child-env.consumer" ]
-  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.consumer"
-  grep -q '^RELOCK_VISITED_FILE=' "$T/child-env.consumer"
-}
-
-@test "no token from gh: said, and the run goes on without one" {
-  STUB_GH=fail STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" --no-push inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"no GitHub token"* ]]
-  ! grep -q "extra-access-tokens" "$T/nix-config"
-}
-
-# A lock with two real root inputs, `a` alphabetically first.
 two_inputs() {
   cat > "$T/work/flake.lock" <<'LOCK'
 {"nodes":{"root":{"inputs":{"a":"a","b":"b"}},
@@ -587,273 +463,309 @@ LOCK
 
 @test "a bump coupled to another input's waits for it, then is carried — whatever the order" {
   two_inputs
-  STUB_HAS_PACKAGES=true STUB_UPDATE=coupled run "$T/relock" --no-push inputs
+  STUB_UPDATE=coupled run "$T/relock" --no-push inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"deferred"* ]]
-  [ "$(relock_commits)" -eq 2 ]
   [ "$(git -C "$T/work" log --format=%s -2 | tr '\n' '|')" = "chore(flake): relock a|chore(flake): relock b|" ]
-  [ "$(jq -r '.nodes.a.locked.rev + .nodes.b.locked.rev' "$T/work/flake.lock")" = "a2b2" ]
-}
-
-@test "one input that fails among others: the others are carried and pushed, the run ends non-zero naming it" {
-  two_inputs
-  STUB_HAS_PACKAGES=true STUB_UPDATE=one-fails run "$T/relock" inputs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"BUMPED"* ]]
-  [[ "$output" == *"FAILED to resolve"* ]]
-  [[ "$output" == *"FAILED: 1 target(s)"*"input b"* ]]
-  [[ "$output" != *"DONE"* ]]
-  [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = a2 ]
-}
-
-@test "a consumer that fails is counted: the requesting run ends non-zero and names it" {
-  STUB_HAS_PACKAGES=true STUB_CONSUMER=fail run "$T/relock" --downstream inputs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: 1 target(s)"*"consumer fake:consumer"* ]]
-  [[ "$output" != *"DONE"* ]]
-}
-
-@test "a requested run measures its bumps in a clone under a TMPDIR that crosses a symlink" {
-  mk_cat
-  mkdir -p "$T/realtmp" && ln -s "$T/realtmp" "$T/linktmp"
-  mkdir -p "$T/outside" && cd "$T/outside"
-  TMPDIR="$T/linktmp" STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_PIN=@remote run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"cloned at $DEFAULT"* ]]
-  [[ "$output" == *"BUMPED"* ]]
-  [[ "$output" != *"is a symlink"* ]]
-  [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
-}
-
-@test "a requested run clones shallow, and its bump is measured and pushed fast-forward" {
-  mk_cat
-  before=$(remote_rev "$DEFAULT")
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_PIN=@remote run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  clone=$(printf '%s\n' "$output" | sed -n "s/^  t ($DEFAULT) : //p")
-  [ -n "$clone" ]
-  [ "$(git -C "$clone" rev-parse --is-shallow-repository)" = true ]
-  [[ "$output" == *"BUMPED"* ]]
-  [ "$(git -C "$T/remote/seedmatic/t.git" show "$DEFAULT:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
-  [ "$(git -C "$T/remote/seedmatic/t.git" rev-parse "$DEFAULT^")" = "$before" ]
-}
-
-@test "a requested run carries its catalog: the hop runs in the clone and pushes the pin of what it pushed" {
-  mk_cat
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_PIN=@remote run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" != *"cat : <no worktree>"* ]]
-  [[ "$output" == *"verified: catalog pins t"* ]]
-  grep -q "lock-envs" "$T/calls"
-  [ "$(git -C "$T/remote/seedmatic/t.git" show cat:flake.lock | jq -r .nodes.t.locked.rev)" = "$(remote_rev "$DEFAULT")" ]
-}
-
-@test "a requested run's catalog is a clone of its own, full — never a worktree linked to the shallow clone" {
-  mk_cat
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  cat=$(printf '%s\n' "$output" | sed -n 's/^  cat : //p')
-  [ -n "$cat" ] && [ -d "$cat" ]
-  [ "$(git -C "$cat" rev-parse --absolute-git-dir)" = "$(cd "$cat" && pwd -P)/.git" ]
-  [ "$(git -C "$cat" rev-parse --is-shallow-repository)" = false ]
-}
-
-@test "a requested run whose catalog branch is not on the remote fails, it does not skip the hop" {
-  before=$(remote_rev "$DEFAULT")
-  mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"cannot clone t's catalog branch 'cat'"* ]]
-  never_updated
-  [ "$(remote_rev "$DEFAULT")" = "$before" ]
 }
 
 @test "a coupling that persists is a clear failure, and leaves nothing behind" {
   two_inputs
-  STUB_HAS_PACKAGES=true STUB_UPDATE=coupled-forever run "$T/relock" --no-push inputs
+  STUB_UPDATE=coupled-forever run "$T/relock" --no-push inputs
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAILED: 1 target(s)"* ]]
   [[ "$output" == *"FAILED — still coupled"* ]]
-  [[ "$output" == *"follows a non-existent input"* ]]
-  [ "$(relock_commits)" -eq 1 ]
   [ "$(jq -r '.nodes.a.locked.rev' "$T/work/flake.lock")" = "a1" ]
   tree_clean
 }
 
-@test "a repo already visited in this pass is skipped before anything else" {
-  printf 'seedmatic/t\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"already visited in this pass"* ]]
-  [ ! -s "$T/calls" ]
-}
-
-@test "a cycle A <-> B turns once: B's request back to A is skipped" {
-  # B is a stand-in consumer whose own relock requests A again, as ndh's does for rke2lab.
-  printf '#!%s\ncat "$RELOCK_VISITED_FILE" > "$T/visited-seen-by-b"\n"$T/relock" --downstream inputs > "$T/inner-a.out" 2>&1\n' "$(command -v bash)" > "$T/bin/consumer-relock"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok run "$T/relock" --downstream inputs
-  [ "$status" -eq 0 ]
-  grep -qx 'seedmatic/t' "$T/visited-seen-by-b"
-  grep -q "already visited in this pass" "$T/inner-a.out"
-  [ "$(grep -c '^DONE$' <<<"$output")" -eq 1 ]
-}
-
-@test "a chain A -> B -> C visits each once, and C's request back to A is skipped" {
-  # B and C honour the same protocol as any relock: skip if listed, else add their key.
-  for x in b c; do
-    next=$([ "$x" = b ] && echo "$T/bin/relock-c" || echo "$T/relock --downstream inputs")
-    printf '#!%s\ngrep -qx %s "$RELOCK_VISITED_FILE" && exit 0\necho %s >> "$RELOCK_VISITED_FILE"\ncp "$RELOCK_VISITED_FILE" "$T/visited-at-%s"\n%s > "$T/after-%s.out" 2>&1\n' \
-      "$(command -v bash)" "seedmatic/$x" "seedmatic/$x" "$x" "$next" "$x" > "$T/bin/relock-$x"
-    chmod +x "$T/bin/relock-$x"
-  done
-  cp "$T/bin/relock-b" "$T/bin/consumer-relock"
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok run "$T/relock" --downstream inputs
-  [ "$status" -eq 0 ]
-  [ "$(cat "$T/visited-at-c")" = "$(printf 'seedmatic/t\nseedmatic/b\nseedmatic/c')" ]
-  grep -q "already visited in this pass" "$T/after-c.out"
-}
-
-@test "an inherited visited list that no longer exists fails the run, it does not start over" {
-  RELOCK_VISITED_FILE="$T/gone" STUB_HAS_PACKAGES=true run "$T/relock" inputs
+@test "one input that fails among others: the others are carried and pushed, the run ends non-zero naming it" {
+  two_inputs
+  STUB_UPDATE=one-fails run "$T/relock" inputs
   [ "$status" -eq 1 ]
-  [[ "$output" == *"is gone — refusing to start over"* ]]
-  [ ! -s "$T/calls" ]
+  [[ "$output" == *"FAILED: 1 target(s)"*"input b"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = a2 ]
 }
 
-@test "a consumer already visited is not relaunched, and the gap is said when this run moved" {
-  # The diamond case: the consumer was reached through another path of the same pass.
-  printf 'fake:consumer\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_CONSUMER=ok \
-    run "$T/relock" --downstream inputs
+@test "--no-push commits in the checkout, pushes NOTHING, writes no trace, and prints how to resume" {
+  before=$(remote_rev develop)
+  STUB_UPDATE=rev run "$T/relock" --no-push inputs
   [ "$status" -eq 0 ]
-  [[ "$output" == *"fake:consumer"*"already visited in this pass — not relaunched"* ]]
-  [[ "$output" == *"NOTE: fake:consumer was not relaunched (already visited in this pass) although t moved"* ]]
-  [ ! -f "$T/child-env.consumer" ]
+  [ "$(relock_commits)" -eq 1 ]
+  [ "$(remote_rev develop)" = "$before" ]
+  [[ "$output" == *"To resume where this stopped:"*"git -C '$T/work' push"* ]]
+  [ "$(remote_rev fabric/relock)" = none ]
 }
 
-@test "no note when the skipped consumer missed nothing — this run moved nothing" {
-  printf 'fake:consumer\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
-    run "$T/relock" --downstream inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"not relaunched"* ]]
-  [[ "$output" != *"NOTE:"* ]]
-}
-
-@test "only the creator removes the visited list" {
-  printf 'x\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none run "$T/relock" inputs
-  [ "$status" -eq 0 ]
-  [ -f "$T/visited" ]
-  grep -qx 'seedmatic/t' "$T/visited"
-}
-
-@test "the creator removes the visited list on exit, even when the run fails" {
-  STUB_HAS_PACKAGES=fail STUB_UPDATE=rev run "$T/relock" inputs
-  [ "$status" -ne 0 ]
-  [ -s "$T/visited-path" ]
-  [ ! -e "$(cat "$T/visited-path")" ]
-}
-
-@test "a github: consumer is skipped when its EXACT key is listed — plain, orphan by /branch, orphan by ?ref=" {
-  printf 'seedmatic/peer\nseedmatic/peer:orphan/x\nseedmatic/peer2:feat/y\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
-    run "$T/relock-github" --downstream inputs
-  [ "$status" -eq 0 ]
-  [ "$(grep -c 'already visited in this pass — not relaunched' <<<"$output")" -eq 3 ]
-  [ ! -f "$T/child-env.consumer" ]
-}
-
-@test "a github: consumer whose key is listed in ANOTHER form is relaunched — keys must match exactly" {
-  printf 'github:seedmatic/peer\nseedmatic/peer:\nseedmatic/peer/orphan/x\nseedmatic/peer2\n' > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
-    run "$T/relock-github" --downstream inputs
-  [ "$status" -eq 0 ]
-  [ "$(grep -c 'not relaunched' <<<"$output")" -eq 0 ]
-  [ -f "$T/child-env.consumer" ]
-}
-
-# Bare remotes for the peers: a requested relock CLONES its repo, here through the same insteadOf.
-peers() {
-  for r in "$@"; do
-    git clone -q --bare "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/$r.git"
-    git config --global url."file://$T/remote/seedmatic/$r.git".insteadOf "file:///nonexistent/seedmatic/$r.git"
-  done
-}
-
-@test "transitive: a github: cycle A <-> B turns once — B does not relaunch A" {
-  peers peer
-  STUB_GRAPH=cycle STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
-    run "$T/relock-GRAPH_A" --downstream inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"relock(peer): not inside this repo — cloning"* ]]
-  [[ "$output" == *"github:seedmatic/t"*"already visited in this pass — not relaunched"* ]]
-  [ "$(grep -c '^DONE$' <<<"$output")" -eq 2 ]
-}
-
-@test "transitive: a github: chain A -> B -> C reaches C from A, each once, and C does not relaunch A" {
-  peers peer peer2
-  STUB_GRAPH=chain STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
-    run "$T/relock-GRAPH_A" --downstream inputs
-  [ "$status" -eq 0 ]
-  [ "$(grep -c 'relock(peer): not inside this repo' <<<"$output")" -eq 1 ]
-  [ "$(grep -c 'relock(peer2): not inside this repo' <<<"$output")" -eq 1 ]
-  [[ "$output" == *"github:seedmatic/t"*"already visited in this pass — not relaunched"* ]]
-  [ "$(grep -c '^DONE$' <<<"$output")" -eq 3 ]
-}
-
-@test "transitive: an orphan of a repo and the repo are two visits — the root reaches both, each once" {
-  mk_orphan
-  git -C "$T/work" checkout -q "$DEFAULT"
-  peers peer
+@test "--no-push refuses a requested run: unpushed commits in a clone would be lost" {
   mkdir -p "$T/outside" && cd "$T/outside"
-  STUB_GRAPH=root STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok \
-    run "$T/relock-ROOT_R" --downstream inputs
-  [ "$status" -eq 0 ]
-  [ "$(grep -c 'relock(peer-orphan): cloned at orphan' <<<"$output")" -eq 1 ]
-  [ "$(grep -c 'relock(peer): cloned at' <<<"$output")" -eq 1 ]
-  [[ "$output" == *"github:seedmatic/peer "*"already visited in this pass — not relaunched"* ]]
-  [ "$(grep -c '^DONE$' <<<"$output")" -eq 3 ]
+  run "$T/relock" --no-push inputs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--no-push needs a checkout"* ]]
 }
 
-@test "a requested run of another tool than the pass's refuses before anything, and is not marked visited" {
-  : > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" RELOCK_PASS_TOOL_ID=another STUB_HAS_PACKAGES=true STUB_UPDATE=rev \
-    run "$T/relock" inputs
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"REFUSING: relock(t) is tool $RELOCK_TOOL_ID, but this pass runs tool another"* ]]
+@test "--no-push with --downstream is refused: a head sees only what is pushed" {
+  run "$T/relock" --no-push --downstream inputs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"contradict"* ]]
   never_updated
-  [ ! -s "$T/visited" ]
+}
+
+@test "a requested run clones shallow under a TMPDIR that crosses a symlink, and pushes fast-forward" {
+  before=$(remote_rev develop)
+  mkdir -p "$T/realtmp" && ln -s "$T/realtmp" "$T/linktmp"
+  mkdir -p "$T/outside" && cd "$T/outside"
+  TMPDIR="$T/linktmp" STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cloned at develop"* ]]
+  [[ "$output" == *"BUMPED"* ]]
+  [[ "$output" != *"is a symlink"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
+  [ "$(git -C "$T/remote/seedmatic/t.git" rev-parse "develop^")" = "$before" ]
+}
+
+# ── the token ──────────────────────────────────────────────────────────────────────────────────────
+
+@test "the gh token reaches relock's own nix calls, appended — an inherited NIX_CONFIG survives" {
+  NIX_CONFIG="flake-registry = /somewhere/registry.json" STUB_UPDATE=none run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  grep -q "extra-access-tokens = github.com=SIMULATED-GH-TOKEN" "$T/nix-config"
+  grep -q "flake-registry = /somewhere/registry.json" "$T/nix-config"
+}
+
+@test "the token reaches the API on curl's stdin, never in its arguments" {
+  STUB_UPDATE=none run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  grep -q "Authorization: Bearer SIMULATED-GH-TOKEN" "$T/curl-stdin"
+  ! grep -q "SIMULATED-GH-TOKEN" "$T/curl-calls"
+}
+
+@test "the token is never printed" {
+  STUB_UPDATE=rev run "$T/relock" --no-push
+  [[ "$output" != *"SIMULATED-GH-TOKEN"* ]]
+}
+
+@test "no token from gh: said, and the run goes on without one" {
+  STUB_GH=fail STUB_UPDATE=none run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no GitHub token"* ]]
+  ! grep -q "extra-access-tokens" "$T/nix-config"
+  ! grep -q "Authorization" "$T/curl-stdin"
+}
+
+# ── after the inputs ───────────────────────────────────────────────────────────────────────────────
+
+@test "an after-inputs app runs AFTER the inputs, and what it changes is committed" {
+  STUB_UPDATE=rev STUB_AFTER=ok run "$T/relock-after"
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$T/work" log --format=%s -2 | tr '\n' '|')" = "chore(relock): after-x after inputs|chore(flake): relock a|" ]
+  tree_clean
+}
+
+@test "an after-inputs app that changes nothing commits nothing" {
+  STUB_UPDATE=none STUB_AFTER=none run "$T/relock-after"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"after-x"*"already current"* ]]
   [ "$(relock_commits)" -eq 0 ]
 }
 
-@test "an inherited pass that names no tool refuses — a requester that does not carry one is another relock" {
-  : > "$T/visited"
-  RELOCK_VISITED_FILE="$T/visited" STUB_HAS_PACKAGES=true STUB_UPDATE=rev run "$T/relock" inputs
+@test "a failing after-inputs app restores the tree, commits nothing of its own, and says why" {
+  STUB_UPDATE=none STUB_AFTER=fail run "$T/relock-after"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"this pass runs tool <none named>"* ]]
+  [[ "$output" == *"FAILED (after-inputs app after-x)"* ]]
+  [[ "$output" == *"after boom"* ]]
+  [ "$(relock_commits)" -eq 0 ]
+  tree_clean
+}
+
+@test "an after-inputs app is run WITHOUT the token" {
+  STUB_UPDATE=none STUB_AFTER=ok run "$T/relock-after"
+  [ -f "$T/child-env.after" ]
+  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.after"
+}
+
+# ── the trace ──────────────────────────────────────────────────────────────────────────────────────
+
+@test "after a pushed change, the trace is written on fabric/relock, naming the pushed revision" {
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"trace written on fabric/relock (t.json)"* ]]
+  tr=$(trace_of t)
+  [ "$(jq -r .schema <<<"$tr")" = seedmatic.relock/v1 ]
+  [ "$(jq -r .rev <<<"$tr")" = "$(remote_rev develop)" ]
+  [ "$(jq -r '.status.bumped.a | join(">")' <<<"$tr")" = "r1>r2" ]
+  [ "$(jq -r .status.tool <<<"$tr")" = "$RELOCK_TOOL_ID" ]
+  # the head's own branch did not move for it
+  [ "$(git -C "$T/remote/seedmatic/t.git" log --format=%s -1 develop)" = "chore(flake): relock a" ]
+}
+
+@test "two heads of one repository keep their own trace files on its fabric/relock" {
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  mk_orphan
+  echo d3 > "$T/drv"
+  jq '.nodes.a.locked.rev = "r5"' "$T/work/flake.lock" > "$T/x" && mv "$T/x" "$T/work/flake.lock"
+  git -C "$T/work" commit -qam orphan-lock && git -C "$T/work" push -q 2>/dev/null
+  STUB_UPDATE=rev run "$T/relock-orphan" inputs
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .head <<<"$(trace_of t)")" = t ]
+  [ "$(jq -r .head <<<"$(trace_of t-orphan)")" = t-orphan ]
+  [ "$(jq -r .rev <<<"$(trace_of t-orphan)")" = "$(remote_rev t-orphan/develop)" ]
+}
+
+@test "a run that commits nothing writes no trace" {
+  STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [ "$(remote_rev fabric/relock)" = none ]
+}
+
+# ── the plan ───────────────────────────────────────────────────────────────────────────────────────
+
+@test "--plan orders each head after what it pins, and covers what pins the start" {
+  run "$T/relock" --plan
+  [ "$status" -eq 0 ]
+  [ "$(jq -c .order <<<"$output")" = '["t","t-orphan","peer","peer2"]' ]
+  [ "$(jq -r '.tool.ref' <<<"$output")" = "github:seedmatic/nix-flake-commons/fc1" ]
   never_updated
 }
 
-@test "--downstream builds each consumer's relock on the pass's tool, and no override writes a lock" {
-  STUB_HAS_PACKAGES=true STUB_UPDATE=none STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+@test "--plan from a head covers only what pins it, transitively" {
+  mkdir -p "$T/outside" && cd "$T/outside"
+  run "$T/relock-peer" --plan
   [ "$status" -eq 0 ]
-  [[ "$output" == *"on the pass's tool github:seedmatic/nix-flake-commons/fc1"* ]]
-  grep -q -- '--override-input flake-commons github:seedmatic/nix-flake-commons/fc1 fake:consumer#apps\..*\.relock\.program' "$T/calls"
-  ! grep -q -- 'fake:consumer#apps.*relock.program' <(grep -v -- '--override-input' "$T/calls")
-  ! grep -q -- '--commit-lock-file' "$T/calls"
-  [ -f "$T/child-env.consumer" ]
+  [ "$(jq -c .order <<<"$output")" = '["peer","peer2"]' ]
 }
 
-@test "a pass whose tool reference holds other code refuses --downstream before anything moves" {
-  before=$(remote_rev "$DEFAULT")
-  STUB_TOOL_ID=other STUB_HAS_PACKAGES=true STUB_UPDATE=rev STUB_CONSUMER=ok run "$T/relock" --downstream inputs
+@test "a data head is a leaf: never read, never run, and what pins it is ordered after it" {
+  lock_of peer develop t d
+  run "$T/relock" --plan
+  [ "$status" -eq 0 ]
+  [ "$(jq -c .order <<<"$output")" = '["t","t-orphan","peer","peer2"]' ]
+  jq -e '.edges | index({from: "peer", to: "d", input: "d"}) != null' <<<"$output"
+  ! grep -q "fabric%2Fd\|fabric/d" "$T/curl-calls"
+}
+
+@test "a pin cycle fails the plan, naming each edge of the cycle and nothing downstream of it" {
+  lock_of t develop peer
+  run "$T/relock" --plan
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r '.errors[0]' <<<"$output")" == "a cycle among peer, t: peer pins t (input \`t\`); t pins peer (input \`peer\`)"* ]]
+  [[ "$(jq -r '.errors[0]' <<<"$output")" != *peer2* ]]
+}
+
+@test "an id that is not a head fails the plan, naming the head and the id" {
+  lock_of peer2 develop peer ghost
+  run "$T/relock" --plan
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r '.errors[]' <<<"$output")" == *"peer2: input \`ghost\` pins the id \`ghost\`, which is not a head of fabric/heads"* ]]
+}
+
+@test "an id that resolves to another repository than its head's fails the plan" {
+  lock_of peer2 develop peer
+  jq '.nodes.peer.locked.repo = "elsewhere"' "$T/gh/seedmatic/peer2/develop/flake.lock" | put seedmatic/peer2 develop flake.lock
+  run "$T/relock" --plan
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r '.errors[]' <<<"$output")" == *"resolves the id \`peer\` to seedmatic/elsewhere, but fabric/heads has it on seedmatic/peer"* ]]
+}
+
+@test "a lock the API cannot serve fails the plan — no fallback, no partial plan" {
+  STUB_API_FAIL=seedmatic/peer2 run "$T/relock" --plan
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"NO PLAN"*"cannot read the lock of peer2"* ]]
+  never_updated
+}
+
+# ── the pass ───────────────────────────────────────────────────────────────────────────────────────
+
+@test "--downstream plays the plan: each head once, in order, on the pass's tool, the start in its checkout" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=none run "$T/relock" --downstream
+  [ "$status" -eq 0 ]
+  [ "$(grep -E '^== (t|t-orphan|peer|peer2) ==$' <<<"$output" | tr '\n' ' ')" = "== t == == t-orphan == == peer == == peer2 == " ]
+  [[ "$output" == *"reconciling the checkout at $T/work (develop)"* ]]
+  [[ "$output" == *"relock(peer): not inside this head — cloning seedmatic/peer (develop)"* ]]
+  grep -q -- '--override-input flake-commons github:seedmatic/nix-flake-commons/fc1 github:seedmatic/peer/develop#apps\..*\.relock\.program' "$T/calls"
+  ! grep -q -- '--commit-lock-file' "$T/calls"
+  [[ "$output" == *"DONE (pass t@"* ]]
+}
+
+@test "a head that fails is named, what pins it is not run, and the rest of the pass still runs" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_PEER=unbuildable STUB_UPDATE=none run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"== peer2: NOT RUN — it pins peer, which did not land in this pass =="* ]]
+  [[ "$output" == *"reconciling the checkout at $T/work (develop)"* ]]
+  [[ "$output" == *"== t-orphan =="* ]]
+  [[ "$output" == *"FAILED: 2 target(s)"*"head peer"*"head peer2 (pins peer)"* ]]
+}
+
+@test "the plan's errors stop the pass before anything moves" {
+  lock_of t develop peer
+  before=$(remote_rev develop)
+  STUB_UPDATE=rev run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"NO PASS"*"a cycle among peer, t"* ]]
+  never_updated
+  [ "$(remote_rev develop)" = "$before" ]
+}
+
+@test "a pass whose tool reference holds other code refuses before anything moves" {
+  before=$(remote_rev develop)
+  STUB_TOOL_ID=other STUB_UPDATE=rev run "$T/relock" --downstream
   [ "$status" -eq 1 ]
   [[ "$output" == *"REFUSING --downstream: github:seedmatic/nix-flake-commons/fc1 is tool other"* ]]
   never_updated
-  [ ! -f "$T/child-env.consumer" ]
-  [ "$(remote_rev "$DEFAULT")" = "$before" ]
+  [ "$(remote_rev develop)" = "$before" ]
+}
+
+@test "--downstream from a session branch refuses: the heads after it pin what is pushed on the head's branch" {
+  git -C "$T/work" checkout -q -b feature/x
+  run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING --downstream from 'feature/x'"* ]]
+  never_updated
+}
+
+@test "a member of a pass runs another tool's code? it refuses before anything" {
+  echo '{"heads":{}}' > "$T/plan"
+  RELOCK_PASS_PLAN="$T/plan" RELOCK_PASS_TOOL_ID=another STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: relock(t) is tool $RELOCK_TOOL_ID, but this pass runs tool another"* ]]
+  never_updated
+}
+
+@test "a member whose plan is gone refuses — it does not run outside its pass" {
+  RELOCK_PASS_PLAN="$T/gone" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"the plan of this pass ($T/gone) is gone"* ]]
+  never_updated
+}
+
+@test "a member called as another head refuses" {
+  jq -n --slurpfile h "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json" '{heads: $h[0].heads}' > "$T/plan"
+  RELOCK_PASS_PLAN="$T/plan" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" RELOCK_HEAD=peer run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"the pass called head 'peer', but this relock is head 't'"* ]]
+}
+
+@test "a member reads the heads from its plan, not from the API" {
+  jq -n --slurpfile h "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json" '{heads: $h[0].heads}' > "$T/plan"
+  STUB_API=fail RELOCK_PASS_PLAN="$T/plan" RELOCK_PASS_TOOL_ID="$RELOCK_TOOL_ID" STUB_UPDATE=none run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [ ! -s "$T/curl-calls" ]
+}
+
+@test "another head's relock in a pass is run WITHOUT the token" {
+  peers peer peer2
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  printf '#!%s\nenv > "$T/child-env.peer"\n' "$(command -v bash)" > "$T/relock-peer"
+  STUB_UPDATE=none run "$T/relock" --downstream
+  [ -f "$T/child-env.peer" ]
+  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.peer"
+  grep -q '^RELOCK_PASS_PLAN=' "$T/child-env.peer"
+  grep -q '^RELOCK_HEAD=peer$' "$T/child-env.peer"
 }

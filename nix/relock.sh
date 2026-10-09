@@ -1,118 +1,103 @@
 # shellcheck shell=bash
-# relock — ONE implementation, shared by every repo in the chain. See rke2lab's
-# docs/architecture/patterns/flake-lock-propagation.adoc; built by nix-flake-commons' `lib.mkRelockApp`.
+# shellcheck disable=SC2016  # the jq programs are single-quoted: their $names are jq's, not the shell's
+# relock — ONE implementation, shared by every head of the fabric. See rke2lab's
+# docs/architecture/fabric/relock-bootstrap-spec.adoc; built by nix-flake-commons' `lib.mkRelockApp`.
 #
 # Build-time tokens (written WITHOUT at-sigils here so replaceVars does not substitute them in this
-# comment): repoName, repoSlug, repoUrl, ownBranch, system, consumers, ownedArtifacts,
-# pushFirstBranch, catalogBranch, selfPinName, aliases, toolId, toolSlug.
+# comment): repoName (the head's id in fabric/heads), system, afterInputs, toolId, toolSlug, planJq,
+# configurationsNix.
 #
 # ★ WHY the name is identical in every repo: propagation is a REQUEST, and the caller must know
-# nothing about the callee beyond its name — that uniformity is what makes `nix run <any repo>#relock`
-# possible. The same reasoning applies one level down, to the implementation: if each repo wrote its
-# own, "the same rule everywhere" would be a claim nobody could check. So the rule lives once and each
-# repo supplies only what is ITS OWN — its url, its artifacts, its branches, its consumers.
+# nothing about the callee beyond its name. The same reasoning applies one level down, to the
+# implementation: if each repo wrote its own, "the same rule everywhere" would be a claim nobody could
+# check. So the rule lives once, and each head supplies only what is ITS OWN: its id, and the apps it
+# runs after its inputs.
 
 downstream=0
 nopush=0
+planonly=0
 targets=()
 
-# A repo's own words for some of its regen apps (`plans` → `regen-dataplan`), declared where that
-# repo builds its relock — never here. The root that every seedmatic flake consumes must not name
-# one consumer's artifacts; it used to, as two hard-coded cases.
-declare -A alias_of=()
-aliases=(@aliases@)
-for kv in "${aliases[@]}"; do alias_of[${kv%%=*}]=${kv#*=}; done
+afterInputs=(@afterInputs@)
 
 for a in "$@"; do
   case $a in
     --downstream) downstream=1 ;;
     --no-push) nopush=1 ;;
+    --plan) planonly=1 ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream | --no-push] [target...]
+relock [--downstream | --no-push | --plan] [target...]
 
-Reconcile this repo's derived, committed artifacts. No target = ALL of them.
+Reconcile this head's lock. No target = ALL of it.
 
   inputs            every flake input          -> flake.lock
   <input-name>      one input, by its name in flake.lock
-  artifacts         every regen-* app this repo exposes (discovered)
-  regen-<name>      one regen app by name
-  envs              every flox env on the catalog branch, if this repo has one
-  envs:<id>         one such env
-  catalog           the catalog branch's pin of this repo, if it has one
+  after             the apps this head runs after its inputs (afterInputs)
 
-An input bump that moves no exported derivation is DROPPED, not carried.
---downstream then REQUESTS each declared consumer's own relock, itself with --downstream: ONE such run
-reconciles and PUSHES the whole chain, each repo once (a visited list ends the cycles). Review a
-chain by walking it by hand with --no-push instead.
-A pass runs ONE relock everywhere: every consumer's is built with `--override-input flake-commons`
-on the tool of the run that started the pass, and a relock of any other code refuses. Started from
-nix-flake-commons, that tool is its pushed HEAD; started from another repo, it is that repo's
-flake-commons pin. A consumer's own flake-commons pin is then bumped like any other input.
+An input bump that moves no exported derivation (packages, apps, configurations with their revision
+neutralised) is DROPPED, not carried. After a push, the trace of the change is written on this repo's
+`fabric/relock` branch, which nothing pins.
+
+--plan prints the plan of a pass started here, as JSON, and changes nothing: the heads come from
+nix-flake-commons' `fabric/heads`, the edges from each code head's lock, both read through the GitHub
+API. A cycle, an id that is not a head, or an id that resolves elsewhere fails it.
+--downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
+plan's order; a head that pins a failed head is not run. The pass ends non-zero naming every failure.
+A pass runs ONE relock everywhere: each head's is built with `--override-input flake-commons` on the
+pass's tool, and a relock of any other code refuses.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
 
-GitHub token: read from `gh auth token` at each run and handed ONLY to relock's own nix calls,
-as extra-access-tokens appended to NIX_CONFIG. Never written anywhere, never exported, and never
-passed to the programs those calls build (regen apps, lock-envs, a consumer's relock).
+GitHub token: read from `gh auth token` at each run and handed ONLY to relock's own nix and API calls,
+as extra-access-tokens appended to NIX_CONFIG, and to curl on its stdin. Never written anywhere, never
+exported, and never passed to the programs relock runs (afterInputs apps, another head's relock).
 USAGE
-      if [ "${#aliases[@]}" -gt 0 ]; then
-        printf '\nAliases this repo declares:\n'
-        for kv in "${aliases[@]}"; do printf '  %-17s %s\n' "${kv%%=*}" "${kv#*=}"; done
-      fi
       exit 0 ;;
     -*) echo "relock: unknown flag '$a' (try --help)" >&2; exit 2 ;;
     *) targets+=("$a") ;;
   esac
 done
-# A consumer only ever sees what is pushed, so requesting one after a run that pushed nothing would
-# relock it against the revision this run did NOT carry — and report success.
+# A head only ever sees what is pushed, so playing a pass after a run that pushed nothing would
+# relock the next heads against the revision this run did NOT carry — and report success.
 if [ "$nopush" = 1 ] && [ "$downstream" = 1 ]; then
-  echo "relock: --no-push and --downstream contradict each other — a consumer sees only what is pushed" >&2
+  echo "relock: --no-push and --downstream contradict each other — a head sees only what is pushed" >&2
   exit 2
 fi
 
-# Every repo is reconciled AT MOST ONCE per pass, however the consumers are wired. The chain has
-# cycles — rke2lab <-> ndh — and the derivation guard alone cannot end them while a repo's outputs
-# move on every commit, so --downstream would turn forever. The pass therefore carries a VISITED
-# list: a FILE, not a variable, because a variable flows only from parent to child, and in a
-# diamond (A->B, A->C, B->C) A would never learn that B had already visited C. The first relock of
-# a pass creates it and removes it on exit; each relock checks for its own key before doing
-# anything else, and adds it. A consumer's relock inherits the path through the environment.
-visit_branch="@ownBranch@"
-visit_key="@repoSlug@${visit_branch:+:$visit_branch}"
-# Only the creator removes it. An INHERITED path that no longer exists is a broken pass, and starting
-# again from an empty list would silently void the very guarantee this file exists to give.
-# The pass also carries the identity of its TOOL. Each repo would otherwise run the relock of its own
-# flake-commons pin, so a fix to relock reached a repo only on the pass AFTER the one that bumped it
-# there. The creator names the tool; a requested run of any other code refuses before anything.
-if [ -z "${RELOCK_VISITED_FILE:-}" ]; then
-  RELOCK_VISITED_FILE=$(mktemp)
-  export RELOCK_VISITED_FILE
-  trap 'rm -f "$RELOCK_VISITED_FILE"' EXIT
-  RELOCK_PASS_TOOL_ID="@toolId@"
-  export RELOCK_PASS_TOOL_ID
-elif [ ! -f "$RELOCK_VISITED_FILE" ]; then
-  echo "relock(@repoName@): the visited list of this pass ($RELOCK_VISITED_FILE) is gone — refusing to start over" >&2
-  exit 1
-elif [ "${RELOCK_PASS_TOOL_ID:-}" != "@toolId@" ]; then
-  echo "REFUSING: relock(@repoName@) is tool @toolId@, but this pass runs tool ${RELOCK_PASS_TOOL_ID:-<none named>}:" >&2
-  echo "          one pass runs one relock — its requester must build this one on the pass's tool" >&2
-  exit 1
+# A MEMBER of a pass is a relock its pass's starter runs, the starter's own included. It carries the
+# plan, and the tool of the pass: a run of any other code refuses before anything, because each head
+# would otherwise run the relock of its own flake-commons pin, and a fix to relock would reach a head
+# only on the pass AFTER the one that bumped it there.
+member=0
+if [ -n "${RELOCK_PASS_PLAN:-}" ]; then
+  member=1
+  if [ ! -f "$RELOCK_PASS_PLAN" ]; then
+    echo "relock(@repoName@): the plan of this pass ($RELOCK_PASS_PLAN) is gone — refusing to run outside it" >&2
+    exit 1
+  fi
+  if [ "${RELOCK_PASS_TOOL_ID:-}" != "@toolId@" ]; then
+    echo "REFUSING: relock(@repoName@) is tool @toolId@, but this pass runs tool ${RELOCK_PASS_TOOL_ID:-<none named>}:" >&2
+    echo "          one pass runs one relock — its starter must build this one on the pass's tool" >&2
+    exit 1
+  fi
+  if [ -n "${RELOCK_HEAD:-}" ] && [ "$RELOCK_HEAD" != "@repoName@" ]; then
+    echo "REFUSING: the pass called head '$RELOCK_HEAD', but this relock is head '@repoName@'" >&2
+    exit 1
+  fi
+  if [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; then
+    echo "relock(@repoName@): a member of a pass plays no pass of its own" >&2
+    exit 2
+  fi
 fi
-if grep -qxF -- "$visit_key" "$RELOCK_VISITED_FILE" 2>/dev/null; then
-  echo "relock(@repoName@): already visited in this pass — skipped"
-  exit 0
-fi
-printf '%s\n' "$visit_key" >> "$RELOCK_VISITED_FILE"
 
 # The GitHub token, for the PRIVATE inputs (measured 2026-10-07: without one, nix fetched ndh's
 # private claude-hub input as a 404 and fell back to a stale cache). Taken from `gh auth token` at
 # each run rather than stored: the copy that used to live in nix.conf expired and nobody noticed.
 #
-# ⚠️ Scoped to relock's OWN nix calls, and that is the whole design. The variable is NOT exported,
-# and `nix` below is a function that appends the token to NIX_CONFIG for that one process only —
-# APPENDED, as extra-access-tokens, because NIX_CONFIG may already carry settings (the flox hook
+# ⚠️ Scoped to relock's OWN nix and API calls, and that is the whole design. The variable is NOT
+# exported, and `nix` below is a function that appends the token to NIX_CONFIG for that one process
+# only — APPENDED, as extra-access-tokens, because NIX_CONFIG may already carry settings (the flox hook
 # puts the flake registry there) and `access-tokens` would replace nix.conf's. A token in a
 # process-wide variable is how GH_TOKEN once leaked into an editor; and `nix run` would hand its
 # environment to the program it starts, which is why apps are built here and run without it.
@@ -132,10 +117,23 @@ nix() {
   fi
 }
 
+# One file of a head, through the GitHub API: a few hundred milliseconds, where `nix flake metadata`
+# downloads the head's whole tree to read one file (measured 2026-10-09: 0.45 s against 2.3 s and
+# 3.9 MB on rke2lab). Any HTTP error fails: an answer that did not come is never read as an empty one.
+# The token travels on curl's stdin, never in its arguments, which every process can read.
+api_raw() { # $1 owner/repo  $2 branch  $3 path -> the file on stdout
+  local ref
+  ref=$(jq -rn --arg b "$2" '$b | @uri')
+  {
+    if [ -n "$gh_token" ]; then printf 'header = "Authorization: Bearer %s"\n' "$gh_token"; fi
+    printf 'header = "Accept: application/vnd.github.raw"\n'
+  } | curl --config - -fsSL "https://api.github.com/repos/$1/contents/$3?ref=$ref"
+}
+
 # An app's program, BUILT with the token, so that running it afterwards needs no fetch and gets no
 # token. `nix build` refuses the program string itself, so its context's derivations are built.
-# Empty but for a consumer's relock, which is built on the pass's tool (see the downstream block). An
-# override never writes a lock: nothing here passes --commit-lock-file.
+# Empty but for another head's relock, which is built on the pass's tool. An override never writes a
+# lock: nothing here passes --commit-lock-file.
 tool_override=()
 app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program path on stdout
   local prog d
@@ -146,115 +144,242 @@ app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program pat
   printf '%s\n' "$prog"
 }
 
-# WHOSE repo this reconciles — its OWN, always, and resolved rather than assumed.
-#
-# ⚠️ The contract is `nix run <repo>#relock` from ANY directory. When rke2lab's relock requests ours,
-# the CWD is RKE2LAB's worktree, so a bare `git rev-parse --show-toplevel` would hand us the wrong
-# repo and relock it with our rules — silently, and reporting success. So the CWD counts only if it is
-# a checkout of THIS repo; otherwise we obtain one of our own.
-#
-# Matching is on the SLUG (`owner/name`), not the url: a local checkout may speak ssh where the input
-# speaks https, and the same repo must not read as a different one because of the transport.
-#
-# ⚠️ And the slug is not enough when one repo carries SEVERAL flakes, one per branch — rke2lab's
-# develop and its orphans seed-incluster and flox-catalog. Matched on the slug alone, the orphan's
-# relock run from a develop checkout reconciled develop by the orphan's rules, and a requested run
-# cloned the default branch instead of the orphan: both silently, both reporting success. So a flake
-# that names its `branch` counts a checkout as its own only on that branch and clones that branch;
-# and a flake that names none refuses to run on the branches it has itself declared as OTHER flakes
-# of the repo (`pushFirstBranch`, `catalogBranch`).
-ownBranch="@ownBranch@"
-pushFirstBranch="@pushFirstBranch@"
-catalogBranch="@catalogBranch@"
-ownSlug="@repoSlug@"
+# Every target that FAILED in this run, named. A failure does not stop the others, and what did
+# succeed is still pushed — but the run then ends non-zero with the list, so a starter reads a
+# failure, not "done", and counts it in its own list in turn.
+failed=()
+finish() { # $1 the word for success
+  if [ "${#failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
+  echo "FAILED: ${#failed[@]} target(s)"
+  printf '  %s\n' "${failed[@]}"
+  exit 1
+}
+
+# THE HEADS. Who this relock is — its repository, its branch — is no argument of the factory: it is
+# its entry in fabric/heads, the one list of the fabric's heads, read once per pass (a member reads it
+# from the plan, so a whole pass sees one list).
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+heads="$work/heads.json"
+if [ "$member" = 1 ]; then
+  jq '.heads' "$RELOCK_PASS_PLAN" > "$heads"
+elif ! api_raw "@toolSlug@" "fabric/heads" "heads.json" > "$work/fabric-heads.json"; then
+  echo "relock(@repoName@): cannot read fabric/heads from @toolSlug@ — refusing to guess who this is" >&2
+  exit 1
+elif ! jq -e '.schema == "seedmatic.fabric-heads/v1" and (.heads | type == "object")' "$work/fabric-heads.json" >/dev/null 2>&1; then
+  echo "relock(@repoName@): fabric/heads holds no seedmatic.fabric-heads/v1 — refusing to read it" >&2
+  exit 1
+else
+  jq '.heads' "$work/fabric-heads.json" > "$heads"
+fi
+selfRepo=$(jq -r '.["@repoName@"].repo // empty' "$heads")
+selfBranch=$(jq -r '.["@repoName@"].branch // empty' "$heads")
+selfKind=$(jq -r '.["@repoName@"].kind // empty' "$heads")
+if [ -z "$selfRepo" ] || [ "$selfKind" != code ]; then
+  echo "REFUSING: '@repoName@' is not a code head of fabric/heads — a relock's name is its head's id" >&2
+  exit 1
+fi
 toolSlug="@toolSlug@"
-cur=""
+
+# A checkout BELONGS to this head when it is a checkout of the head's repository on the head's
+# branch, or on a session of it. The sessions of a head on `develop` are the branches of no other
+# head's namespace; the sessions of `seed-incluster/develop` are `seed-incluster/*`. Matching on the
+# repository alone reconciled one flake of a repo by another's rules, silently.
+namespace_of() { case $1 in */*) printf '%s\n' "${1%%/*}" ;; *) printf '\n' ;; esac; }
+belongs() { # $1 branch -> 0 when it is this head's branch or a session of it
+  local b=$1 ns
+  [ "$b" = "$selfBranch" ] && return 0
+  ns=$(namespace_of "$selfBranch")
+  if [ -n "$ns" ]; then
+    case $b in "$ns"/*) return 0 ;; *) return 1 ;; esac
+  fi
+  jq -e --arg r "$selfRepo" --arg b "$b" '[ .[] | select(.repo == $r) | .branch | select(contains("/")) | split("/")[0] ]
+    | index($b | split("/")[0]) == null' "$heads" >/dev/null
+}
+
+# The checkout this run reconciles, if the CWD is one of ours: matched on the origin's slug, because a
+# local checkout may speak ssh where the remote speaks https.
 REPO=""
-catalogClone=""
+cur=""
 if top=$(git rev-parse --show-toplevel 2>/dev/null); then
   origin=$(git -C "$top" remote get-url origin 2>/dev/null || true)
   origin=${origin%.git}
   case "$origin" in
-    *"@repoSlug@") REPO=$top ;;
+    *"$selfRepo") REPO=$top ;;
   esac
 fi
-if [ -n "$REPO" ]; then
-  cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
-  if [ -n "$ownBranch" ] && [ "$cur" != "$ownBranch" ]; then
-    echo "REFUSING: this checkout of @repoSlug@ is on '$cur', but @repoName@ is the flake on '$ownBranch'." >&2
-    echo "Run it from a worktree of '$ownBranch', or from outside any checkout of @repoSlug@ to have" >&2
-    echo "'$ownBranch' cloned." >&2
+
+# THE PASS. Planned from facts only, then played: each head of the plan runs its own relock once, in
+# the plan's order. Nothing ends a cycle here, because a cycle never gets this far.
+if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
+  if [ -n "$REPO" ]; then
+    cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+    if [ "$downstream" = 1 ] && [ "$cur" != "$selfBranch" ]; then
+      echo "REFUSING --downstream from '$cur': a pass starts from the head's own branch, '$selfBranch' —" >&2
+      echo "          the heads after it pin what is pushed there, not a session" >&2
+      exit 1
+    fi
+  fi
+
+  # The tool of the pass, as a FETCHABLE reference, proven before anything moves: every head's relock
+  # is built from it. From the tool's own head it is that head's pushed revision; from any other, the
+  # start's pushed flake-commons pin. Unpushed code cannot pass for either.
+  mapfile -t code_heads < <(jq -r 'to_entries[] | select(.value.kind == "code") | .key' "$heads" | sort)
+  plan_errors=()
+  locks="$work/locks.json"
+  echo '{}' > "$locks"
+  for id in "${code_heads[@]}"; do
+    repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
+    branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
+    if ! api_raw "$repo" "$branch" flake.lock > "$work/lock-$id.json" || ! jq -e '.nodes' "$work/lock-$id.json" >/dev/null 2>&1; then
+      plan_errors+=("cannot read the lock of $id ($repo:$branch) through the GitHub API")
+      continue
+    fi
+    jq --arg i "$id" --slurpfile l "$work/lock-$id.json" '. + { ($i): $l[0] }' "$locks" > "$work/locks.next" && mv "$work/locks.next" "$locks"
+  done
+  if [ "${#plan_errors[@]}" -gt 0 ]; then
+    echo "relock(@repoName@): NO PLAN — the facts could not all be read:" >&2
+    printf '  %s\n' "${plan_errors[@]}" >&2
     exit 1
   fi
-  if [ -z "$ownBranch" ] && { [ "$cur" = "$pushFirstBranch" ] || [ "$cur" = "$catalogBranch" ]; }; then
-    echo "REFUSING: this checkout of @repoSlug@ is on '$cur', which @repoName@ declares as ANOTHER" >&2
-    echo "flake of this repo. Run that branch's own relock from here, or this one from another checkout." >&2
+  plan="$work/plan.json"
+  jq -n --arg start "@repoName@" --slurpfile h "$heads" --slurpfile l "$locks" \
+    '{ start: $start, heads: $h[0], locks: $l[0] }' | jq -f "@planJq@" > "$plan"
+
+  if [ "$selfRepo" = "$toolSlug" ]; then
+    tool_rev=$(git ls-remote "https://github.com/$selfRepo.git" "refs/heads/$selfBranch" | cut -f1)
+    tool_ref="github:$selfRepo/${tool_rev:-<none>}"
+  else
+    tool_ref=$(jq -r --arg s "@repoName@" '.locks[$s] as $l | $l.nodes[$l.root].inputs["flake-commons"] as $n
+      | if ($n | type) == "string" and $l.nodes[$n].locked.type == "github"
+        then "github:\($l.nodes[$n].locked.owner)/\($l.nodes[$n].locked.repo)/\($l.nodes[$n].locked.rev)" else "" end' \
+      <(jq -n --slurpfile l "$locks" '{ locks: $l[0] }'))
+  fi
+  jq --arg id "@toolId@" --arg ref "$tool_ref" '. + { tool: { id: $id, ref: $ref } }' "$plan" > "$work/plan.next" && mv "$work/plan.next" "$plan"
+
+  if [ "$planonly" = 1 ]; then
+    jq 'del(.heads)' "$plan"
+    if jq -e '.errors | length > 0' "$plan" >/dev/null; then exit 1; fi
+    exit 0
+  fi
+  if jq -e '.errors | length > 0' "$plan" >/dev/null; then
+    echo "relock(@repoName@): NO PASS — the plan fails before anything moves:" >&2
+    jq -r '.errors[] | "  " + .' "$plan" >&2
+    exit 1
+  fi
+  if [ -z "$tool_ref" ] || [ "${tool_ref##*/}" = "<none>" ]; then
+    echo "REFUSING --downstream: @repoName@ names no pushed tool (no github: flake-commons pin, or the tool's head is not on the remote)" >&2
+    exit 1
+  fi
+  if ! pass_tool=$(nix eval --raw "$tool_ref#lib.relockToolId"); then
+    echo "REFUSING --downstream: the pass's tool $tool_ref cannot be fetched" >&2
+    exit 1
+  fi
+  if [ "$pass_tool" != "@toolId@" ]; then
+    echo "REFUSING --downstream: $tool_ref is tool $pass_tool, not the one running here (@toolId@)" >&2
+    echo "          — commit and push the relock you mean to run, or run the one that is pushed" >&2
+    exit 1
+  fi
+
+  RELOCK_PASS_TOOL_ID="@toolId@"
+  RELOCK_PASS_TOOL_REF="$tool_ref"
+  RELOCK_PASS_WAVE="@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  pass_plan=$(mktemp)
+  jq --arg w "$RELOCK_PASS_WAVE" '. + { wave: $w }' "$plan" > "$pass_plan"
+  RELOCK_PASS_PLAN="$pass_plan"
+  export RELOCK_PASS_TOOL_ID RELOCK_PASS_TOOL_REF RELOCK_PASS_WAVE RELOCK_PASS_PLAN
+  trap 'rm -rf "$work" "$pass_plan"' EXIT
+  tool_override=(--override-input flake-commons "$RELOCK_PASS_TOOL_REF")
+
+  mapfile -t order < <(jq -r '.order[]' "$plan")
+  echo "== pass $RELOCK_PASS_WAVE, on the tool $RELOCK_PASS_TOOL_REF =="
+  echo "order: ${order[*]}"
+  echo
+  declare -A down=()
+  here=$(pwd)
+  for id in "${order[@]}"; do
+    # A head that pins a head which failed, or was not run, would relock against what that head did
+    # NOT carry: it is not run, and the failure is said with the head it waits on.
+    blocked=$(jq -r --arg i "$id" '.edges[] | select(.from == $i) | .to' "$plan" | while read -r d; do
+      if [ -n "${down[$d]:-}" ]; then printf '%s\n' "$d"; fi; done | head -n1)
+    if [ -n "$blocked" ]; then
+      echo "== $id: NOT RUN — it pins $blocked, which did not land in this pass =="
+      failed+=("head $id (pins $blocked)")
+      down[$id]=1
+      continue
+    fi
+    echo "== $id =="
+    rc=0
+    if [ "$id" = "@repoName@" ]; then
+      # The start's own relock, by the very program running here, in the operator's checkout.
+      ( cd "$here" && RELOCK_HEAD="$id" "$0" "${targets[@]}" ) || rc=$?
+    else
+      repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
+      branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
+      if ! prog=$(app_program "github:$repo/$branch#apps.@system@.relock"); then
+        echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
+        rc=1
+      else
+        # Run from outside any checkout, so the head clones its own branch.
+        elsewhere=$(mktemp -d)
+        ( cd "$elsewhere" && RELOCK_HEAD="$id" "$prog" ) || rc=$?
+        rm -rf "$elsewhere"
+      fi
+    fi
+    if [ "$rc" != 0 ]; then
+      echo "  ^ FAILED — $id's relock exited $rc (its output is above)"
+      failed+=("head $id")
+      down[$id]=1
+    else
+      echo "  ^ $id done"
+    fi
+    echo
+  done
+  finish "DONE (pass $RELOCK_PASS_WAVE)"
+fi
+
+# THE LOCAL RULE, the same for every head and in every pass: bump, drop what moves nothing exported,
+# commit, push, trace.
+if [ -n "$REPO" ]; then
+  cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+  if ! belongs "$cur"; then
+    echo "REFUSING: this checkout of $selfRepo is on '$cur', which is not '$selfBranch' nor a session of it:" >&2
+    echo "          it belongs to another head of the repository. Run that head's relock from here, or" >&2
+    echo "          this one from its own checkout." >&2
     exit 1
   fi
   echo "relock(@repoName@): reconciling the checkout at $REPO ($cur)"
 else
   # A REQUESTED run, from somewhere that is not our checkout. We clone, reconcile and PUSH: the chain
   # is push-gated anyway (a `github:` input only ever sees what is pushed), so the remote is the only
-  # place a request can usefully land. The operator's own checkout stays untouched and simply pulls.
-  # Unpushed commits in a throwaway clone would vanish with it: --no-push needs the operator's checkout.
+  # place a request can usefully land. Unpushed commits in a throwaway clone would vanish with it:
+  # --no-push needs the operator's checkout.
   if [ "$nopush" = 1 ]; then
-    on=""
-    if [ -n "$ownBranch" ]; then on=" on $ownBranch"; fi
-    echo "relock: --no-push needs a checkout of @repoSlug@$on — run it from there;" >&2
+    echo "relock: --no-push needs a checkout of $selfRepo on $selfBranch — run it from there;" >&2
     echo "        in a clone, the unpushed commits would be lost with it" >&2
     exit 2
   fi
   # Canonical, because nix refuses a git+file flake whose path crosses a symlink once its tree is
   # dirty — and a bumped lock makes it dirty. TMPDIR may well cross one (macOS: /tmp -> private/tmp).
   REPO=$(realpath "$(mktemp -d)")/@repoName@
-  clone_branch=()
-  if [ -n "$ownBranch" ]; then clone_branch=(--branch "$ownBranch"); fi
-  echo "relock(@repoName@): not inside this repo — cloning @repoUrl@ ${ownBranch:+($ownBranch) }to reconcile and push"
+  echo "relock(@repoName@): not inside this head — cloning $selfRepo ($selfBranch) to reconcile and push"
   # Shallow: a requested run reads no history, it bumps the tip and pushes it.
-  git clone --quiet --depth=1 "${clone_branch[@]}" "@repoUrl@" "$REPO" || { echo "relock: cannot clone @repoUrl@ $ownBranch" >&2; exit 1; }
+  git clone --quiet --depth=1 --branch "$selfBranch" "https://github.com/$selfRepo.git" "$REPO" \
+    || { echo "relock: cannot clone $selfRepo $selfBranch" >&2; exit 1; }
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
   echo "relock(@repoName@): cloned at $cur"
-  # The catalog hop is this repo's OWN act, so a requested run owes it as much as a local one. A
-  # clone carries no checkout of the catalog branch, so the branch is cloned here, and a catalog
-  # branch the remote does not have is a failure, not a skip.
-  # ⚠️ A clone of its OWN, full: nix reads a flake through libgit2, which does not see the shallow
-  # boundary of a worktree linked to a shallow clone and fails on the tip's missing parent.
-  if [ -n "$catalogBranch" ]; then
-    catalogClone="${REPO%/*}/$catalogBranch"
-    if ! git clone --quiet --single-branch --branch "$catalogBranch" "@repoUrl@" "$catalogClone"; then
-      echo "relock: cannot clone @repoName@'s catalog branch '$catalogBranch' from @repoUrl@ —" >&2
-      echo "        refusing to reconcile without the hop that carries this repo to its envs" >&2
-      exit 1
-    fi
-  fi
 fi
 
-# The registry that resolves a repo's INDIRECT inputs, pinned by a CLI flag rather than left to
-# NIX_CONFIG. Measured 2026-10-06: `--flake-registry` beats a NIX_CONFIG aimed elsewhere, and
-# leaving NIX_CONFIG alone matters because that is where access-tokens for the private inputs
-# live. What it points AT is the repo's EFFECTIVE registry — the operator's gitignored
-# flake-registry.local.json when one exists, the committed flake-registry.json otherwise.
+# The registry that resolves a head's INDIRECT inputs, pinned by a CLI flag rather than left to
+# NIX_CONFIG (measured 2026-10-06: `--flake-registry` beats a NIX_CONFIG aimed elsewhere, and leaving
+# NIX_CONFIG alone matters because that is where access-tokens for the private inputs live). It
+# points at the head's EFFECTIVE registry: the operator's gitignored flake-registry.local.json when
+# one exists — re-aiming an input at the branch you work on, and having relock follow you there, is
+# what the indirection is for — the committed flake-registry.json otherwise. A fresh clone has no
+# gitignored file, so the only local file relock can read is the operator's own.
 #
-# ★ That precedence is the whole point of the indirection, and an earlier version of this
-# function defeated it: it pinned the committed file unconditionally, so re-locking through a
-# local re-aim was impossible — which is the one thing the registry exists to make possible.
-# Re-aiming an input at the branch you are working on, and having a relock FOLLOW you there, is
-# the use case; naming that branch in flake.nix is what we removed.
-#
-# What made the over-caution look reasonable was imagining the local file as somebody ELSE's.
-# It cannot be: relock reconciles either the operator's own checkout or a FRESH CLONE, and a
-# fresh clone has no gitignored file at all, so it falls back to the committed one by
-# construction. The only flake-registry.local.json relock can ever read is the one belonging to
-# whoever ran it.
-#
-# Safety is the GUARD's job, not this pin's, and the guard already draws the right line —
-# between a re-aim at another BRANCH, whose locked rev is pushed and therefore fetchable by
-# everyone, and a re-aim at a local CHECKOUT, whose rev exists on one machine. It refuses the
-# second and lets the first through. Pinning the committed file as well bought nothing and cost
-# the feature.
-#
-# A repo that carries neither file gets no flag: nothing to point at, and the guard covers it
-# regardless. Uniform across the chain whether a given repo has migrated its inputs or not.
+# The COMMITTED registry must agree with fabric/heads, id by id: three lists that map an id to a
+# repository drift apart exactly where nobody looks. The local one may disagree — that is its purpose.
 registry_flag=()
 set_registry_flag() { # $1 checkout dir
   registry_flag=()
@@ -265,113 +390,71 @@ set_registry_flag() { # $1 checkout dir
   fi
 }
 set_registry_flag "$REPO"
+if [ -f "$REPO/flake-registry.json" ]; then
+  if ! drift=$(jq -r --slurpfile h "$heads" '.flakes[] | . as $f | $h[0][$f.from.id] as $e
+      | if $e == null then "\($f.from.id): not a head of fabric/heads"
+        elif "\($f.to.owner)/\($f.to.repo)" != $e.repo or ($f.to.ref // "develop") != $e.branch
+        then "\($f.from.id): \($f.to.owner)/\($f.to.repo) at \($f.to.ref // "develop"), but fabric/heads has \($e.repo) at \($e.branch)"
+        else empty end' "$REPO/flake-registry.json"); then
+    echo "REFUSING: cannot read $REPO/flake-registry.json" >&2
+    exit 1
+  fi
+  if [ -n "$drift" ]; then
+    echo "REFUSING: the committed flake-registry.json disagrees with fabric/heads:" >&2
+    printf '  %s\n' "$drift" >&2
+    exit 1
+  fi
+fi
 
-# The per-input comparison attributes a derivation change to the input just bumped, so
-# any OTHER uncommitted edit would be credited to it. Refuse rather than mislead.
-#
-# TRACKED changes only. Measured 2026-10-07: nix's git fetcher EXCLUDES untracked files from a
-# flake's source — the untracked `.claude/` scratch paths in this checkout are absent from the
-# store path `nix flake metadata` reports, while tracked `flake.nix` is present. So an untracked
-# file cannot move any derivation, and refusing on one refuses on a condition this guard cannot
-# be protecting against. It did exactly that: scratch notes left by another session blocked a
-# reconciliation outright, and the only ways out were to commit files that were not ours or to
-# delete them.
-dirty=$(git -C "$REPO" status --porcelain --untracked-files=no -- . ':!flake.lock' @ownedArtifacts@)
+# The per-input comparison attributes a derivation change to the input just bumped, so any OTHER
+# uncommitted edit would be credited to it. Refuse rather than mislead. TRACKED changes only: nix's git
+# fetcher excludes untracked files from a flake's source (measured 2026-10-07), so an untracked file
+# cannot move any derivation.
+dirty=$(git -C "$REPO" status --porcelain --untracked-files=no -- . ':!flake.lock')
 if [ -n "$dirty" ]; then
-  echo "REFUSING: the worktree carries changes beyond the artifacts relock owns, so a" >&2
-  echo "derivation change could not be attributed. Commit or set them aside:" >&2
+  echo "REFUSING: the worktree carries changes beyond flake.lock, so a derivation change could not be" >&2
+  echo "attributed. Commit or set them aside:" >&2
   printf '%s\n' "$dirty" >&2
   exit 1
 fi
 
-# The pass's tool as a FETCHABLE reference, named once by the creator of a --downstream pass and
-# proven before anything moves: every consumer's relock is built from it, so a reference nobody can
-# fetch, or one that holds other code than the tool running here, would fail at the first consumer.
-# From the tool's own repo it is HEAD — which a dirty tree or an unpushed commit cannot pass for —
-# and from any other repo the flake-commons pin, which must be a `github:` lock of its own.
-if [ "$downstream" = 1 ] && [ -z "${RELOCK_PASS_TOOL_REF:-}" ]; then
-  if [ "$ownSlug" = "$toolSlug" ]; then
-    RELOCK_PASS_TOOL_REF="github:$toolSlug/$(git -C "$REPO" rev-parse HEAD)"
-  elif ! fc_locked=$(nix flake metadata --json "$REPO" | jq -ce '.locks as $l | $l.nodes[$l.root].inputs["flake-commons"] as $n
-      | if ($n|type) == "string" then $l.nodes[$n].locked | select(.type == "github") else empty end'); then
-    echo "REFUSING --downstream: @repoName@ has no flake-commons pin of its own on github: — start the" >&2
-    echo "          pass from the repo whose relock it should run" >&2
-    exit 1
-  else
-    RELOCK_PASS_TOOL_REF="github:$(jq -r '"\(.owner)/\(.repo)/\(.rev)"' <<<"$fc_locked")"
-  fi
-  if ! pass_tool=$(nix eval --raw "$RELOCK_PASS_TOOL_REF#lib.relockToolId"); then
-    echo "REFUSING --downstream: the pass's tool $RELOCK_PASS_TOOL_REF cannot be fetched (unpushed?)" >&2
-    exit 1
-  fi
-  if [ "$pass_tool" != "@toolId@" ]; then
-    echo "REFUSING --downstream: $RELOCK_PASS_TOOL_REF is tool $pass_tool, not the one running here (@toolId@)" >&2
-    echo "          — commit and push the relock you mean to run, or run the one that is pushed" >&2
-    exit 1
-  fi
-  export RELOCK_PASS_TOOL_REF
-fi
-
-wt_for_branch() {
-  local want=$1 path="" br=""
-  while IFS= read -r line; do
-    case $line in
-      "worktree "*) path=${line#worktree } ;;
-      "branch refs/heads/"*)
-        br=${line#branch refs/heads/}
-        [ "$br" = "$want" ] && { printf '%s\n' "$path"; return 0; } ;;
-    esac
-  done < <(git -C "$REPO" worktree list --porcelain)
-  return 1
-}
-
 lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
-  # shellcheck disable=SC2016  # $i/$n/$nn are jq vars, not shell
   jq -r --arg i "$2" '
     .nodes.root.inputs[$i] as $n
     | (if ($n|type)=="array" then $n[-1] else $n end) as $nn
     | .nodes[$nn].locked.rev // empty' "$1"
 }
 
-# The MEANINGFUL projection of a flake edge: every exported derivation — each package's, and the
-# ones behind each app's program.
-# NOT a projection of the lock's fields — in a flake.lock `locked.rev` IS the content
-# identity, so deleting it would make every bump compare equal and look impact-free.
+# The MEANINGFUL projection of a flake edge: every exported derivation — each package's, the ones
+# behind each app's program, and each nixos/darwin configuration's top level with its revision
+# neutralised (nix/configurations.nix, the measure the sweep proves stable). A contribution reaches the
+# hosts only through the configurations, so without them a real change of one is dropped.
+# NOT a projection of the lock's fields — in a flake.lock `locked.rev` IS the content identity, so
+# deleting it would make every bump compare equal and look impact-free.
 #
-# A flake with no `packages` is an AGGREGATOR: what it exports is its inputs, which its consumers
-# follow — so its impact is the revision each root input is locked at. Without this, relock died on
-# nix-flake-commons (the eval of a missing attribute aborts under `set -e`), and caught, it would
-# have dropped every bump as impact-free.
+# A flake with neither `packages` nor configurations is an AGGREGATOR: what it exports is its inputs,
+# which the heads that pin it follow — so its impact is the revision each root input is locked at.
 #
-# ⚠️ Presence is tested WITHOUT evaluating `packages`, and an error must stay fatal. A first version
-# probed `.#packages` under `2>/dev/null` inside an `if`: a repo whose packages FAIL to evaluate then
-# read as an aggregator, every bump showed "impact", and all of them were carried — with no error
-# anywhere. Absent and broken must not look alike. Hence the capture into a variable: under `set -e`
-# a failing command substitution aborts, while the same failure inside an `if` condition is
-# swallowed and simply reads as false (measured).
-#
-# ⚠️ And `set -e` alone does NOT carry it: evalmap only ever runs inside `$(…)`, and the
-# writeShellApplication wrapper sets errexit/nounset/pipefail but NOT `inherit_errexit`, so inside
-# the substitution a failing capture just continues (measured). Every failure is therefore returned
-# EXPLICITLY, and each caller decides what it means.
-#
-# An app is an exported derivation too: its `program` is a store path, measured by the derivations
-# in its string context. `apps or {}` answers only ABSENCE — an app that fails to evaluate still
-# aborts the measure.
+# ⚠️ Presence is tested WITHOUT evaluating the outputs, and an error must stay fatal: a repo whose
+# packages FAIL to evaluate must not read as an aggregator. Every failure is returned EXPLICITLY —
+# evalmap runs inside `$(…)`, where errexit does not carry (no `inherit_errexit`).
 evalmap() {
-  local has_packages pkgs apps
-  has_packages=$(nix eval --impure --json --expr "(builtins.getFlake \"git+file://$REPO\").outputs ? packages") || return 1
-  if [ "$has_packages" = true ]; then
-    pkgs=$(nix eval --json "$REPO#packages.@system@" \
-      --apply 'ps: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) ps') || return 1
+  local has pkgs apps cfgs
+  has=$(nix eval --impure --json --expr "let o = (builtins.getFlake \"git+file://$REPO\").outputs; in { packages = o ? packages; configurations = (o ? nixosConfigurations) || (o ? darwinConfigurations); }") || return 1
+  if jq -e '.packages or .configurations' <<<"$has" >/dev/null; then
+    pkgs='{}'
+    if jq -e '.packages' <<<"$has" >/dev/null; then
+      pkgs=$(nix eval --json "$REPO#packages.@system@" \
+        --apply 'ps: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) ps') || return 1
+    fi
     apps=$(nix eval --impure --json --expr \
       "builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a.program)) (((builtins.getFlake \"git+file://$REPO\").outputs.apps or { }).@system@ or { })") || return 1
-    jq -S -n --argjson p "$pkgs" --argjson a "$apps" '{packages: $p, apps: $a}'
+    cfgs=$(nix eval --impure --json --expr \
+      "import @configurationsNix@ { outputs = (builtins.getFlake \"git+file://$REPO\").outputs; }") || return 1
+    jq -S -n --argjson p "$pkgs" --argjson a "$apps" --argjson c "$cfgs" '{packages: $p, apps: $a, configurations: $c}'
   else
     # A `follows` root input has no lock of its own — it is an input PATH whose target is already
-    # counted where it is defined — so it is left out rather than resolved. Taking its last path
-    # segment as a node key would have measured the wrong node, or null.
-    # shellcheck disable=SC2016  # $l is a jq var, not shell
+    # counted where it is defined — so it is left out rather than resolved.
     jq -S '. as $l | .nodes.root.inputs
       | with_entries(select(.value | type == "string"))
       | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' "$REPO/flake.lock"
@@ -379,50 +462,6 @@ evalmap() {
 }
 
 all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }
-
-# Every `regen-*` app this flake exposes — DISCOVERED, not listed. A repo's generated
-# artifacts are whatever its regen apps write, and it already declares those as apps; making
-# a caller re-list them (app AND filename) is the same "enumerate what you could derive" the
-# cluster set was cured of. It also means a new regen app is covered the day it lands.
-regen_apps() {
-  nix eval --json "$REPO#apps.@system@" --apply 'as: builtins.attrNames as' 2>/dev/null \
-    | jq -r '.[] | select(startswith("regen-"))'
-}
-
-# Re-derive and commit only what MOVED. No eval needed and no filename needed: the regen
-# writes whatever it writes, and git reports it.
-#
-# ⚠️ Like relock_input, this runs as `regen_artifact … || true`, so bash switches errexit off for its
-# whole body: every failure is returned EXPLICITLY. A failed regen restores whatever it had already
-# rewritten — it must leave nothing dirty, and certainly nothing committed — and says WHY, since its
-# own stderr is the only account of the failure.
-regen_artifact() { # $1 app
-  printf '  %-18s ' "$1"
-  local err
-  err=$(mktemp)
-  local -a moved=()
-  local prog
-  if ! prog=$(cd "$REPO" && app_program ".#apps.@system@.$1" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
-    mapfile -t moved < <(git -C "$REPO" diff --name-only)
-    if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
-    echo "FAILED (regen app $1) — restored ${moved[*]:-nothing}"
-    sed 's/^/    /' "$err" >&2
-    rm -f "$err"
-    return 1
-  fi
-  rm -f "$err"
-  mapfile -t moved < <(git -C "$REPO" diff --name-only)
-  if [ "${#moved[@]}" -eq 0 ]; then
-    echo "already current"
-  elif git -C "$REPO" commit -q -m "chore(relock): regen via $1" -- "${moved[@]}"; then
-    committed=1
-    echo "REGENERATED — ${moved[*]} was stale"
-  else
-    git -C "$REPO" checkout -q -- "${moved[@]}"
-    echo "FAILED to commit the regenerated ${moved[*]} — restored"
-    return 1
-  fi
-}
 
 # `nix flake update` in $1 for the inputs that follow; its stderr lands in `update_err`.
 # Returns 1 when nix fails, 2 when it SUCCEEDS on a stale copy, and 3 when it fails because the
@@ -447,27 +486,21 @@ nix_update() {
 
 # Inputs whose bump had to wait for another one. Measured 2026-10-07 on rke2lab: ndh, as locked,
 # followed an input of flake-commons that the newer flake-commons had dropped; bumping flake-commons
-# FIRST — alphabetical order — removed that input, and nix refused the whole lock. Bumping ndh first would have worked. But no FIXED order
-# is right: the next coupling may run the other way, a new ndh following an input only the new
-# flake-commons has. So the order is discovered, not chosen: such a bump is set aside with its lock
-# restored, retried ONCE after every other target, and only then reported as failed.
+# FIRST removed that input, and nix refused the whole lock. No FIXED order is right, so the order is
+# discovered: such a bump is set aside with its lock restored, retried ONCE after every other target,
+# and only then reported as failed.
 deferred=()
 retrying=0
 
-# Every target that FAILED in this run, named. A failure does not stop the others, and what did
-# succeed is still pushed — but the run then ends non-zero with the list, so a requesting run reads
-# a failure, not "done", and counts it in its own list in turn, up to the root.
-failed=()
-finish() { # $1 the word for success
-  if [ "${#failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
-  echo "FAILED: ${#failed[@]} target(s)"
-  printf '  %s\n' "${failed[@]}"
-  exit 1
-}
+# What this run carried and dropped, for its trace.
+bumped='{}'
+dropped=()
+after_done=()
 
 relock_input() { # $1 input name
   printf '  %-18s ' "$1"
-  local rc=0
+  local rc=0 before
+  before=$(lockrev "$REPO/flake.lock" "$1")
   nix_update "$REPO" "$1" || rc=$?
   if [ "$rc" = 3 ]; then
     git -C "$REPO" checkout -q -- flake.lock
@@ -499,10 +532,8 @@ relock_input() { # $1 input name
   fi
   # A lock has to be fetchable by everyone, not only by whoever ran this. The ONLY way a local
   # revision can enter one is a path- or file-typed ref: a `github:` fetch physically cannot see an
-  # unpushed commit, which is what makes the chain push-gated to begin with. Measured 2026-10-06 —
-  # re-locking ndh's `rke2lab` input resolved the PUSHED head while the local checkout sat two
-  # commits ahead of it. So this single check IS the invariant; probing "is the rev on the remote"
-  # as well would be vacuous.
+  # unpushed commit, which is what makes the chain push-gated to begin with. So this single check IS
+  # the invariant.
   local locked_at
   # Checked: an unreadable lock left `locked_at` empty, and an empty answer is what "not local" looks
   # like — the guard against machine-local locks would have waved it through in silence.
@@ -523,13 +554,13 @@ relock_input() { # $1 input name
     git -C "$REPO" checkout -q -- flake.lock
     echo "LOCAL lock REFUSED -> $locked_at"
     echo "relock: that revision resolves only on this machine, so the lock would be unfetchable" >&2
-    echo "        for every other consumer. Aim this id at a PUSHED ref and run again — another" >&2
+    echo "        for every other head. Aim this id at a PUSHED ref and run again — another" >&2
     echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
     return 1
   fi
   local after
-  # Checked by hand: relock_input runs as `relock_input … || true`, and bash switches errexit off
-  # for the whole body of a function called in an `||` list. Unchecked, a failed measurement left
+  # Checked by hand: relock_input runs as `relock_input … || failed+=…`, and bash switches errexit
+  # off for the whole body of a function called in an `||` list. Unchecked, a failed measurement left
   # `after` empty, unequal to the baseline, and the bump was COMMITTED as "derivations moved".
   if ! after=$(evalmap); then
     git -C "$REPO" checkout -q -- flake.lock
@@ -537,9 +568,8 @@ relock_input() { # $1 input name
     return 1
   fi
   if [ "$after" = "$baseline" ]; then
-    # A lock is a statement about outputs: carrying this adds nothing and would keep the
-    # rke2lab <-> ndh cycle turning.
     git -C "$REPO" checkout -q -- flake.lock
+    dropped+=("$1")
     echo "moved, NO derivation impact -> dropped"
   else
     if ! git -C "$REPO" commit -q -m "chore(flake): relock $1" -- flake.lock; then
@@ -549,102 +579,110 @@ relock_input() { # $1 input name
     fi
     baseline=$after
     committed=1
+    bumped=$(jq -c --arg i "$1" --arg b "$before" --arg a "$(lockrev "$REPO/flake.lock" "$1")" '. + { ($i): [ $b, $a ] }' <<<"$bumped")
     echo "BUMPED — derivations moved"
   fi
 }
 
-# Orphan-branch hops are OPTIONAL — a repo with none simply skips them. NOT a parameter: a
-# repo either carries such a branch or it does not, and `git worktree list` already answers
-# that. This is what lets the same implementation serve a repo like ndh, which has neither a
-# seed-incluster nor a flox-catalog branch.
-# The branch names come in as variables, set at the checkout guard above, not as tokens inline:
-# after substitution a token IS a literal, and shellcheck rejects `[ -n "literal" ]` (SC2157) —
-# correctly, since the test would be constant.
-FIRST=""
-if [ -n "$pushFirstBranch" ]; then FIRST=$(wt_for_branch "$pushFirstBranch") || FIRST=""; fi
-CATALOG=""
-if [ -n "$catalogBranch" ]; then CATALOG=$(wt_for_branch "$catalogBranch") || CATALOG="$catalogClone"; fi
+# An app this head runs AFTER its inputs, because what it produces resolves through them:
+# flox-catalog's envs lock `path:../../..#<attr>` against the catalog's own flake, so locking them
+# before its rke2lab pin moves records the OLD derivation and reports "unchanged" (measured
+# 2026-09-30). Run without the token; whatever it leaves changed is committed, whatever it commits
+# itself stays; a failure restores the tree and says why.
+after_input() { # $1 app name
+  printf '  %-18s ' "$1"
+  local err prog head_before
+  local -a moved=()
+  err=$(mktemp)
+  head_before=$(git -C "$REPO" rev-parse HEAD)
+  if ! prog=$(cd "$REPO" && app_program ".#apps.@system@.$1" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
+    mapfile -t moved < <(git -C "$REPO" diff --name-only)
+    if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
+    echo "FAILED (after-inputs app $1) — restored ${moved[*]:-nothing}"
+    sed 's/^/    /' "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  mapfile -t moved < <(git -C "$REPO" diff --name-only)
+  if [ "${#moved[@]}" -gt 0 ] && ! git -C "$REPO" commit -q -m "chore(relock): $1 after inputs" -- "${moved[@]}"; then
+    git -C "$REPO" checkout -q -- "${moved[@]}"
+    echo "FAILED to commit what $1 changed — restored"
+    return 1
+  fi
+  if [ "$(git -C "$REPO" rev-parse HEAD)" = "$head_before" ]; then
+    echo "already current"
+  else
+    committed=1
+    after_done+=("$1")
+    echo "COMMITTED — $1 moved something"
+  fi
+}
 
-# There WAS a pre-flight check here: read `original.ref` out of the catalog's lock and refuse
-# if it differed from the branch we stand on. It is gone, and not because it was inconvenient.
-#
-# It PREDICTED by name what the catalog hop already MEASURES by revision: the post-condition at
-# the end of that hop compares the rev the catalog ended up pinning against the rev this run
-# pushed, and exits 1 when they differ. That assertion covers the same failure — and covers it
-# for every shape of target, whether the catalog names a ref, names none, or points at a local
-# checkout. The name-based prediction only ever worked for one of those three.
-#
-# And it was actively in the way: the catalog's pin is now an INDIRECT id, so there is no
-# `original.ref` to read. The check would have silently skipped itself (`[ -n "$cat_ref" ]`)
-# while looking like it still guarded something — the worst of the two outcomes. Any repair of
-# that pin removes the ref, so this check could not survive the chantier in any form.
-#
-# One guard that measures beats two where one guesses.
+json_list() { if [ "$#" -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -R . | jq -sc .; fi; }
 
-# No target = everything, in dependency order: artifacts first (they can move the
-# derivations the input guard compares against), then inputs, then the catalog.
+# The trace of a change, after it is pushed: one file per head (`<id>.json`) on this repository's
+# `fabric/relock`, an orphan nothing pins — so writing it carries nothing anywhere, which is what
+# separates it from the hop this tool used to make. Written by plumbing, so neither the checkout nor
+# its branch moves.
+write_trace() { # $1 the pushed revision
+  local base="" idx blob tree commit json
+  json=$(jq -n --arg h "@repoName@" --arg r "$1" --arg w "${RELOCK_PASS_WAVE:-@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+    --arg t "@toolId@" --argjson b "$bumped" --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
+    '{ schema: "seedmatic.relock/v1", head: $h, rev: $r,
+       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a } }')
+  if git -C "$REPO" fetch -q --depth=1 origin "+refs/heads/fabric/relock:refs/relock/trace-base" 2>/dev/null; then
+    base=$(git -C "$REPO" rev-parse refs/relock/trace-base)
+  fi
+  idx=$(mktemp)
+  rm -f "$idx"
+  if [ -n "$base" ]; then GIT_INDEX_FILE=$idx git -C "$REPO" read-tree "$base" || return 1; fi
+  blob=$(printf '%s\n' "$json" | git -C "$REPO" hash-object -w --stdin) || return 1
+  GIT_INDEX_FILE=$idx git -C "$REPO" update-index --add --cacheinfo "100644,$blob,@repoName@.json" || return 1
+  tree=$(GIT_INDEX_FILE=$idx git -C "$REPO" write-tree) || return 1
+  rm -f "$idx"
+  if [ -n "$base" ]; then
+    commit=$(git -C "$REPO" commit-tree "$tree" -p "$base" -m "relock(@repoName@): trace of ${1:0:9}") || return 1
+  else
+    commit=$(git -C "$REPO" commit-tree "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || return 1
+  fi
+  git -C "$REPO" update-ref -d refs/relock/trace-base 2>/dev/null || true
+  git -C "$REPO" push -q origin "$commit:refs/heads/fabric/relock"
+}
+
 if [ "${#targets[@]}" -eq 0 ]; then
-  targets=(artifacts inputs envs catalog)
+  targets=(inputs after)
 fi
 
-echo "worktrees:"
-echo "  @repoName@ ($cur) : $REPO"
-if [ -n "$pushFirstBranch" ]; then echo "  $pushFirstBranch : ${FIRST:-<no worktree>}"; fi
-if [ -n "$catalogBranch" ]; then echo "  $catalogBranch : ${CATALOG:-<no worktree>}"; fi
+echo "head: @repoName@ ($selfRepo:$selfBranch) at $REPO ($cur)"
 echo "targets: ${targets[*]}"
 echo
 
-# Our own branches first: an orphan-branch INPUT resolves github:, which sees only what is
-# pushed.
-if [ -n "$FIRST" ] && [ "$nopush" = 1 ]; then
-  # Honest, not silent: the inputs below still resolve github:, so they see the REMOTE head, which
-  # may be behind this worktree.
-  echo "== own branches: NOT pushed (--no-push) =="
-  first_remote=$(git -C "$FIRST" ls-remote origin "refs/heads/$pushFirstBranch" | cut -c1-9)
-  echo "  $pushFirstBranch NOT pushed: its input resolves the remote head ${first_remote:-<none>}," \
-    "not this worktree's $(git -C "$FIRST" rev-parse --short=9 HEAD)"
-  echo
-elif [ -n "$FIRST" ]; then
-  echo "== own branches: push before resolving =="
-  git -C "$FIRST" push origin "$pushFirstBranch"
-  echo "  $pushFirstBranch @ $(git -C "$FIRST" rev-parse --short=9 HEAD) pushed"
-  echo
+if ! baseline=$(evalmap); then
+  echo "FAILED to measure the starting point — nothing reconciled" >&2
+  exit 1
 fi
-
-baseline=$(evalmap)
-do_catalog=0
-env_targets=()
 committed=0
 for t in "${targets[@]}"; do
-  t=${alias_of[$t]:-$t}
   case $t in
-    # Every generated artifact this repo knows how to re-derive.
-    artifacts)
-      echo "== artifacts (every regen-* app) =="
-      while read -r app; do regen_artifact "$app" || failed+=("regen $app"); done < <(regen_apps)
-      echo ;;
-    regen-*)  echo "== $t ==" ; regen_artifact "$t" || failed+=("regen $t") ; echo ;;
     inputs)
       echo "== inputs =="
       while read -r i; do relock_input "$i" || failed+=("input $i"); done < <(all_inputs)
       echo ;;
-    # ⚠️ The env locks are NOT taken here. They resolve `path:../../..#<attr>` against the
-    # CATALOG's flake, so locking before its rke2lab pin moves records the OLD derivation
-    # and then reports "unchanged (churn dropped)" — a sincere answer to a question asked too
-    # early. Measured 2026-09-30: cluster-api/seed-incluster reported unchanged, the pin then
-    # advanced, and the env kept pinning the previous controller binary, so the node would
-    # never have realised it. Re-locking the SAME env after the bump reported BUMPED and the
-    # drv changed. So the targets only RECORD what to lock; the catalog hop does it, after.
-    # Naming an env is for a SURGICAL act only. Normally you do not: any change committed to
-    # rke2lab implies the catalog must be re-pinned and the envs re-locked, because the
-    # envs resolve `path:../../..#<attr>` THROUGH the catalog's flake. Requiring the
-    # operator to pair `relock seed-incluster envs:cluster-api/seed-incluster` made them
-    # supply a dependency relation they should not have to know — and let them name the
-    # wrong env, or forget it. The derivation guard drops the envs that did not move, so
-    # re-locking all of them is both cheap and correct.
-    envs) env_targets+=("") ; do_catalog=1 ;;
-    envs:*) env_targets+=("${t#envs:}") ; do_catalog=1 ;;
-    catalog) do_catalog=1 ;;
+    after)
+      if [ "${#afterInputs[@]}" -gt 0 ]; then
+        # The deferred inputs first: what runs after the inputs runs after ALL of them.
+        if [ "${#deferred[@]}" -gt 0 ]; then
+          echo "== deferred inputs: retried once, after the others =="
+          retrying=1
+          for i in "${deferred[@]}"; do relock_input "$i" || failed+=("input $i"); done
+          deferred=()
+          echo
+        fi
+        echo "== after the inputs =="
+        for app in "${afterInputs[@]}"; do after_input "$app" || failed+=("after $app"); done
+        echo
+      fi ;;
     *)
       if all_inputs | grep -qx -- "$t"; then
         echo "== input $t =="
@@ -664,189 +702,41 @@ if [ "${#deferred[@]}" -gt 0 ]; then
   echo
 fi
 
-# Anything committed here must TRAVEL: the catalog pins rke2lab and the envs resolve
-# through it, so a change that stops at this repo is a change the nodes never see. The
-# operator therefore never has to pair a target with its env — see the note at the env
-# targets.
-if [ "$committed" = 1 ] && [ "$do_catalog" = 0 ] && [ -n "$CATALOG" ]; then
-  do_catalog=1
-  env_targets=("")
-  if [ "$nopush" = 0 ]; then
-    echo "  (committed here ⇒ re-pinning the catalog and re-locking every env)"
-    echo
-  fi
-fi
-
-# Push whatever the artifacts did. The catalog hop resolves
-# github:seedmatic/rke2lab/<branch> and therefore pins what the REMOTE answers, not this
-# worktree — so pushing only on a change was the hole: any other commit left HEAD
-# unpushed and the catalog silently pinned an older rev while reporting a clean bump
-# (measured 2026-09-30: catalog at 9ccd89923 while HEAD was fec07de85).
-#
-# The catalog hop pins the revision the REMOTE answers, so under --no-push it runs only when that
-# revision is already there: nothing between the upstream, freshly fetched, and HEAD. Which commits
-# this run made does not answer it — a commit left unpushed by an earlier run counts the same.
-# Not knowing is fatal: a failed fetch or a missing upstream must never read as "landed".
-landed() { # -> 0 HEAD is on the remote, 1 it is not, 2 cannot tell
-  local unpushed
-  git -C "$REPO" fetch --quiet || return 2
-  git -C "$REPO" rev-parse --verify --quiet '@{u}' >/dev/null || return 2
-  unpushed=$(git -C "$REPO" rev-list '@{u}..HEAD') || return 2
-  [ -z "$unpushed" ] || return 1
-}
 if [ "$nopush" = 1 ]; then
-  hop=0
-  if [ -n "$CATALOG" ] && { [ "$do_catalog" = 1 ] || [ "$committed" = 1 ]; }; then
-    rc=0
-    landed || rc=$?
-    if [ "$rc" = 2 ]; then
-      echo "relock: cannot tell whether $cur is on its remote (fetch failed, or no upstream) —" >&2
-      echo "        refusing the catalog hop rather than pinning a revision that may not be there" >&2
-      exit 1
-    fi
-    if [ "$rc" = 0 ]; then hop=1; fi
-  fi
   ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
   echo "== NOT pushed (--no-push) =="
   echo "  @repoName@ ($cur): $ahead commit(s) ahead of its upstream — review them with:"
   echo "    git -C '$REPO' log --stat '@{u}..HEAD'"
-  resume=()
-  if [ -n "$FIRST" ]; then resume+=("git -C '$FIRST' push origin '$pushFirstBranch'"); fi
-  resume+=("git -C '$REPO' push")
-  # `envs`, not `catalog`: the catalog target alone re-pins without re-locking a single env.
-  if [ -n "$CATALOG" ] && { [ "$do_catalog" = 1 ] || [ "$committed" = 1 ]; } && [ "$hop" = 0 ]; then
-    echo "  catalog hop SKIPPED: $cur has commits its remote does not have, and the hop pins the remote's"
-    resume+=("(cd '$REPO' && nix run .#relock -- envs)")
-  fi
   echo
-  if [ "$hop" = 0 ]; then
-    echo "To resume where this stopped:"
-    printf '  %s' "${resume[0]}"
-    for r in "${resume[@]:1}"; do printf ' && %s' "$r"; done
-    echo
-    finish "DONE (not pushed)"
+  echo "To resume where this stopped:"
+  echo "  git -C '$REPO' push"
+  echo "  (no trace is written for an unpushed change)"
+  finish "DONE (not pushed)"
+fi
+
+# Pushed when there is something to push: this run's commits, or commits an earlier run left behind
+# — a head after this one pins what is on the remote, so an unpushed commit is a change that did not
+# land. A session with no upstream and nothing new has nothing to push.
+ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "")
+if [ "$committed" = 1 ] || { [ -n "$ahead" ] && [ "$ahead" != 0 ]; }; then
+  if ! git -C "$REPO" push; then
+    echo "FAILED to push @repoName@ ($cur) — nothing it carried has landed" >&2
+    failed+=("push @repoName@")
+    finish "DONE"
   fi
-  pushed_head=$(git -C "$REPO" rev-parse HEAD)
-  echo "  @repoName@ @ ${pushed_head:0:9} is already on its remote — the catalog hop runs, and pushes nothing"
-  echo
-else
-  git -C "$REPO" push
   pushed_head=$(git -C "$REPO" rev-parse HEAD)
   echo "  @repoName@ @ ${pushed_head:0:9} pushed"
-  echo
-fi
-
-# ⚠️ `-n "$CATALOG"` is load-bearing, and its absence was a latent defect: the header claims this
-# implementation serves a repo with no such branch, yet an unguarded hop would `lockrev "/flake.lock"`
-# and die on exactly that repo. A repo without a catalog branch simply has nothing to re-pin.
-if [ "$do_catalog" = 1 ] && [ -n "$CATALOG" ]; then
-  echo "== own branch @catalogBranch@: pin @selfPinName@ =="
-  pin_before=$(lockrev "$CATALOG/flake.lock" @selfPinName@)
-  # The catalog branch is a different checkout with its own committed registry, so the pin is
-  # re-resolved for it rather than inherited from the main one.
-  set_registry_flag "$CATALOG"
-  if ! nix_update "$CATALOG" @selfPinName@; then
-    git -C "$CATALOG" checkout -q -- flake.lock
-    echo "FAILED: the catalog could not re-resolve @selfPinName@ (nix failed, or fell back to a cache):" >&2
-    printf '%s\n' "$update_err" | sed 's/^/    /' >&2
-    exit 1
-  fi
-  pin_after=$(lockrev "$CATALOG/flake.lock" @selfPinName@)
-  if [ "$pin_before" != "$pin_after" ]; then
-    git -C "$CATALOG" commit -q -m "chore(flake): relock @selfPinName@ -> ${pin_after:0:9}" -- flake.lock
-    echo "  pinned @selfPinName@ ${pin_before:0:9} -> ${pin_after:0:9}"
-  else
-    echo "  already pinning @selfPinName@ ${pin_after:0:9}"
-  fi
-  # NOW the envs, with the pin already moved — see the note at the env targets above.
-  # lock-envs applies the same guard one level down: it re-locks and commits only real
-  # derivation bumps, dropping locked-url churn.
-  for e in "${env_targets[@]}"; do
-    lock_envs=$(cd "$CATALOG" && app_program ".#apps.@system@.lock-envs")
-    if [ -z "$e" ]; then
-      ( cd "$CATALOG" && "$lock_envs" )
-    else
-      ( cd "$CATALOG" && "$lock_envs" "$e" )
-    fi
-  done
-  # ASSERT the landing rather than trust the bump report: a lagging push, a stale
-  # --refresh cache or a catalog tracking another branch all end here quietly on a rev
-  # that is not what this run built. The point is to make ONE revision travel — prove it.
-  if [ "$pin_after" != "$pushed_head" ]; then
-    echo "MISMATCH: the catalog pinned @selfPinName@ ${pin_after:0:9} but this run pushed ${pushed_head:0:9} —" >&2
-    echo "the propagation did NOT carry this revision. Check that '$cur' is the branch the" >&2
-    echo "catalog tracks and that the push above reached the remote." >&2
-    exit 1
-  fi
-  echo "  verified: catalog pins @selfPinName@ ${pushed_head:0:9} — the revision on the remote"
-  ahead=$(git -C "$CATALOG" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
-  if [ "$nopush" = 1 ]; then
-    echo "  @catalogBranch@ NOT pushed: $ahead commit(s) in $CATALOG (@catalogBranch@) — review them with:"
-    echo "    git -C '$CATALOG' log --stat '@{u}..HEAD'"
-    echo
-    echo "To resume where this stopped:"
-    printf '  '
-    if [ -n "$FIRST" ]; then printf '%s && ' "git -C '$FIRST' push origin '$pushFirstBranch'"; fi
-    printf '%s\n' "git -C '$CATALOG' push"
-    finish "DONE (not pushed)"
-  elif [ "${ahead:-0}" -gt 0 ] 2>/dev/null; then
-    git -C "$CATALOG" push
-    echo "  @catalogBranch@ pushed $ahead commit(s)"
-  else
-    echo "  @catalogBranch@ already up to date"
-  fi
-  echo
-fi
-
-# Crossing a repo boundary is a REQUEST, never a reach-in: we do not edit a consumer's
-# lock, we run the consumer's OWN relock. Off by default — it mutates another repo.
-consumers=(@consumers@)
-skipped=()
-# A consumer reference's key in the visited list — the key that repo's own relock records:
-# `github:owner/repo` -> `owner/repo`, and an orphan, `github:owner/repo/<branch>` or
-# `github:owner/repo?ref=<branch>`, -> `owner/repo:<branch>` (a branch may contain slashes).
-# Anything that is not `github:` is its own key.
-ref_key() {
-  local r=${1#github:} ref="" q="" t
-  if [ "$r" = "$1" ]; then printf '%s\n' "$1"; return; fi
-  case $r in *\?*) q=${r#*\?}; r=${r%%\?*} ;; esac
-  case $r in */*/*) ref=${r#*/*/}; r=${r%/"$ref"} ;; esac
-  case "&$q" in *"&ref="*) t=${q#*ref=}; ref=${t%%&*} ;; esac
-  printf '%s\n' "$r${ref:+:$ref}"
-}
-if [ "$downstream" = 1 ]; then
-  echo "== downstream: request each consumer's own relock, on the pass's tool $RELOCK_PASS_TOOL_REF =="
-  tool_override=(--override-input flake-commons "$RELOCK_PASS_TOOL_REF")
-  # A request, so a failure here is not fatal — but it is SAID, with the consumer's name and its own
-  # stderr. The first version ran `nix run "$c#relock" 2>/dev/null` and answered every failure with
-  # "exposes no #relock yet": a consumer whose relock CRASHED read exactly like one that has none.
-  # A consumer already visited in this pass is not relaunched — that is what ends a cycle. But if
-  # THIS run committed, that consumer pins a repo that just moved, so the gap is SAID at the end
-  # rather than left to be noticed: the loop stops, the drift stays visible.
-  for c in "${consumers[@]}"; do
-    printf '  %-28s ' "$c"
-    if grep -qxF -- "$(ref_key "$c")" "$RELOCK_VISITED_FILE"; then
-      echo "already visited in this pass — not relaunched"
-      if [ "$committed" = 1 ]; then skipped+=("$c"); fi
-      continue
-    fi
-    if ! has_relock=$(nix eval --json "${tool_override[@]}" "$c#apps.@system@" --apply 'as: as ? relock'); then
-      echo "FAILED — cannot evaluate $c (its error is above)"
-      failed+=("consumer $c")
-    elif [ "$has_relock" != true ]; then
-      echo "exposes no #relock yet — skipped (that app is THAT repo's to add)"
-    elif prog=$(app_program "$c#apps.@system@.relock") && "$prog" --downstream; then
-      echo "  ^ $c done"
-    else
-      echo "  ^ FAILED — $c's relock exited non-zero (its output is above)"
-      failed+=("consumer $c")
-    fi
-  done
 else
-  echo "consumers NOT notified (pass --downstream): ${consumers[*]}"
+  pushed_head=$(git -C "$REPO" rev-parse HEAD)
+  echo "  @repoName@ @ ${pushed_head:0:9}: nothing to push"
 fi
-for c in "${skipped[@]}"; do
-  echo "NOTE: $c was not relaunched (already visited in this pass) although @repoName@ moved:" \
-    "run its relock on the next pass"
-done
+if [ "$committed" = 1 ]; then
+  if write_trace "$pushed_head"; then
+    echo "  trace written on fabric/relock (@repoName@.json)"
+  else
+    echo "  FAILED to write the trace on fabric/relock — the change itself is pushed"
+    failed+=("trace @repoName@")
+  fi
+fi
+echo
 finish "DONE"
