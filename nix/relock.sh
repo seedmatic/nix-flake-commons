@@ -43,7 +43,7 @@ nix-flake-commons' `fabric/heads`, the edges from each code head's lock, both re
 API. A cycle, an id that is not a head, or an id that resolves elsewhere fails it.
 --downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
 plan's order; a head that pins a failed head is not run. The pass ends non-zero naming every failure.
-Exit 3: everything landed, but a trace could not be written (the heads that pin it still run).
+Exit 75: everything landed, but a trace could not be written (the heads that pin it still run).
 A pass runs ONE relock everywhere: each head's is built with `--override-input flake-commons` on the
 pass's tool, and a relock of any other code refuses.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
@@ -135,10 +135,14 @@ api_raw() { # $1 owner/repo  $2 branch  $3 path -> the file on stdout
 # Empty but for another head's relock, which is built on the pass's tool. An override never writes a
 # lock: nothing here passes --commit-lock-file.
 tool_override=()
+# What nix says when it answers from a copy instead of the network — the tarball fetcher's two, and the
+# git fetcher's two (nix-fetchers 2.34.8), none of which makes it fail.
+cache_fallbacks="using cached version|unable to download|could not update local clone of Git repository|using expired cached ref"
+
 # Read with --refresh, and a fallback to nix's cache is refused: a program served from a stale copy
 # would run another head's OLD relock while the pass believes it runs its tool.
 cache_refused() { # $1 nix's stderr -> 0 when nix fell back to a cache, said
-  if grep -qE 'using cached version|unable to download' "$1"; then
+  if grep -qE "$cache_fallbacks" "$1"; then
     sed 's/^/    /' "$1" >&2
     echo "relock: nix answered from its cache — refusing that answer" >&2
     return 0
@@ -165,16 +169,22 @@ app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program pat
 # succeed is still pushed — but the run then ends non-zero with the list, so a starter reads a
 # failure, not "done", and counts it in its own list in turn.
 #
-# A trace that could not be written is a failure of its own, exit 3: the change it traces HAS landed,
-# so a pass still runs the heads that pin this one, and only names the missing trace.
+# A trace that could not be written is a failure of its own, exit 75 — a code nothing else here
+# returns (jq's compile error is 3): the change it traces HAS landed, so a pass still runs the heads
+# that pin this one, and only names the missing trace.
 failed=()
 trace_failed=()
+unmeasured=()
 finish() { # $1 the word for success
+  if [ "${#unmeasured[@]}" -gt 0 ]; then
+    echo "NOT MEASURED by the impact guard (broken before any bump; a bump that moves only these is dropped):"
+    printf '  %s\n' "${unmeasured[@]}"
+  fi
   if [ "${#failed[@]}" -eq 0 ] && [ "${#trace_failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
   echo "FAILED: $(( ${#failed[@]} + ${#trace_failed[@]} )) target(s)"
   if [ "${#failed[@]}" -gt 0 ]; then printf '  %s\n' "${failed[@]}"; fi
   if [ "${#trace_failed[@]}" -gt 0 ]; then printf '  %s\n' "${trace_failed[@]}"; fi
-  if [ "${#failed[@]}" -eq 0 ]; then exit 3; fi
+  if [ "${#failed[@]}" -eq 0 ]; then exit 75; fi
   exit 1
 }
 
@@ -232,6 +242,38 @@ if top=$(git rev-parse --show-toplevel 2>/dev/null); then
   esac
 fi
 
+# What the start refuses, BEFORE anything moves — for a pass, before the first head runs, since the
+# start's own relock may come late in the order (rke2lab after ndh) and a refusal there would come after
+# another head had pushed.
+#
+# The per-input comparison attributes a derivation change to the input just bumped, so any OTHER
+# uncommitted edit would be credited to it. Refuse rather than mislead — flake.lock INCLUDED: an edited
+# lock would ride along with the next bump (a `path:` pin on another input, committed and pushed), and a
+# dropped bump restores the lock, which would wipe the edit. TRACKED changes only: nix's git fetcher
+# excludes untracked files from a flake's source (measured 2026-10-07), so an untracked file cannot
+# move any derivation.
+#
+# A head AHEAD of its upstream carries commits this run did not make — in a shared worktree, another
+# session's, not yet reviewed and never checked for a machine-local lock. Pushing them with this run's
+# would publish them. Refuse: push them, or set them aside, first.
+start_checks() { # uses REPO and cur
+  local dirty ahead
+  dirty=$(git -C "$REPO" status --porcelain --untracked-files=no)
+  if [ -n "$dirty" ]; then
+    echo "REFUSING: the worktree carries uncommitted changes, so a derivation change could not be" >&2
+    echo "attributed, and a restored lock would lose them. Commit or set them aside:" >&2
+    printf '%s\n' "$dirty" >&2
+    exit 1
+  fi
+  ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "")
+  if [ -n "$ahead" ] && [ "$ahead" != 0 ]; then
+    echo "REFUSING: $cur is $ahead commit(s) ahead of its upstream — commits this run did not make." >&2
+    echo "          Push them (after review), or set them aside, then run again:" >&2
+    git -C "$REPO" log --oneline '@{u}..HEAD' >&2
+    exit 1
+  fi
+}
+
 # THE PASS. Planned from facts only, then played: each head of the plan runs its own relock once, in
 # the plan's order. Nothing ends a cycle here, because a cycle never gets this far.
 if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
@@ -242,6 +284,7 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
       echo "          the heads after it pin what is pushed there, not a session" >&2
       exit 1
     fi
+    if [ "$downstream" = 1 ]; then start_checks; fi
   fi
 
   # The tool of the pass, as a FETCHABLE reference, proven before anything moves: every head's relock
@@ -352,7 +395,7 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
         rm -rf "$elsewhere"
       fi
     fi
-    if [ "$rc" = 3 ]; then
+    if [ "$rc" = 75 ]; then
       echo "  ^ $id landed, but its trace was not written (its output is above)"
       trace_failed+=("trace $id (its change landed)")
     elif [ "$rc" != 0 ]; then
@@ -435,29 +478,7 @@ if [ -f "$REPO/flake-registry.json" ]; then
   fi
 fi
 
-# The per-input comparison attributes a derivation change to the input just bumped, so any OTHER
-# uncommitted edit would be credited to it. Refuse rather than mislead — flake.lock INCLUDED: an edited
-# lock would ride along with the next bump (a `path:` pin on another input, committed and pushed), and a
-# dropped bump restores the lock, which would wipe the edit. TRACKED changes only: nix's git fetcher
-# excludes untracked files from a flake's source (measured 2026-10-07), so an untracked file cannot
-# move any derivation.
-dirty=$(git -C "$REPO" status --porcelain --untracked-files=no)
-if [ -n "$dirty" ]; then
-  echo "REFUSING: the worktree carries uncommitted changes, so a derivation change could not be" >&2
-  echo "attributed, and a restored lock would lose them. Commit or set them aside:" >&2
-  printf '%s\n' "$dirty" >&2
-  exit 1
-fi
-# A head AHEAD of its upstream carries commits this run did not make — in a shared worktree, another
-# session's, not yet reviewed and never checked for a machine-local lock. Pushing them with this run's
-# would publish them. Refuse: push them, or set them aside, first.
-ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "")
-if [ -n "$ahead" ] && [ "$ahead" != 0 ]; then
-  echo "REFUSING: $cur is $ahead commit(s) ahead of its upstream — commits this run did not make." >&2
-  echo "          Push them (after review), or set them aside, then run again:" >&2
-  git -C "$REPO" log --oneline '@{u}..HEAD' >&2
-  exit 1
-fi
+start_checks
 
 lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
   jq -r --arg i "$2" '
@@ -506,14 +527,16 @@ read_shape() {
     if nix eval --impure --json --expr "/* relock:probe */ let o = $flake_expr; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
       pk_systems+=("$sys")
     else
-      echo "  packages.$sys NOT MEASURED — it does not evaluate before any bump: $(grep -m1 'error:' "$err" | sed 's/^ *//')"
+      unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(grep -m1 'error:' "$err" | sed 's/^ *//')")
+      echo "  ${unmeasured[-1]}"
     fi
   done < <(jq -r '.packages[]' <<<"$shape")
   while read -r sys; do
     if nix eval --impure --json --expr "/* relock:probe */ let o = $flake_expr; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
       ap_systems+=("$sys")
     else
-      echo "  apps.$sys NOT MEASURED — it does not evaluate before any bump: $(grep -m1 'error:' "$err" | sed 's/^ *//')"
+      unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(grep -m1 'error:' "$err" | sed 's/^ *//')")
+      echo "  ${unmeasured[-1]}"
     fi
   done < <(jq -r '.apps[]' <<<"$shape")
   rm -f "$err"
@@ -551,7 +574,7 @@ nix_update() {
   shift
   err=$(mktemp)
   ( cd "$dir" && nix "${registry_flag[@]}" flake update "$@" --refresh ) >/dev/null 2>"$err" || rc=1
-  if [ "$rc" = 0 ] && grep -qE 'using cached version|unable to download' "$err"; then rc=2; fi
+  if [ "$rc" = 0 ] && grep -qE "$cache_fallbacks" "$err"; then rc=2; fi
   if [ "$rc" = 1 ] && grep -q 'follows a non-existent input' "$err"; then rc=3; fi
   update_err=$(grep -vE '^evaluation warning' "$err" || true)
   rm -f "$err"
@@ -597,7 +620,7 @@ relock_input() { # $1 input name
   if [ "$rc" = 2 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to fetch — nix fell back to a cached copy, so the bump is NOT carried"
-    printf '%s\n' "$update_err" | grep -E 'using cached version|unable to download|error|status' | sed 's/^/    /' >&2
+    printf '%s\n' "$update_err" | grep -E "$cache_fallbacks|error|status" | sed 's/^/    /' >&2
     return 1
   fi
   if git -C "$REPO" diff --quiet -- flake.lock; then
@@ -704,8 +727,9 @@ write_trace() { # $1 the pushed revision
   url=$(git -C "$REPO" remote get-url origin) || return 1
   json=$(jq -n --arg h "@repoName@" --arg r "$1" --arg w "${RELOCK_PASS_WAVE:-@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     --arg t "@toolId@" --argjson b "$bumped" --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
+    --argjson u "$(json_list "${unmeasured[@]}")" \
     '{ schema: "seedmatic.relock/v1", head: $h, rev: $r,
-       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a } }')
+       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a, unmeasured: $u } }')
   # A repository of its own: a shallow fetch into the operator's would make it SHALLOW, and in the
   # bare store that is the common dir of every worktree of the repo.
   tmp=$(mktemp -d)

@@ -117,6 +117,8 @@ case "$*" in
         jq '.nodes.a.locked.rev = "stale"' flake.lock > l && mv l flake.lock
         echo "warning: unable to download 'https://api.github.com/repos/o/r/commits/HEAD'" >&2 ;;
       failing) echo "error: cannot fetch" >&2; exit 1 ;;
+      # The git fetcher's fallback: a warning, exit 0, the old revision.
+      git-cached) echo "warning: could not update local clone of Git repository 'https://example/a.git'; continuing with the most recent version" >&2 ;;
       coupled|coupled-forever)
         case "$*" in
           *"flake update b "*)
@@ -831,7 +833,7 @@ LOCK
 @test "a system that does not evaluate before any bump is said and left out; the run goes on" {
   STUB_SYSTEMS="aarch64-darwin x86_64-darwin" STUB_BROKEN_SYSTEM=x86_64-darwin STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 0 ]
-  [[ "$output" == *"packages.x86_64-darwin NOT MEASURED — it does not evaluate before any bump: error: attribute 'x86_64-darwin' missing"* ]]
+  [[ "$output" == *"packages of x86_64-darwin: one of them does not evaluate before any bump, so none of x86_64-darwin is measured — error: attribute 'x86_64-darwin' missing"* ]]
   [[ "$output" == *"BUMPED"* ]]
   ! grep 'relock:measure' "$T/calls" | grep -q '"x86_64-darwin"'
 }
@@ -852,10 +854,10 @@ HOOK
   chmod +x "$T/remote/seedmatic/t.git/hooks/pre-receive"
 }
 
-@test "a trace that cannot be written is its own failure, exit 3 — the change itself has landed" {
+@test "a trace that cannot be written is its own failure, exit 75 — the change itself has landed" {
   reject_trace_pushes 2
   STUB_UPDATE=rev run "$T/relock" inputs
-  [ "$status" -eq 3 ]
+  [ "$status" -eq 75 ]
   [[ "$output" == *"FAILED to write the trace on fabric/relock — the change itself is pushed, and has landed"* ]]
   [[ "$output" == *"trace t (its change landed)"* ]]
   [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
@@ -877,7 +879,7 @@ mv "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/t.git.gone"
 HOOK
   chmod +x "$T/remote/seedmatic/t.git/hooks/post-receive"
   STUB_UPDATE=rev run "$T/relock" inputs
-  [ "$status" -eq 3 ]
+  [ "$status" -eq 75 ]
   [[ "$output" == *"cannot tell whether fabric/relock exists"* ]]
   ! git -C "$T/remote/seedmatic/t.git.gone" rev-parse -q --verify refs/heads/fabric/relock
 }
@@ -893,13 +895,13 @@ HOOK
   [ ! -f "$(git -C "$T/work" rev-parse --git-common-dir)/shallow" ]
 }
 
-@test "in a pass, a head whose trace failed still lets what pins it run; the pass ends 3" {
+@test "in a pass, a head whose trace failed still lets what pins it run; the pass ends 75" {
   mk_orphan
   git -C "$T/work" checkout -q develop
   peers peer peer2
   reject_trace_pushes 9
   STUB_UPDATE=rev run "$T/relock" --downstream
-  [ "$status" -eq 3 ]
+  [ "$status" -eq 75 ]
   [[ "$output" == *"t landed, but its trace was not written"* ]]
   [[ "$output" == *"^ peer done"* ]]
   [[ "$output" != *"NOT RUN"* ]]
@@ -945,4 +947,47 @@ HOOK
   [ "$(git -C "$T/remote/seedmatic/peer.git" show develop:flake.lock | jq -r .nodes.t.locked.rev)" = "$t_head" ]
   [ "$(jq -r .rev <<<"$(trace_of t)")" = "$t_head" ]
   [ "$(jq -r '.status.bumped.t[1]' <<<"$(git -C "$T/remote/seedmatic/peer.git" show fabric/relock:peer.json)")" = "$t_head" ]
+}
+
+# ── review of f6ac9fd ──────────────────────────────────────────────────────────────────────────────
+
+@test "a starter AHEAD of its upstream refuses before the first head runs, even when it is not first" {
+  lock_of t develop t-orphan
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  echo other > "$T/work/other" && git -C "$T/work" add other && git -C "$T/work" commit -qm "another session's"
+  before=$(git -C "$T/remote/seedmatic/t.git" rev-parse t-orphan/develop)
+  STUB_UPDATE=rev run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: develop is 1 commit(s) ahead of its upstream"* ]]
+  [[ "$output" != *"== t-orphan =="* ]]
+  never_updated
+  [ "$(git -C "$T/remote/seedmatic/t.git" rev-parse t-orphan/develop)" = "$before" ]
+}
+
+@test "a starter with an uncommitted flake.lock refuses before the first head runs" {
+  lock_of t develop t-orphan
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  jq '.nodes.x.locked.rev = "edited"' "$T/work/flake.lock" > "$T/x" && mv "$T/x" "$T/work/flake.lock"
+  STUB_UPDATE=rev run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: the worktree carries uncommitted changes"* ]]
+  [[ "$output" != *"== t-orphan =="* ]]
+  never_updated
+}
+
+@test "what the guard does not measure is in the final summary and in the trace" {
+  STUB_SYSTEMS="aarch64-darwin x86_64-darwin" STUB_BROKEN_SYSTEM=x86_64-darwin STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$(tail -n 4 <<<"$output")" == *"NOT MEASURED by the impact guard"*"packages of x86_64-darwin"*"DONE"* ]]
+  [[ "$(jq -r '.status.unmeasured[0]' <<<"$(trace_of t)")" == "packages of x86_64-darwin: one of them does not evaluate"* ]]
+}
+
+@test "the git fetcher's fallback to its old clone is a failure, never 'already current'" {
+  STUB_UPDATE=git-cached run "$T/relock" --no-push inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED to fetch"* ]]
+  [[ "$output" == *"could not update local clone of Git repository"* ]]
+  [[ "$output" != *"already current"* ]]
 }
