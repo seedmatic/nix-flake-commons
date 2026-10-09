@@ -1,0 +1,18 @@
+{
+  "schema": "seedmatic.fabric-heads/v1",
+  "heads": {
+    "flake-commons":    { "repo": "seedmatic/nix-flake-commons", "branch": "develop",                "kind": "code" },
+    "flox-controller":  { "repo": "seedmatic/flox-controller",   "branch": "develop",                "kind": "code" },
+    "flox-runtime":     { "repo": "seedmatic/flox-nri-plugin",   "branch": "develop",                "kind": "code" },
+    "seat-roster":      { "repo": "seedmatic/seat-roster",       "branch": "develop",                "kind": "code" },
+    "ndh":              { "repo": "seedmatic/ndh",               "branch": "develop",                "kind": "code" },
+    "nch":              { "repo": "seedmatic/nch",               "branch": "develop",                "kind": "code" },
+    "nnh":              { "repo": "seedmatic/nnh",               "branch": "develop",                "kind": "code" },
+    "rke2lab":          { "repo": "seedmatic/rke2lab",           "branch": "develop",                "kind": "code" },
+    "seed-incluster":   { "repo": "seedmatic/rke2lab",           "branch": "seed-incluster/develop", "kind": "code" },
+    "flox-catalog":     { "repo": "seedmatic/rke2lab",           "branch": "flox-catalog/develop",   "kind": "code" },
+    "workspace":        { "repo": "seedmatic/rke2lab",           "branch": "workspace/develop",      "kind": "code" },
+    "fabric-plan":      { "repo": "seedmatic/rke2lab",           "branch": "fabric/plan",            "kind": "data" },
+    "nnh-contribution": { "repo": "seedmatic/nnh",               "branch": "fabric/contribution",    "kind": "data" }
+  }
+}
