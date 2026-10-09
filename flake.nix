@@ -236,7 +236,7 @@
               "github:seedmatic/flox-controller"
               "github:seedmatic/flox-nri-plugin"
               "github:seedmatic/seat-roster"
-              "github:seedmatic/rke2lab/seed-incluster"
+              "github:seedmatic/rke2lab/seed-incluster/develop"
               "github:seedmatic/rke2lab"
             ];
           }
