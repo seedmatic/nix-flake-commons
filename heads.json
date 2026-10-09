@@ -13,7 +13,6 @@
     "flox-catalog":     { "repo": "seedmatic/rke2lab",           "branch": "flox-catalog/develop",   "kind": "code" },
     "workspace":        { "repo": "seedmatic/rke2lab",           "branch": "workspace/develop",      "kind": "code" },
     "fabric-plan":      { "repo": "seedmatic/rke2lab",           "branch": "fabric/plan",            "kind": "data" },
-    "nnh-contribution": { "repo": "seedmatic/nnh",               "branch": "fabric/contribution",    "kind": "data" },
-    "fabric-heads":     { "repo": "seedmatic/nix-flake-commons", "branch": "fabric/heads",           "kind": "data" }
+    "nnh-contribution": { "repo": "seedmatic/nnh",               "branch": "fabric/contribution",    "kind": "data" }
   }
 }
