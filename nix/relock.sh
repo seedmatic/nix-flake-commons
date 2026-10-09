@@ -1,5 +1,4 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2016  # the jq programs are single-quoted: their $names are jq's, not the shell's
 # relock — ONE implementation, shared by every head of the fabric. See rke2lab's
 # docs/architecture/fabric/relock-bootstrap-spec.adoc; built by nix-flake-commons' `lib.mkRelockApp`.
 #
@@ -44,6 +43,7 @@ nix-flake-commons' `fabric/heads`, the edges from each code head's lock, both re
 API. A cycle, an id that is not a head, or an id that resolves elsewhere fails it.
 --downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
 plan's order; a head that pins a failed head is not run. The pass ends non-zero naming every failure.
+Exit 3: everything landed, but a trace could not be written (the heads that pin it still run).
 A pass runs ONE relock everywhere: each head's is built with `--override-input flake-commons` on the
 pass's tool, and a relock of any other code refuses.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
@@ -135,11 +135,28 @@ api_raw() { # $1 owner/repo  $2 branch  $3 path -> the file on stdout
 # Empty but for another head's relock, which is built on the pass's tool. An override never writes a
 # lock: nothing here passes --commit-lock-file.
 tool_override=()
+# Read with --refresh, and a fallback to nix's cache is refused: a program served from a stale copy
+# would run another head's OLD relock while the pass believes it runs its tool.
+cache_refused() { # $1 nix's stderr -> 0 when nix fell back to a cache, said
+  if grep -qE 'using cached version|unable to download' "$1"; then
+    sed 's/^/    /' "$1" >&2
+    echo "relock: nix answered from its cache — refusing that answer" >&2
+    return 0
+  fi
+  return 1
+}
 app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program path on stdout
-  local prog d
+  local prog d ctx err
   local -a drvs=()
-  prog=$(nix eval --raw "${tool_override[@]}" "$1.program") || return 1
-  mapfile -t drvs < <(nix eval --json "${tool_override[@]}" "$1.program" --apply 'p: builtins.attrNames (builtins.getContext p)' | jq -r '.[]') || return 1
+  err=$(mktemp)
+  if ! prog=$(nix eval --raw --refresh "${tool_override[@]}" "$1.program" 2>"$err") || cache_refused "$err"; then
+    grep -v '^evaluation warning' "$err" >&2 || true; rm -f "$err"; return 1
+  fi
+  if ! ctx=$(nix eval --json --refresh "${tool_override[@]}" "$1.program" --apply 'p: builtins.attrNames (builtins.getContext p)' 2>"$err") || cache_refused "$err"; then
+    grep -v '^evaluation warning' "$err" >&2 || true; rm -f "$err"; return 1
+  fi
+  rm -f "$err"
+  mapfile -t drvs < <(jq -r '.[]' <<<"$ctx")
   for d in "${drvs[@]}"; do nix build --no-link "$d^*" || return 1; done
   printf '%s\n' "$prog"
 }
@@ -147,11 +164,17 @@ app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program pat
 # Every target that FAILED in this run, named. A failure does not stop the others, and what did
 # succeed is still pushed — but the run then ends non-zero with the list, so a starter reads a
 # failure, not "done", and counts it in its own list in turn.
+#
+# A trace that could not be written is a failure of its own, exit 3: the change it traces HAS landed,
+# so a pass still runs the heads that pin this one, and only names the missing trace.
 failed=()
+trace_failed=()
 finish() { # $1 the word for success
-  if [ "${#failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
-  echo "FAILED: ${#failed[@]} target(s)"
-  printf '  %s\n' "${failed[@]}"
+  if [ "${#failed[@]}" -eq 0 ] && [ "${#trace_failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
+  echo "FAILED: $(( ${#failed[@]} + ${#trace_failed[@]} )) target(s)"
+  if [ "${#failed[@]}" -gt 0 ]; then printf '  %s\n' "${failed[@]}"; fi
+  if [ "${#trace_failed[@]}" -gt 0 ]; then printf '  %s\n' "${trace_failed[@]}"; fi
+  if [ "${#failed[@]}" -eq 0 ]; then exit 3; fi
   exit 1
 }
 
@@ -271,10 +294,13 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
     echo "REFUSING --downstream: @repoName@ names no pushed tool (no github: flake-commons pin, or the tool's head is not on the remote)" >&2
     exit 1
   fi
-  if ! pass_tool=$(nix eval --raw "$tool_ref#lib.relockToolId"); then
+  tool_err=$(mktemp)
+  if ! pass_tool=$(nix eval --raw --refresh "$tool_ref#lib.relockToolId" 2>"$tool_err") || cache_refused "$tool_err"; then
+    rm -f "$tool_err"
     echo "REFUSING --downstream: the pass's tool $tool_ref cannot be fetched" >&2
     exit 1
   fi
+  rm -f "$tool_err"
   if [ "$pass_tool" != "@toolId@" ]; then
     echo "REFUSING --downstream: $tool_ref is tool $pass_tool, not the one running here (@toolId@)" >&2
     echo "          — commit and push the relock you mean to run, or run the one that is pushed" >&2
@@ -326,7 +352,10 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
         rm -rf "$elsewhere"
       fi
     fi
-    if [ "$rc" != 0 ]; then
+    if [ "$rc" = 3 ]; then
+      echo "  ^ $id landed, but its trace was not written (its output is above)"
+      trace_failed+=("trace $id (its change landed)")
+    elif [ "$rc" != 0 ]; then
       echo "  ^ FAILED — $id's relock exited $rc (its output is above)"
       failed+=("head $id")
       down[$id]=1
@@ -407,14 +436,26 @@ if [ -f "$REPO/flake-registry.json" ]; then
 fi
 
 # The per-input comparison attributes a derivation change to the input just bumped, so any OTHER
-# uncommitted edit would be credited to it. Refuse rather than mislead. TRACKED changes only: nix's git
-# fetcher excludes untracked files from a flake's source (measured 2026-10-07), so an untracked file
-# cannot move any derivation.
-dirty=$(git -C "$REPO" status --porcelain --untracked-files=no -- . ':!flake.lock')
+# uncommitted edit would be credited to it. Refuse rather than mislead — flake.lock INCLUDED: an edited
+# lock would ride along with the next bump (a `path:` pin on another input, committed and pushed), and a
+# dropped bump restores the lock, which would wipe the edit. TRACKED changes only: nix's git fetcher
+# excludes untracked files from a flake's source (measured 2026-10-07), so an untracked file cannot
+# move any derivation.
+dirty=$(git -C "$REPO" status --porcelain --untracked-files=no)
 if [ -n "$dirty" ]; then
-  echo "REFUSING: the worktree carries changes beyond flake.lock, so a derivation change could not be" >&2
-  echo "attributed. Commit or set them aside:" >&2
+  echo "REFUSING: the worktree carries uncommitted changes, so a derivation change could not be" >&2
+  echo "attributed, and a restored lock would lose them. Commit or set them aside:" >&2
   printf '%s\n' "$dirty" >&2
+  exit 1
+fi
+# A head AHEAD of its upstream carries commits this run did not make — in a shared worktree, another
+# session's, not yet reviewed and never checked for a machine-local lock. Pushing them with this run's
+# would publish them. Refuse: push them, or set them aside, first.
+ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "")
+if [ -n "$ahead" ] && [ "$ahead" != 0 ]; then
+  echo "REFUSING: $cur is $ahead commit(s) ahead of its upstream — commits this run did not make." >&2
+  echo "          Push them (after review), or set them aside, then run again:" >&2
+  git -C "$REPO" log --oneline '@{u}..HEAD' >&2
   exit 1
 fi
 
@@ -425,40 +466,73 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
     | .nodes[$nn].locked.rev // empty' "$1"
 }
 
-# The MEANINGFUL projection of a flake edge: every exported derivation — each package's, the ones
-# behind each app's program, and each nixos/darwin configuration's top level with its revision
-# neutralised (nix/configurations.nix, the measure the sweep proves stable). A contribution reaches the
-# hosts only through the configurations, so without them a real change of one is dropped.
+# The MEANINGFUL projection of a flake edge: every exported derivation — each package's and the ones
+# behind each app's program, for EVERY system the flake exposes (from darwin, a bump that moves only
+# aarch64-linux packages was dropped: nnh's squashfs, flox-nri-plugin), and each nixos/darwin
+# configuration's top level with its revision neutralised (nix/configurations.nix, the measure the
+# sweep proves stable). Evaluation only: nothing is built, so a foreign system costs no builder.
 # NOT a projection of the lock's fields — in a flake.lock `locked.rev` IS the content identity, so
 # deleting it would make every bump compare equal and look impact-free.
 #
 # A flake with neither `packages` nor configurations is an AGGREGATOR: what it exports is its inputs,
 # which the heads that pin it follow — so its impact is the revision each root input is locked at.
 #
-# ⚠️ Presence is tested WITHOUT evaluating the outputs, and an error must stay fatal: a repo whose
-# packages FAIL to evaluate must not read as an aggregator. Every failure is returned EXPLICITLY —
-# evalmap runs inside `$(…)`, where errexit does not carry (no `inherit_errexit`).
-evalmap() {
-  local has pkgs apps cfgs
-  has=$(nix eval --impure --json --expr "let o = (builtins.getFlake \"git+file://$REPO\").outputs; in { packages = o ? packages; configurations = (o ? nixosConfigurations) || (o ? darwinConfigurations); }") || return 1
-  if jq -e '.packages or .configurations' <<<"$has" >/dev/null; then
-    pkgs='{}'
-    if jq -e '.packages' <<<"$has" >/dev/null; then
-      pkgs=$(nix eval --json "$REPO#packages.@system@" \
-        --apply 'ps: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) ps') || return 1
+# The SHAPE is read once, before anything moves: which systems the flake exposes, and which of them
+# evaluate. A system that does not evaluate at the start is said, with its error, and left out — it was
+# broken before this run (measured 2026-10-09: rke2lab's x86_64 systems). A measured system that stops
+# evaluating after a bump is fatal: absent and broken must not look alike.
+#
+# ⚠️ Every failure is returned EXPLICITLY — evalmap runs inside `$(…)`, where errexit does not carry
+# (no `inherit_errexit`).
+flake_expr="(builtins.getFlake \"git+file://$REPO\").outputs"
+# shellcheck disable=SC2016  # nix's own interpolation, not the shell's
+pk_expr='sys: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) o.packages.${sys}'
+# shellcheck disable=SC2016  # nix's own interpolation, not the shell's
+ap_expr='sys: builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a.program)) o.apps.${sys}'
+aggregator=0
+pk_systems=()
+ap_systems=()
+read_shape() {
+  local shape sys err
+  shape=$(nix eval --impure --json --expr "/* relock:shape */ let o = $flake_expr; in {
+      packages = builtins.attrNames (o.packages or { }); apps = builtins.attrNames (o.apps or { });
+      configurations = (o ? nixosConfigurations) || (o ? darwinConfigurations); }") || return 1
+  if jq -e '(.packages | length) == 0 and (.configurations | not)' <<<"$shape" >/dev/null; then
+    aggregator=1
+    return 0
+  fi
+  err=$(mktemp)
+  while read -r sys; do
+    if nix eval --impure --json --expr "/* relock:probe */ let o = $flake_expr; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
+      pk_systems+=("$sys")
+    else
+      echo "  packages.$sys NOT MEASURED — it does not evaluate before any bump: $(grep -m1 'error:' "$err" | sed 's/^ *//')"
     fi
-    apps=$(nix eval --impure --json --expr \
-      "builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a.program)) (((builtins.getFlake \"git+file://$REPO\").outputs.apps or { }).@system@ or { })") || return 1
-    cfgs=$(nix eval --impure --json --expr \
-      "import @configurationsNix@ { outputs = (builtins.getFlake \"git+file://$REPO\").outputs; }") || return 1
-    jq -S -n --argjson p "$pkgs" --argjson a "$apps" --argjson c "$cfgs" '{packages: $p, apps: $a, configurations: $c}'
-  else
+  done < <(jq -r '.packages[]' <<<"$shape")
+  while read -r sys; do
+    if nix eval --impure --json --expr "/* relock:probe */ let o = $flake_expr; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
+      ap_systems+=("$sys")
+    else
+      echo "  apps.$sys NOT MEASURED — it does not evaluate before any bump: $(grep -m1 'error:' "$err" | sed 's/^ *//')"
+    fi
+  done < <(jq -r '.apps[]' <<<"$shape")
+  rm -f "$err"
+}
+nix_list() { local x out="["; for x in "$@"; do out+=" \"$x\""; done; printf '%s ]' "$out"; }
+evalmap() {
+  if [ "$aggregator" = 1 ]; then
     # A `follows` root input has no lock of its own — it is an input PATH whose target is already
     # counted where it is defined — so it is left out rather than resolved.
     jq -S '. as $l | .nodes.root.inputs
       | with_entries(select(.value | type == "string"))
       | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' "$REPO/flake.lock"
+    return
   fi
+  nix eval --impure --json --expr "/* relock:measure */ let o = $flake_expr;
+      each = f: systems: builtins.listToAttrs (map (s: { name = s; value = f s; }) systems); in {
+      packages = each ($pk_expr) $(nix_list "${pk_systems[@]}");
+      apps = each ($ap_expr) $(nix_list "${ap_systems[@]}");
+      configurations = import @configurationsNix@ { outputs = o; }; }" | jq -S . || return 1
 }
 
 all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }
@@ -626,28 +700,49 @@ json_list() { if [ "$#" -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -R
 # separates it from the hop this tool used to make. Written by plumbing, so neither the checkout nor
 # its branch moves.
 write_trace() { # $1 the pushed revision
-  local base="" idx blob tree commit json
+  local url tmp base attempt rc json blob tree commit
+  url=$(git -C "$REPO" remote get-url origin) || return 1
   json=$(jq -n --arg h "@repoName@" --arg r "$1" --arg w "${RELOCK_PASS_WAVE:-@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     --arg t "@toolId@" --argjson b "$bumped" --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
     '{ schema: "seedmatic.relock/v1", head: $h, rev: $r,
        status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a } }')
-  if git -C "$REPO" fetch -q --depth=1 origin "+refs/heads/fabric/relock:refs/relock/trace-base" 2>/dev/null; then
-    base=$(git -C "$REPO" rev-parse refs/relock/trace-base)
-  fi
-  idx=$(mktemp)
-  rm -f "$idx"
-  if [ -n "$base" ]; then GIT_INDEX_FILE=$idx git -C "$REPO" read-tree "$base" || return 1; fi
-  blob=$(printf '%s\n' "$json" | git -C "$REPO" hash-object -w --stdin) || return 1
-  GIT_INDEX_FILE=$idx git -C "$REPO" update-index --add --cacheinfo "100644,$blob,@repoName@.json" || return 1
-  tree=$(GIT_INDEX_FILE=$idx git -C "$REPO" write-tree) || return 1
-  rm -f "$idx"
-  if [ -n "$base" ]; then
-    commit=$(git -C "$REPO" commit-tree "$tree" -p "$base" -m "relock(@repoName@): trace of ${1:0:9}") || return 1
-  else
-    commit=$(git -C "$REPO" commit-tree "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || return 1
-  fi
-  git -C "$REPO" update-ref -d refs/relock/trace-base 2>/dev/null || true
-  git -C "$REPO" push -q origin "$commit:refs/heads/fabric/relock"
+  # A repository of its own: a shallow fetch into the operator's would make it SHALLOW, and in the
+  # bare store that is the common dir of every worktree of the repo.
+  tmp=$(mktemp -d)
+  git init -q --bare "$tmp/trace.git" || { rm -rf "$tmp"; return 1; }
+  for attempt in 1 2; do
+    base=""
+    # "Absent" is ls-remote's exit 2 (no such ref); anything else it cannot answer is an error, never
+    # read as absent — a root commit pushed over an unseen branch is a rejected push at best.
+    rc=0
+    git ls-remote --exit-code "$url" refs/heads/fabric/relock >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = 0 ]; then
+      git -C "$tmp/trace.git" fetch -q --depth=1 "$url" "+refs/heads/fabric/relock:refs/base" || { rm -rf "$tmp"; return 1; }
+      base=$(git -C "$tmp/trace.git" rev-parse refs/base) || { rm -rf "$tmp"; return 1; }
+    elif [ "$rc" != 2 ]; then
+      echo "  cannot tell whether fabric/relock exists on $url (ls-remote exited $rc)" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    rm -f "$tmp/index"
+    if [ -n "$base" ]; then GIT_INDEX_FILE="$tmp/index" git -C "$tmp/trace.git" read-tree "$base" || break; fi
+    blob=$(printf '%s\n' "$json" | git -C "$tmp/trace.git" hash-object -w --stdin) || break
+    GIT_INDEX_FILE="$tmp/index" git -C "$tmp/trace.git" update-index --add --cacheinfo "100644,$blob,@repoName@.json" || break
+    tree=$(GIT_INDEX_FILE="$tmp/index" git -C "$tmp/trace.git" write-tree) || break
+    if [ -n "$base" ]; then
+      commit=$(git -C "$tmp/trace.git" commit-tree "$tree" -p "$base" -m "relock(@repoName@): trace of ${1:0:9}") || break
+    else
+      commit=$(git -C "$tmp/trace.git" commit-tree "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || break
+    fi
+    # One retry: another head of this repository may have written its trace in between.
+    if git -C "$tmp/trace.git" push -q "$url" "$commit:refs/heads/fabric/relock"; then
+      rm -rf "$tmp"
+      return 0
+    fi
+    [ "$attempt" = 1 ] && echo "  the trace's push was rejected — fetching fabric/relock again, once"
+  done
+  rm -rf "$tmp"
+  return 1
 }
 
 if [ "${#targets[@]}" -eq 0 ]; then
@@ -658,6 +753,10 @@ echo "head: @repoName@ ($selfRepo:$selfBranch) at $REPO ($cur)"
 echo "targets: ${targets[*]}"
 echo
 
+if ! read_shape; then
+  echo "FAILED to read what this head exports — nothing reconciled" >&2
+  exit 1
+fi
 if ! baseline=$(evalmap); then
   echo "FAILED to measure the starting point — nothing reconciled" >&2
   exit 1
@@ -714,11 +813,9 @@ if [ "$nopush" = 1 ]; then
   finish "DONE (not pushed)"
 fi
 
-# Pushed when there is something to push: this run's commits, or commits an earlier run left behind
-# — a head after this one pins what is on the remote, so an unpushed commit is a change that did not
-# land. A session with no upstream and nothing new has nothing to push.
-ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "")
-if [ "$committed" = 1 ] || { [ -n "$ahead" ] && [ "$ahead" != 0 ]; }; then
+# Pushed when this run committed — and only then: the start refused a head already ahead of its
+# upstream, so what is pushed is exactly what this run made.
+if [ "$committed" = 1 ]; then
   if ! git -C "$REPO" push; then
     echo "FAILED to push @repoName@ ($cur) — nothing it carried has landed" >&2
     failed+=("push @repoName@")
@@ -734,8 +831,8 @@ if [ "$committed" = 1 ]; then
   if write_trace "$pushed_head"; then
     echo "  trace written on fabric/relock (@repoName@.json)"
   else
-    echo "  FAILED to write the trace on fabric/relock — the change itself is pushed"
-    failed+=("trace @repoName@")
+    echo "  FAILED to write the trace on fabric/relock — the change itself is pushed, and has landed"
+    trace_failed+=("trace @repoName@ (its change landed)")
   fi
 fi
 echo

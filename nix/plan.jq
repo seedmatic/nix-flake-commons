@@ -26,7 +26,8 @@ def edges_of($H; $locks):
           | if ($m | length) == 1 then { edge: { from: $e.from, to: $m[0], input: $e.input } }
             else { error: "\($e.from): input `\($e.input)` pins \($o.owner)/\($o.repo) at `\($ref)` directly, which is no head of fabric/heads" } end
         else empty end)
-  | map(select(.edge == null or .edge.from != .edge.to));
+  | map(if .edge != null and .edge.from == .edge.to
+        then { error: "\(.edge.from): input `\(.edge.input)` pins its own id — a cycle of one" } else . end);
 
 # Kahn's order, deterministic: at each step every head whose pins have all run, sorted.
 def topo($nodes; $E):

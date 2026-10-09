@@ -45,35 +45,62 @@ for a in "$@"; do
 done
 case "$*" in
   *"#lib.relockToolId"*) printf '%s' "${STUB_TOOL_ID:-$RELOCK_TOOL_ID}" ;;
-  # The presence probe of the impact projection.
-  *"configurations = (o ? nixosConfigurations)"*)
-    n=$(( $(cat "$T/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/probes"
-    mode=${STUB_HAS_PACKAGES:-true}
-    [ "$mode" = true-then-fail ] && { [ "$n" -eq 1 ] && mode=true || mode=fail; }
-    [ "$mode" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
-    printf '{"packages":%s,"configurations":%s}\n' "$mode" "${STUB_HAS_CONFIGS:-false}" ;;
-  # The configurations' measure: their neutralised top level.
-  *"configurations.nix"*)
-    [ "${STUB_CONFIGS:-ok}" = fail ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
-    if [ "${STUB_HAS_CONFIGS:-false}" = true ]; then
-      printf '{"darwin":{},"nixos":{"h":"/nix/store/%s.drv"}}\n' "$(cat "$T/cfg-drv")"
-    else echo '{"darwin":{},"nixos":{}}'; fi ;;
-  *"getContext a.program"*)
+  # What the head exports: its systems, and whether it has configurations.
+  *"relock:shape"*)
+    [ "${STUB_HAS_PACKAGES:-true}" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
+    systems=$(printf '%s\n' ${STUB_SYSTEMS:-aarch64-darwin} | jq -R . | jq -sc .)
+    pk=$systems; [ "${STUB_HAS_PACKAGES:-true}" = false ] && pk='[]'
+    printf '{"packages":%s,"apps":%s,"configurations":%s}\n' "$pk" "$systems" "${STUB_HAS_CONFIGS:-false}" ;;
+  # One system, tried before anything moves.
+  *"relock:probe"*)
+    if [ -n "${STUB_BROKEN_SYSTEM:-}" ] && [[ "$*" == *"\"$STUB_BROKEN_SYSTEM\""* ]]; then
+      echo "error: attribute '$STUB_BROKEN_SYSTEM' missing" >&2; exit 1
+    fi ;;
+  # The measure: packages and apps of every measured system, and the configurations.
+  *"relock:measure"*)
+    n=$(( $(cat "$T/measures" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/measures"
+    [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
-    printf '{"relock":["/nix/store/%s.drv"]}\n' "$(cat "$T/app-drv")" ;;
+    [ "${STUB_CONFIGS:-ok}" = fail ] && [ "${STUB_HAS_CONFIGS:-false}" = true ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
+    drv=$(cat "$T/drv"); [ "${STUB_DRV_FROM_LOCK:-}" = 1 ] && drv=$(cksum < "$p/flake.lock" | cut -d' ' -f1)
+    jq -n --arg d "$drv" --arg l "$(cat "$T/drv-linux")" --arg a "$(cat "$T/app-drv")" --arg c "$(cat "$T/cfg-drv")" \
+      --arg expr "$*" --arg broken "${STUB_BROKEN_SYSTEM:-}" \
+      --argjson haspk "$([ "${STUB_HAS_PACKAGES:-true}" = false ] && echo false || echo true)" \
+      --argjson hascfg "${STUB_HAS_CONFIGS:-false}" '
+      # Only what the expression asks for: its systems, and the configurations if it imports them.
+      def asked($k): [ $expr | capture("\($k) = each \\(.*?\\) \\[(?<l>[^\\]]*)\\]").l | scan("\"([^\"]+)\"") | .[0] ];
+      { packages: ([ asked("packages")[] | { (.): { p: ("/nix/store/" + (if . == "aarch64-linux" then $l else $d end) + ".drv") } } ] | add // {}),
+        apps: ([ asked("apps")[] | { (.): { relock: [ "/nix/store/\($a).drv" ] } } ] | add // {}),
+        configurations: (if ($expr | test("configurations = import ")) then
+          { darwin: {}, nixos: (if $hascfg then { h: "/nix/store/\($c).drv" } else {} end) } else {} end) }' ;;
   # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
   *".program"*"getContext"*) echo '[]' ;;
   *"github:seedmatic/t/t-orphan/develop#apps."*"relock.program"*) printf '%s' "$T/relock-orphan" ;;
   *"github:seedmatic/t/develop#apps."*"relock.program"*) printf '%s' "$T/relock" ;;
   *"github:seedmatic/peer/develop#apps."*"relock.program"*)
     [ "${STUB_PEER:-ok}" = unbuildable ] && { echo "error: peer does not evaluate" >&2; exit 1; }
+    [ "${STUB_PEER:-ok}" = cached ] && echo "warning: unable to download 'https://api.github.com/repos/seedmatic/peer/commits/develop'; using cached version" >&2
     printf '%s' "$T/relock-peer" ;;
   *"github:seedmatic/peer2/develop#apps."*"relock.program"*) printf '%s' "$T/relock-peer2" ;;
   *"after-x.program"*) printf '%s' "$T/bin/after-x" ;;
-  *"#packages."*) printf '{"p":"/nix/store/%s.drv"}\n' "$(cat "$T/drv")" ;;
   *"flake update"*)
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
+      # A new revision at each run.
+      revs)   n=$(( $(cat "$T/revn" 2>/dev/null || echo 1) + 1 )); echo "$n" > "$T/revn"
+              jq --arg r "r$n" '.nodes.a.locked.rev = $r' flake.lock > l && mv l flake.lock; echo "d$n" > "$T/drv" ;;
+      # Only another system's package moves: what a darwin seat must not drop.
+      linux-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo lin2 > "$T/drv-linux" ;;
+      # A real propagation: the upstream head t bumps `a`; a head that pins t takes t's pushed head.
+      propagate)
+        if jq -e '.nodes.t' flake.lock >/dev/null; then
+          case "$*" in
+            *"flake update t "*) r=$(git -C "$T/remote/seedmatic/t.git" rev-parse develop)
+              jq --arg r "$r" '.nodes.t.locked.rev = $r' flake.lock > l && mv l flake.lock ;;
+          esac
+        else
+          case "$*" in *"flake update a "*) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock ;; esac
+        fi ;;
       # Only a configuration moves: the bump of a contribution's pin, seen from its aggregator.
       config-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo cfg2 > "$T/cfg-drv" ;;
       one-fails)
@@ -143,6 +170,7 @@ FAKE
   echo d1 > "$T/drv"
   echo app1 > "$T/app-drv"
   echo cfg1 > "$T/cfg-drv"
+  echo lin1 > "$T/drv-linux"
 
   # The fabric's heads, as nix-flake-commons' fabric/heads serves them.
   put "seedmatic/nix-flake-commons" "fabric/heads" heads.json <<'JSON'
@@ -186,8 +214,8 @@ put() { mkdir -p "$T/gh/$1/$2/$(dirname "$3")"; cat > "$T/gh/$1/$2/$3"; }
 # A pushed lock for a head: it pins flake-commons at fc1, and each head named after its branch, by id.
 lock_of() { # $1 repo  $2 branch  $3… ids it pins
   local repo=$1 branch=$2; shift 2
-  jq -n --args '{ version: 7, root: "root",
-      nodes: ({ root: { inputs: ({ "flake-commons": "fc" } + ([ $ARGS.positional[] | { (.): . } ] | add // {})) },
+  jq -n --arg self "$repo" --args '{ version: 7, root: "root",
+      nodes: ({ root: { inputs: ((if $self == "nix-flake-commons" then {} else { "flake-commons": "fc" } end) + ([ $ARGS.positional[] | { (.): . } ] | add // {})) },
                 fc: { original: { type: "indirect", id: "flake-commons" },
                       locked: { type: "github", owner: "seedmatic", repo: "nix-flake-commons", rev: "fc1" } } }
               + ([ $ARGS.positional[] | { (.): { original: { type: "indirect", id: . },
@@ -276,7 +304,7 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
 
 @test "a committed registry that disagrees with fabric/heads refuses" {
   echo '{"version":2,"flakes":[{"from":{"type":"indirect","id":"peer"},"to":{"type":"github","owner":"seedmatic","repo":"elsewhere"}}]}' > "$T/work/flake-registry.json"
-  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
+  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg && git -C "$T/work" push -q 2>/dev/null
   run "$T/relock" inputs
   [ "$status" -eq 1 ]
   [[ "$output" == *"disagrees with fabric/heads"*"peer: seedmatic/elsewhere at develop, but fabric/heads has seedmatic/peer at develop"* ]]
@@ -285,7 +313,7 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
 
 @test "a committed registry that names an orphan by its branch agrees with fabric/heads" {
   echo '{"version":2,"flakes":[{"from":{"type":"indirect","id":"t-orphan"},"to":{"type":"github","owner":"seedmatic","repo":"t","ref":"t-orphan/develop"}}]}' > "$T/work/flake-registry.json"
-  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
+  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg && git -C "$T/work" push -q 2>/dev/null
   STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
 }
@@ -306,7 +334,7 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
   [[ "$output" == *"REFUSING"* ]]
 }
 
-@test "a FAILING presence probe is fatal — it must not read as 'an aggregator'" {
+@test "a FAILING shape probe is fatal — it must not read as 'an aggregator'" {
   STUB_HAS_PACKAGES=fail STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -ne 0 ]
   [[ "$output" != *"DONE"* ]]
@@ -315,8 +343,8 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
   lock_unchanged
 }
 
-@test "a failed measurement mid-run is NOT committed, and the lock is restored" {
-  STUB_HAS_PACKAGES=true-then-fail STUB_UPDATE=rev run "$T/relock" inputs
+@test "a measured system that stops evaluating after a bump is fatal: not committed, the lock restored" {
+  STUB_MEASURE=fail-after-first STUB_UPDATE=rev run "$T/relock" inputs
   [[ "$output" == *"FAILED to measure impact"* ]]
   [ "$(relock_commits)" -eq 0 ]
   tree_clean
@@ -349,7 +377,7 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
   STUB_HAS_PACKAGES=false STUB_HAS_CONFIGS=true STUB_UPDATE=nested run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"NO derivation impact -> dropped"* ]]
-  ! grep -q "#packages\." "$T/calls"
+  grep -q "relock:measure" "$T/calls"
   grep -q "configurations.nix" "$T/calls"
 }
 
@@ -412,7 +440,7 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
 @test "the local registry wins over the committed one — that is what the indirection is for" {
   echo '{"version":2,"flakes":[]}' > "$T/work/flake-registry.json"
   echo '{"version":2,"flakes":[]}' > "$T/work/flake-registry.local.json"
-  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
+  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg && git -C "$T/work" push -q 2>/dev/null
   STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   grep -q -- "--flake-registry $T/work/flake-registry.local.json flake update" "$T/calls"
@@ -420,7 +448,7 @@ trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.jso
 
 @test "with no local override, the committed registry is used" {
   echo '{"version":2,"flakes":[]}' > "$T/work/flake-registry.json"
-  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg
+  git -C "$T/work" add flake-registry.json && git -C "$T/work" commit -qm reg && git -C "$T/work" push -q 2>/dev/null
   STUB_UPDATE=none run "$T/relock" inputs
   [ "$status" -eq 0 ]
   grep -q -- "--flake-registry $T/work/flake-registry.json flake update" "$T/calls"
@@ -458,7 +486,7 @@ two_inputs() {
  "a":{"locked":{"type":"github","rev":"a1"}},
  "b":{"locked":{"type":"github","rev":"b1"}}},"root":"root","version":7}
 LOCK
-  git -C "$T/work" commit -qam two-inputs
+  git -C "$T/work" commit -qam two-inputs && git -C "$T/work" push -q 2>/dev/null
 }
 
 @test "a bump coupled to another input's waits for it, then is carried — whatever the order" {
@@ -768,4 +796,153 @@ LOCK
   ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.peer"
   grep -q '^RELOCK_PASS_PLAN=' "$T/child-env.peer"
   grep -q '^RELOCK_HEAD=peer$' "$T/child-env.peer"
+}
+
+# ── review of 1a: the start refuses what this run did not make ─────────────────────────────────────
+
+@test "a head AHEAD of its upstream refuses at the start — those commits are not this run's" {
+  echo other > "$T/work/other" && git -C "$T/work" add other && git -C "$T/work" commit -qm "another session's"
+  before=$(remote_rev develop)
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: develop is 1 commit(s) ahead of its upstream"*"another session's"* ]]
+  never_updated
+  [ "$(remote_rev develop)" = "$before" ]
+}
+
+@test "an uncommitted flake.lock refuses at the start — and the edit survives" {
+  jq '.nodes.x.locked = {"type":"path","path":"/somewhere/local"}' "$T/work/flake.lock" > "$T/x" && mv "$T/x" "$T/work/flake.lock"
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: the worktree carries uncommitted changes"*"flake.lock"* ]]
+  never_updated
+  [ "$(jq -r .nodes.x.locked.path "$T/work/flake.lock")" = /somewhere/local ]
+}
+
+# ── review of 1a: every system is measured ─────────────────────────────────────────────────────────
+
+@test "a bump that moves ONLY another system's package is carried — a darwin seat must not drop it" {
+  STUB_SYSTEMS="aarch64-darwin aarch64-linux" STUB_UPDATE=linux-only run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+}
+
+@test "a system that does not evaluate before any bump is said and left out; the run goes on" {
+  STUB_SYSTEMS="aarch64-darwin x86_64-darwin" STUB_BROKEN_SYSTEM=x86_64-darwin STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"packages.x86_64-darwin NOT MEASURED — it does not evaluate before any bump: error: attribute 'x86_64-darwin' missing"* ]]
+  [[ "$output" == *"BUMPED"* ]]
+  ! grep 'relock:measure' "$T/calls" | grep -q '"x86_64-darwin"'
+}
+
+# ── review of 1a: the trace, absent, rejected, or unreachable ───────────────────────────────────────
+
+reject_trace_pushes() { # $1 how many pushes to fabric/relock the remote rejects
+  echo "$1" > "$T/rejects"
+  cat > "$T/remote/seedmatic/t.git/hooks/pre-receive" <<HOOK
+#!$(command -v bash)
+while read -r _ _ ref; do
+  if [ "\$ref" = refs/heads/fabric/relock ]; then
+    n=\$(cat "$T/rejects"); [ "\$n" -gt 0 ] && { echo \$((n - 1)) > "$T/rejects"; echo "rejected by the test" >&2; exit 1; }
+  fi
+done
+exit 0
+HOOK
+  chmod +x "$T/remote/seedmatic/t.git/hooks/pre-receive"
+}
+
+@test "a trace that cannot be written is its own failure, exit 3 — the change itself has landed" {
+  reject_trace_pushes 2
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"FAILED to write the trace on fabric/relock — the change itself is pushed, and has landed"* ]]
+  [[ "$output" == *"trace t (its change landed)"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
+}
+
+@test "a rejected trace push is retried ONCE, on a fresh fetch" {
+  reject_trace_pushes 1
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the trace's push was rejected — fetching fabric/relock again, once"* ]]
+  [ "$(jq -r .head <<<"$(trace_of t)")" = t ]
+}
+
+@test "a remote that cannot be read is never taken for an absent trace branch" {
+  # The remote vanishes once the change is pushed: ls-remote can no longer answer.
+  cat > "$T/remote/seedmatic/t.git/hooks/post-receive" <<HOOK
+#!$(command -v bash)
+mv "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/t.git.gone"
+HOOK
+  chmod +x "$T/remote/seedmatic/t.git/hooks/post-receive"
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"cannot tell whether fabric/relock exists"* ]]
+  ! git -C "$T/remote/seedmatic/t.git.gone" rev-parse -q --verify refs/heads/fabric/relock
+}
+
+@test "the trace never makes the operator's repository shallow" {
+  # Three changes: fabric/relock has history to cut by the third.
+  for i in 1 2 3; do
+    STUB_UPDATE=revs run "$T/relock" inputs
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"trace written"* ]]
+  done
+  [ "$(git -C "$T/remote/seedmatic/t.git" rev-list --count fabric/relock)" -eq 3 ]
+  [ ! -f "$(git -C "$T/work" rev-parse --git-common-dir)/shallow" ]
+}
+
+@test "in a pass, a head whose trace failed still lets what pins it run; the pass ends 3" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  reject_trace_pushes 9
+  STUB_UPDATE=rev run "$T/relock" --downstream
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"t landed, but its trace was not written"* ]]
+  [[ "$output" == *"^ peer done"* ]]
+  [[ "$output" != *"NOT RUN"* ]]
+}
+
+# ── review of 1a: the plan ─────────────────────────────────────────────────────────────────────────
+
+@test "a head that pins its own id fails the plan — a cycle of one" {
+  lock_of peer2 develop peer peer2
+  run "$T/relock" --plan
+  [ "$status" -eq 1 ]
+  [[ "$(jq -r '.errors[]' <<<"$output")" == *"peer2: input \`peer2\` pins its own id — a cycle of one"* ]]
+}
+
+@test "another head's relock served from nix's cache is refused, and what pins it is not run" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_PEER=cached STUB_UPDATE=none run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"nix answered from its cache — refusing that answer"* ]]
+  [[ "$output" == *"FAILED — cannot build peer's relock"* ]]
+  [[ "$output" == *"peer2: NOT RUN — it pins peer"* ]]
+  grep -q -- 'eval --raw --refresh --override-input flake-commons' "$T/calls"
+}
+
+# ── review of 1a: a REAL propagation ───────────────────────────────────────────────────────────────
+
+@test "a pass PROPAGATES: t pushes its bump, peer pins t's pushed head, both traced" {
+  peers peer peer2
+  # peer's own lock pins t at the current head.
+  git clone -q "$T/remote/seedmatic/peer.git" "$T/peer-src"
+  jq --arg r "$(remote_rev develop)" '.nodes.root.inputs.t = "t" | .nodes.t = {"locked":{"type":"github","owner":"seedmatic","repo":"t","rev":$r}}' \
+    "$T/peer-src/flake.lock" > "$T/x" && mv "$T/x" "$T/peer-src/flake.lock"
+  git -C "$T/peer-src" commit -qam "peer pins t" && git -C "$T/peer-src" push -q 2>/dev/null
+  git clone -q --bare "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/t-orphan-src.git"
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  STUB_DRV_FROM_LOCK=1 STUB_UPDATE=propagate run "$T/relock" --downstream
+  [ "$status" -eq 0 ]
+  t_head=$(remote_rev develop)
+  [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
+  [ "$(git -C "$T/remote/seedmatic/peer.git" show develop:flake.lock | jq -r .nodes.t.locked.rev)" = "$t_head" ]
+  [ "$(jq -r .rev <<<"$(trace_of t)")" = "$t_head" ]
+  [ "$(jq -r '.status.bumped.t[1]' <<<"$(git -C "$T/remote/seedmatic/peer.git" show fabric/relock:peer.json)")" = "$t_head" ]
 }
