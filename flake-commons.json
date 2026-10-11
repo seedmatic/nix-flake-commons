@@ -1,26 +1,19 @@
 {
   "schema": "seedmatic.relock/v1",
   "head": "flake-commons",
-  "rev": "f994a3f785a72ace4100a500576bf95019b2cd39",
+  "rev": "bbcc5a4a9a129de97b782e2e74ddd4b693b2a516",
   "status": {
-    "wave": "flake-commons@2026-10-11T09:19:47Z",
-    "tool": "3441528c8710e06d3fb518a0ec7f7bf8697b0a380245e74d765d35f0253eeb66",
+    "wave": "flake-commons@2026-10-11T10:44:19Z",
+    "tool": "8a143b902dd8656a0d28ea8d54f97f20a228acc1e897b6cce35160fbaf3c36d7",
     "bumped": {
-      "flox": [
-        "0876a444cb836c746a5339239b9dcc324bdf9d92",
-        "744c37e325c194aec80cccf1074f14c7baa594c7"
-      ],
-      "nixpkgs-unstable": [
-        "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8",
-        "6510408d147d8c5e6d76043e899e9251756f6a75"
-      ],
       "sops-nix": [
-        "dcd241ba97088c22569d1573286e1b9daad340c0",
-        "a8be3b14935d3532604c51c8dfe3021c73d1a885"
+        "a8be3b14935d3532604c51c8dfe3021c73d1a885",
+        "ee48786c6f9160d2c1a084aac841f68195b8420c"
       ]
     },
     "dropped": [],
     "after": [],
-    "unmeasured": []
+    "unmeasured": [],
+    "seconds": 20
   }
 }
