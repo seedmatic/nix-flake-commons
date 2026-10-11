@@ -513,7 +513,9 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
 # `rev` copies the tracked files FROM DISK, clean tree or dirty alike (measured 2026-10-11, nix 2.34.8,
 # a fresh store per case) — and an operator's checkout holds there what the global sops smudge
 # decrypted, which the store copy then carries to every cache it is pushed to. With `rev`, nix reads
-# the git objects: what is committed, encrypted. A shallow clone needs `shallow=1`, or nix refuses it.
+# the git objects: what is committed, encrypted — so relock never MAKES such a copy. It cannot undo one:
+# the fetcher cache keys a clean commit's source by revision, so a copy an earlier `.#` made of the
+# same commit is the one `?rev=` gets back. A shallow clone needs `shallow=1`, or nix refuses it.
 shallow=""
 if [ "$(git -C "$REPO" rev-parse --is-shallow-repository)" = true ]; then shallow="&shallow=1"; fi
 rev_ref() { printf 'git+file://%s?rev=%s%s' "$REPO" "$1" "$shallow"; }
@@ -566,11 +568,19 @@ evalmap() { # $1 the revision measured
       | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' <<<"$lock"
     return
   fi
-  nix eval --impure --json --expr "/* relock:measure */ let o = $(flake_at "$1");
+  # A head's own evaluation warnings are its business, not this measure's: they are left out, so a
+  # pass reads as its heads and their verdicts. Anything else nix says still reaches the terminal.
+  local err out rc=0
+  err=$(mktemp)
+  out=$(nix eval --impure --json --expr "/* relock:measure */ let o = $(flake_at "$1");
       each = f: systems: builtins.listToAttrs (map (s: { name = s; value = f s; }) systems); in {
       packages = each ($pk_expr) $(nix_list "${pk_systems[@]}");
       apps = each ($ap_expr) $(nix_list "${ap_systems[@]}");
-      configurations = import @configurationsNix@ { outputs = o; }; }" | jq -S . || return 1
+      configurations = import @configurationsNix@ { outputs = o; }; }" 2>"$err") || rc=1
+  grep -v '^evaluation warning' "$err" >&2 || true
+  rm -f "$err"
+  [ "$rc" = 0 ] || return 1
+  jq -S . <<<"$out" || return 1
 }
 
 all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }

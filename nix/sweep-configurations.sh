@@ -27,10 +27,16 @@ measure() { # $1 neutralise (true|false) -> JSON, of the clone's HEAD
   nix eval --json --impure --expr \
     "import @configurationsNix@ { outputs = (builtins.getFlake \"git+file://$work/flake?rev=$(git -C "$work/flake" rev-parse HEAD)$shallow\").outputs; neutralise = $1; }"
 }
+# Each measure evaluates every configuration, minutes for a large flake: say which one runs.
+echo "sweep: measuring the configurations raw (1/4)" >&2
 before_raw=$(measure false) || exit 1
+echo "sweep: neutralised (2/4)" >&2
 before=$(measure true) || exit 1
-git -C "$work/flake" -c user.name=sweep -c user.email=sweep@localhost commit --quiet --allow-empty -m "sweep: same tree, new revision"
+# A measuring commit, not a change: the repository's own hooks have nothing to say about it.
+git -C "$work/flake" -c user.name=sweep -c user.email=sweep@localhost -c core.hooksPath=/dev/null commit --quiet --allow-empty -m "sweep: same tree, new revision"
+echo "sweep: same tree, new revision — raw (3/4)" >&2
 after_raw=$(measure false) || exit 1
+echo "sweep: neutralised (4/4)" >&2
 after=$(measure true) || exit 1
 
 jq -rn --argjson br "$before_raw" --argjson ar "$after_raw" --argjson bn "$before" --argjson an "$after" '

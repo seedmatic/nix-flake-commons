@@ -71,6 +71,7 @@ case "$*" in
   # The measure: packages and apps of every measured system, and the configurations.
   *"relock:measure"*)
     n=$(( $(cat "$T/measures" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/measures"
+    [ -n "${STUB_EVAL_WARNING:-}" ] && echo "evaluation warning: $STUB_EVAL_WARNING" >&2
     [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
     [ "${STUB_CONFIGS:-ok}" = fail ] && [ "${STUB_HAS_CONFIGS:-false}" = true ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
@@ -626,6 +627,26 @@ LOCK
   [ "$(git -C "$T/work" show "$m:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
   [ -z "$(git -C "$T/work" for-each-ref --contains "$m")" ]
   [ "$(git -C "$T/work" rev-parse 'HEAD^{tree}')" = "$(git -C "$T/work" rev-parse "$m^{tree}")" ]
+}
+
+@test "a head's evaluation warnings stay out of a pass; a measure's real error does not" {
+  STUB_EVAL_WARNING="getExe: Package tailscale does not have meta.mainProgram" STUB_UPDATE=rev run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  [[ "$output" != *"evaluation warning"* ]]
+  git -C "$T/work" reset -q --hard '@{u}'
+  STUB_EVAL_WARNING=noise STUB_MEASURE=fail-after-first STUB_UPDATE=revs run "$T/relock" --no-push inputs
+  [[ "$output" == *"error: cannot evaluate packages"* ]]
+  [[ "$output" != *"evaluation warning"* ]]
+}
+
+@test "sweep says which of its four measures runs, and its measuring commit runs no hook" {
+  mkdir -p "$T/hooks" && printf '#!%s\nexit 1\n' "$(command -v bash)" > "$T/hooks/pre-commit" && chmod +x "$T/hooks/pre-commit"
+  git config --global core.hooksPath "$T/hooks"
+  run "$T/sweep" "$T/work"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"(1/4)"* ]] && [[ "$output" == *"(4/4)"* ]]
+  [[ "$output" == *"0 configurations"* ]]
 }
 
 @test "sweep clones with no filter and measures revisions: the operator's smudge never reaches nix" {
