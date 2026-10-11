@@ -24,10 +24,12 @@ for a in "$@"; do
     --downstream) downstream=1 ;;
     --no-push) nopush=1 ;;
     --plan) planonly=1 ;;
-    --log=*) RELOCK_LOG=${a#--log=} ;;
+    --format=jsonl) RELOCK_FORMAT=jsonl ;;
+    --format=text) RELOCK_FORMAT=text ;;
+    --format=*) echo "relock: unknown format '${a#--format=}' (text, jsonl)" >&2; exit 2 ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream | --no-push | --plan] [--log=<file>] [target...]
+relock [--downstream | --no-push | --plan] [--format=text|jsonl] [target...]
 
 Reconcile this head's lock. No target = ALL of it.
 
@@ -49,8 +51,9 @@ A pass runs ONE relock everywhere: each head's is built with `--override-input f
 pass's tool, and a relock of any other code refuses.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
---log=<file> appends one JSON line per head run and per pass (its verdicts, what it pushed, how long
-it took) to <file>; a pass hands the file to every head's relock. RELOCK_LOG does the same.
+--format=jsonl prints one JSON line per event on stdout — a pass's start, each head run (its verdicts,
+what it pushed, how long it took), a head not run, the pass's end, a --plan — and everything said for
+a human on stderr. A pass hands the channel to every head's relock, so a whole pass is ONE stream.
 
 GitHub token: read from `gh auth token` at each run and handed ONLY to relock's own nix and API calls,
 as extra-access-tokens appended to NIX_CONFIG, and to curl on its stdin. Never written anywhere, never
@@ -184,17 +187,20 @@ error_of() { awk '/error:/ { msg = $0; want = ($0 ~ /error:[[:space:]]*$/); next
 json_list() { if [ "$#" -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -R . | jq -sc .; fi; }
 # How long this relock has run — SECONDS counts from the start of the script.
 took() { printf '%dm%02ds' $(( ${1:-$SECONDS} / 60 )) $(( ${1:-$SECONDS} % 60 )); }
-# One JSON line per event in RELOCK_LOG, for a machine to compare passes. A line that cannot be
-# written is said, never fatal: the log reports a run, it does not decide one.
-if [ -n "${RELOCK_LOG:-}" ]; then
-  case $RELOCK_LOG in /*) ;; *) RELOCK_LOG=$PWD/$RELOCK_LOG ;; esac
-  export RELOCK_LOG
+# --format=jsonl: stdout carries one JSON line per event, for a machine to compare passes, and
+# everything said for a human goes to stderr. The events leave on fd 3, opened on the original stdout by
+# the relock that was started and INHERITED by every head's relock a pass runs, so a whole pass is one
+# stream. An event that cannot be written is said, never fatal: it reports a run, it does not decide one.
+if [ "${RELOCK_FORMAT:-text}" = jsonl ]; then
+  if [ -z "${RELOCK_EVENTS_FD:-}" ]; then exec 3>&1; RELOCK_EVENTS_FD=3; fi
+  exec 1>&2
+  export RELOCK_FORMAT RELOCK_EVENTS_FD
 fi
 log_event() { # $1 event  $2 its fields, a JSON object
-  [ -n "${RELOCK_LOG:-}" ] || return 0
+  [ "${RELOCK_FORMAT:-text}" = jsonl ] || return 0
   jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ev "$1" --arg head "@repoName@" \
     --arg wave "${RELOCK_PASS_WAVE:-}" --argjson f "$2" '{ ts: $ts, event: $ev, head: $head, wave: $wave } + $f' \
-    >> "$RELOCK_LOG" || echo "relock: cannot write the log $RELOCK_LOG" >&2
+    >&"$RELOCK_EVENTS_FD" || echo "relock: cannot write an event on fd $RELOCK_EVENTS_FD" >&2
 }
 pass_role=0
 finish() { # $1 the word for success
@@ -210,7 +216,7 @@ finish() { # $1 the word for success
   else
     local carried='{}'
     if [ -n "${bumped:-}" ]; then carried=$bumped; fi
-    log_event head "$(jq -n --arg o "$outcome" --arg p "${pushed_head:-}" --argjson s "$SECONDS" --argjson b "$carried" \
+    log_event head "$(jq -n --arg o "$outcome" --arg p "${landed:-}" --argjson s "$SECONDS" --argjson b "$carried" \
       --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
       --argjson u "$(json_list "${unmeasured[@]}")" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
       '{ outcome: $o, pushed: $p, seconds: $s, bumped: $b, dropped: $d, after: $a, unmeasured: $u, failed: $f }')"
@@ -360,6 +366,7 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
 
   if [ "$planonly" = 1 ]; then
     jq 'del(.heads)' "$plan"
+    log_event plan "$(jq -c 'del(.heads)' "$plan")"
     if jq -e '.errors | length > 0' "$plan" >/dev/null; then exit 1; fi
     exit 0
   fi
@@ -921,6 +928,7 @@ if [ "$committed" = 1 ]; then
     finish "DONE"
   fi
   pushed_head=$(git -C "$REPO" rev-parse HEAD)
+  landed=$pushed_head
   echo "  @repoName@ @ ${pushed_head:0:9} pushed"
 else
   pushed_head=$(git -C "$REPO" rev-parse HEAD)

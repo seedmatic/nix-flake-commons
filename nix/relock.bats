@@ -672,27 +672,46 @@ LOCK
   [[ "$output" == *"so none of x86_64-darwin is measured — error: attribute 'x86_64-darwin' missing"* ]]
 }
 
-@test "a run says how long it took, and --log writes it as one JSON line with its verdicts and its push" {
-  STUB_UPDATE=rev run "$T/relock" --log=run.jsonl inputs
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ DONE\ —\ [0-9]+m[0-9]{2}s ]]
-  [ "$(wc -l < run.jsonl)" -eq 1 ]
+@test "a run says how long it took, and --format=jsonl puts its event on stdout and every word on stderr" {
+  STUB_UPDATE=rev "$T/relock" --format=jsonl inputs >"$T/out" 2>"$T/err"
+  grep -q 'BUMPED' "$T/err"
+  ! grep -q 'BUMPED' "$T/out"
+  grep -qE 'DONE — [0-9]+m[0-9]{2}s' "$T/err"
+  [ "$(wc -l < "$T/out")" -eq 1 ]
   jq -e --arg r "$(remote_rev develop)" '.event == "head" and .head == "t" and .outcome == "done"
-      and .pushed == $r and (.seconds | type == "number") and (.bumped | has("a"))' run.jsonl
+      and .pushed == $r and (.seconds | type == "number") and (.bumped | has("a"))' "$T/out"
   jq -e '.status.seconds | type == "number"' <<<"$(trace_of t)"
 }
 
-@test "a pass times each head, and its log holds the pass, each head's run, and parses line by line" {
+@test "a run that pushes nothing says so in its event: pushed is empty, not HEAD" {
+  STUB_UPDATE=none "$T/relock" --format=jsonl inputs >"$T/out" 2>"$T/err"
+  grep -q 'nothing to push' "$T/err"
+  jq -e '.event == "head" and .outcome == "done" and .pushed == ""' "$T/out"
+}
+
+@test "a pass is ONE jsonl stream on stdout — its start, every head's run, its end — and every word on stderr" {
   mk_orphan
   git -C "$T/work" checkout -q develop
   peers peer peer2
-  STUB_UPDATE=none RELOCK_LOG="$T/pass.jsonl" run "$T/relock" --downstream
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ \^\ peer\ done\ \([0-9]+m[0-9]{2}s\) ]]
-  while read -r line; do jq -e . <<<"$line" >/dev/null; done < "$T/pass.jsonl"
-  [ "$(jq -sr '[.[] | select(.event == "pass-start")] | length' "$T/pass.jsonl")" -eq 1 ]
-  [ "$(jq -sr '[.[] | select(.event == "pass")][0].outcome' "$T/pass.jsonl")" = done ]
-  [ "$(jq -sr '[.[] | select(.event == "head") | .head] | sort | join(" ")' "$T/pass.jsonl")" = "peer peer2 t t-orphan" ]
+  STUB_UPDATE=none "$T/relock" --downstream --format=jsonl >"$T/out" 2>"$T/err"
+  grep -qE '\^ peer done \([0-9]+m[0-9]{2}s\)' "$T/err"
+  while read -r line; do jq -e . <<<"$line" >/dev/null; done < "$T/out"
+  [ "$(jq -sr '[.[] | select(.event == "pass-start")] | length' "$T/out")" -eq 1 ]
+  [ "$(jq -sr '[.[] | select(.event == "pass")][0].outcome' "$T/out")" = done ]
+  [ "$(jq -sr '[.[] | select(.event == "head") | .head] | sort | join(" ")' "$T/out")" = "peer peer2 t t-orphan" ]
+}
+
+@test "--plan --format=jsonl puts the plan on stdout as one event" {
+  "$T/relock" --plan --format=jsonl >"$T/out" 2>"$T/err"
+  [ "$(wc -l < "$T/out")" -eq 1 ]
+  jq -e '.event == "plan" and .errors == [] and (.order | index("t") != null)' "$T/out"
+}
+
+@test "an unknown --format is refused before anything" {
+  run "$T/relock" --format=xml inputs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"unknown format 'xml'"* ]]
+  never_updated
 }
 
 # ── the token ──────────────────────────────────────────────────────────────────────────────────────
