@@ -475,11 +475,11 @@
         "pre-commit-hooks": "pre-commit-hooks"
       },
       "locked": {
-        "lastModified": 1791487281,
-        "narHash": "sha256-GJ5lAq1iu7eF77MtScKIs0qWkqt+4mHIcHc+UPrdqbI=",
+        "lastModified": 1791586177,
+        "narHash": "sha256-soAlsa5WmIUbyp0ADkP9lODEfNDqI+2jCNXAMsHuub0=",
         "owner": "flox",
         "repo": "flox",
-        "rev": "0876a444cb836c746a5339239b9dcc324bdf9d92",
+        "rev": "744c37e325c194aec80cccf1074f14c7baa594c7",
         "type": "github"
       },
       "original": {
