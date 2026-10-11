@@ -24,9 +24,10 @@ for a in "$@"; do
     --downstream) downstream=1 ;;
     --no-push) nopush=1 ;;
     --plan) planonly=1 ;;
+    --log=*) RELOCK_LOG=${a#--log=} ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream | --no-push | --plan] [target...]
+relock [--downstream | --no-push | --plan] [--log=<file>] [target...]
 
 Reconcile this head's lock. No target = ALL of it.
 
@@ -48,6 +49,8 @@ A pass runs ONE relock everywhere: each head's is built with `--override-input f
 pass's tool, and a relock of any other code refuses.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
+--log=<file> appends one JSON line per head run and per pass (its verdicts, what it pushed, how long
+it took) to <file>; a pass hands the file to every head's relock. RELOCK_LOG does the same.
 
 GitHub token: read from `gh auth token` at each run and handed ONLY to relock's own nix and API calls,
 as extra-access-tokens appended to NIX_CONFIG, and to curl on its stdin. Never written anywhere, never
@@ -175,12 +178,44 @@ app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program pat
 failed=()
 trace_failed=()
 unmeasured=()
+# The innermost error nix printed, on one line: nix opens with a bare `error:` and its trace, and
+# states the cause last — the first `error:` line alone said nothing.
+error_of() { awk '/error:/ { msg = $0; want = ($0 ~ /error:[[:space:]]*$/); next } want && NF { msg = msg " " $0; want = 0 } END { print msg }' "$1" | sed 's/^ *//; s/  */ /g'; }
+json_list() { if [ "$#" -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -R . | jq -sc .; fi; }
+# How long this relock has run — SECONDS counts from the start of the script.
+took() { printf '%dm%02ds' $(( ${1:-$SECONDS} / 60 )) $(( ${1:-$SECONDS} % 60 )); }
+# One JSON line per event in RELOCK_LOG, for a machine to compare passes. A line that cannot be
+# written is said, never fatal: the log reports a run, it does not decide one.
+if [ -n "${RELOCK_LOG:-}" ]; then
+  case $RELOCK_LOG in /*) ;; *) RELOCK_LOG=$PWD/$RELOCK_LOG ;; esac
+  export RELOCK_LOG
+fi
+log_event() { # $1 event  $2 its fields, a JSON object
+  [ -n "${RELOCK_LOG:-}" ] || return 0
+  jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ev "$1" --arg head "@repoName@" \
+    --arg wave "${RELOCK_PASS_WAVE:-}" --argjson f "$2" '{ ts: $ts, event: $ev, head: $head, wave: $wave } + $f' \
+    >> "$RELOCK_LOG" || echo "relock: cannot write the log $RELOCK_LOG" >&2
+}
+pass_role=0
 finish() { # $1 the word for success
   if [ "${#unmeasured[@]}" -gt 0 ]; then
     echo "NOT MEASURED by the impact guard (broken before any bump; a bump that moves only these is dropped):"
     printf '  %s\n' "${unmeasured[@]}"
   fi
-  if [ "${#failed[@]}" -eq 0 ] && [ "${#trace_failed[@]}" -eq 0 ]; then echo "$1"; exit 0; fi
+  local outcome="done"
+  if [ "${#failed[@]}" -gt 0 ] || [ "${#trace_failed[@]}" -gt 0 ]; then outcome=failed; fi
+  if [ "$pass_role" = 1 ]; then
+    log_event pass "$(jq -n --arg o "$outcome" --argjson s "$SECONDS" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
+      '{ outcome: $o, seconds: $s, failed: $f }')"
+  else
+    local carried='{}'
+    if [ -n "${bumped:-}" ]; then carried=$bumped; fi
+    log_event head "$(jq -n --arg o "$outcome" --arg p "${pushed_head:-}" --argjson s "$SECONDS" --argjson b "$carried" \
+      --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
+      --argjson u "$(json_list "${unmeasured[@]}")" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
+      '{ outcome: $o, pushed: $p, seconds: $s, bumped: $b, dropped: $d, after: $a, unmeasured: $u, failed: $f }')"
+  fi
+  if [ "$outcome" = "done" ]; then echo "$1 — $(took)"; exit 0; fi
   echo "FAILED: $(( ${#failed[@]} + ${#trace_failed[@]} )) target(s)"
   if [ "${#failed[@]}" -gt 0 ]; then printf '  %s\n' "${failed[@]}"; fi
   if [ "${#trace_failed[@]}" -gt 0 ]; then printf '  %s\n' "${trace_failed[@]}"; fi
@@ -363,6 +398,8 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   mapfile -t order < <(jq -r '.order[]' "$plan")
   echo "== pass $RELOCK_PASS_WAVE, on the tool $RELOCK_PASS_TOOL_REF =="
   echo "order: ${order[*]}"
+  pass_role=1
+  log_event pass-start "$(jq -n --arg t "$RELOCK_PASS_TOOL_REF" --argjson o "$(json_list "${order[@]}")" '{ tool: $t, order: $o }')"
   echo
   declare -A down=()
   here=$(pwd)
@@ -373,11 +410,13 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
       if [ -n "${down[$d]:-}" ]; then printf '%s\n' "$d"; fi; done | head -n1)
     if [ -n "$blocked" ]; then
       echo "== $id: NOT RUN — it pins $blocked, which did not land in this pass =="
+      log_event not-run "$(jq -n --arg i "$id" --arg b "$blocked" '{ target: $i, pins: $b }')"
       failed+=("head $id (pins $blocked)")
       down[$id]=1
       continue
     fi
     echo "== $id =="
+    head_started=$SECONDS
     rc=0
     if [ "$id" = "@repoName@" ]; then
       # The start's own relock, by the very program running here, in the operator's checkout.
@@ -395,15 +434,16 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
         rm -rf "$elsewhere"
       fi
     fi
+    head_took=$(took $((SECONDS - head_started)))
     if [ "$rc" = 75 ]; then
-      echo "  ^ $id landed, but its trace was not written (its output is above)"
+      echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
       trace_failed+=("trace $id (its change landed)")
     elif [ "$rc" != 0 ]; then
-      echo "  ^ FAILED — $id's relock exited $rc (its output is above)"
+      echo "  ^ FAILED — $id's relock exited $rc (its output is above) — $head_took"
       failed+=("head $id")
       down[$id]=1
     else
-      echo "  ^ $id done"
+      echo "  ^ $id done ($head_took)"
     fi
     echo
   done
@@ -542,7 +582,7 @@ read_shape() { # what HEAD exports
     if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
       pk_systems+=("$sys")
     else
-      unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(grep -m1 'error:' "$err" | sed 's/^ *//')")
+      unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
       echo "  ${unmeasured[-1]}"
     fi
   done < <(jq -r '.packages[]' <<<"$shape")
@@ -550,7 +590,7 @@ read_shape() { # what HEAD exports
     if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
       ap_systems+=("$sys")
     else
-      unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(grep -m1 'error:' "$err" | sed 's/^ *//')")
+      unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
       echo "  ${unmeasured[-1]}"
     fi
   done < <(jq -r '.apps[]' <<<"$shape")
@@ -753,8 +793,6 @@ after_input() { # $1 app name
   fi
 }
 
-json_list() { if [ "$#" -eq 0 ]; then echo '[]'; else printf '%s\n' "$@" | jq -R . | jq -sc .; fi; }
-
 # The trace of a change, after it is pushed: one file per head (`<id>.json`) on this repository's
 # `fabric/relock`, an orphan nothing pins — so writing it carries nothing anywhere, which is what
 # separates it from the hop this tool used to make. Written by plumbing, so neither the checkout nor
@@ -764,9 +802,9 @@ write_trace() { # $1 the pushed revision
   url=$(git -C "$REPO" remote get-url origin) || return 1
   json=$(jq -n --arg h "@repoName@" --arg r "$1" --arg w "${RELOCK_PASS_WAVE:-@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     --arg t "@toolId@" --argjson b "$bumped" --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
-    --argjson u "$(json_list "${unmeasured[@]}")" \
+    --argjson u "$(json_list "${unmeasured[@]}")" --argjson s "$SECONDS" \
     '{ schema: "seedmatic.relock/v1", head: $h, rev: $r,
-       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a, unmeasured: $u } }')
+       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a, unmeasured: $u, seconds: $s } }')
   # A repository of its own: a shallow fetch into the operator's would make it SHALLOW, and in the
   # bare store that is the common dir of every worktree of the repo.
   tmp=$(mktemp -d)

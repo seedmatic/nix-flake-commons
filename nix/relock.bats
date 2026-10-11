@@ -66,7 +66,12 @@ case "$*" in
   # One system, tried before anything moves.
   *"relock:probe"*)
     if [ -n "${STUB_BROKEN_SYSTEM:-}" ] && [[ "$*" == *"\"$STUB_BROKEN_SYSTEM\""* ]]; then
-      echo "error: attribute '$STUB_BROKEN_SYSTEM' missing" >&2; exit 1
+      if [ "${STUB_ERROR_STYLE:-}" = nix ]; then
+        printf "error:\n       … while evaluating the attribute 'packages'\n\n       error: attribute '%s' missing\n" "$STUB_BROKEN_SYSTEM" >&2
+      else
+        echo "error: attribute '$STUB_BROKEN_SYSTEM' missing" >&2
+      fi
+      exit 1
     fi ;;
   # The measure: packages and apps of every measured system, and the configurations.
   *"relock:measure"*)
@@ -657,6 +662,37 @@ LOCK
   grep -q 'neutralise = true.*' "$T/calls"
   grep -q 'git+file://[^?]*/flake?rev=' "$T/calls"
   [ ! -s "$T/smudged" ]
+}
+
+# ── what a run says of itself ────────────────────────────────────────────────────────────────────────
+
+@test "a system left out is said with nix's own cause, not the bare first line of its trace" {
+  STUB_ERROR_STYLE=nix STUB_SYSTEMS="aarch64-darwin x86_64-darwin" STUB_BROKEN_SYSTEM=x86_64-darwin STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"so none of x86_64-darwin is measured — error: attribute 'x86_64-darwin' missing"* ]]
+}
+
+@test "a run says how long it took, and --log writes it as one JSON line with its verdicts and its push" {
+  STUB_UPDATE=rev run "$T/relock" --log=run.jsonl inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ DONE\ —\ [0-9]+m[0-9]{2}s ]]
+  [ "$(wc -l < run.jsonl)" -eq 1 ]
+  jq -e --arg r "$(remote_rev develop)" '.event == "head" and .head == "t" and .outcome == "done"
+      and .pushed == $r and (.seconds | type == "number") and (.bumped | has("a"))' run.jsonl
+  jq -e '.status.seconds | type == "number"' <<<"$(trace_of t)"
+}
+
+@test "a pass times each head, and its log holds the pass, each head's run, and parses line by line" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=none RELOCK_LOG="$T/pass.jsonl" run "$T/relock" --downstream
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ \^\ peer\ done\ \([0-9]+m[0-9]{2}s\) ]]
+  while read -r line; do jq -e . <<<"$line" >/dev/null; done < "$T/pass.jsonl"
+  [ "$(jq -sr '[.[] | select(.event == "pass-start")] | length' "$T/pass.jsonl")" -eq 1 ]
+  [ "$(jq -sr '[.[] | select(.event == "pass")][0].outcome' "$T/pass.jsonl")" = done ]
+  [ "$(jq -sr '[.[] | select(.event == "head") | .head] | sort | join(" ")' "$T/pass.jsonl")" = "peer peer2 t t-orphan" ]
 }
 
 # ── the token ──────────────────────────────────────────────────────────────────────────────────────
