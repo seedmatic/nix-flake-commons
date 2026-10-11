@@ -431,13 +431,16 @@ else
     echo "        in a clone, the unpushed commits would be lost with it" >&2
     exit 2
   fi
-  # Canonical, because nix refuses a git+file flake whose path crosses a symlink once its tree is
-  # dirty — and a bumped lock makes it dirty. TMPDIR may well cross one (macOS: /tmp -> private/tmp).
-  REPO=$(realpath "$(mktemp -d)")/@repoName@
+  REPO=$(mktemp -d)/@repoName@
   echo "relock(@repoName@): not inside this head — cloning $selfRepo ($selfBranch) to reconcile and push"
-  # Shallow: a requested run reads no history, it bumps the tip and pushes it.
-  git clone --quiet --depth=1 --branch "$selfBranch" "https://github.com/$selfRepo.git" "$REPO" \
+  # Shallow: a requested run reads no history, it bumps the tip and pushes it. Checked out with every
+  # filter OFF — `* -filter` outranks the tree's own .gitattributes: the operator's global sops
+  # smudge would write the repository's secrets decrypted here, for whatever reads the clone.
+  git clone --quiet --depth=1 --no-checkout --branch "$selfBranch" "https://github.com/$selfRepo.git" "$REPO" \
     || { echo "relock: cannot clone $selfRepo $selfBranch" >&2; exit 1; }
+  gitdir=$(git -C "$REPO" rev-parse --absolute-git-dir)
+  mkdir -p "$gitdir/info" && echo '* -filter' > "$gitdir/info/attributes"
+  git -C "$REPO" reset --quiet --hard || { echo "relock: cannot check out $selfRepo $selfBranch" >&2; exit 1; }
   cur=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
   echo "relock(@repoName@): cloned at $cur"
 fi
@@ -505,7 +508,16 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
 #
 # ⚠️ Every failure is returned EXPLICITLY — evalmap runs inside `$(…)`, where errexit does not carry
 # (no `inherit_errexit`).
-flake_expr="(builtins.getFlake \"git+file://$REPO\").outputs"
+#
+# What nix reads of this head is a REVISION, never its working tree. A `git+file` reference without
+# `rev` copies the tracked files FROM DISK, clean tree or dirty alike (measured 2026-10-11, nix 2.34.8,
+# a fresh store per case) — and an operator's checkout holds there what the global sops smudge
+# decrypted, which the store copy then carries to every cache it is pushed to. With `rev`, nix reads
+# the git objects: what is committed, encrypted. A shallow clone needs `shallow=1`, or nix refuses it.
+shallow=""
+if [ "$(git -C "$REPO" rev-parse --is-shallow-repository)" = true ]; then shallow="&shallow=1"; fi
+rev_ref() { printf 'git+file://%s?rev=%s%s' "$REPO" "$1" "$shallow"; }
+flake_at() { printf '(builtins.getFlake "%s").outputs' "$(rev_ref "$1")"; }
 # shellcheck disable=SC2016  # nix's own interpolation, not the shell's
 pk_expr='sys: builtins.mapAttrs (_: p: if p ? drvPath then p.drvPath else null) o.packages.${sys}'
 # shellcheck disable=SC2016  # nix's own interpolation, not the shell's
@@ -513,9 +525,10 @@ ap_expr='sys: builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a
 aggregator=0
 pk_systems=()
 ap_systems=()
-read_shape() {
-  local shape sys err
-  shape=$(nix eval --impure --json --expr "/* relock:shape */ let o = $flake_expr; in {
+read_shape() { # what HEAD exports
+  local shape sys err at
+  at=$(flake_at "$(git -C "$REPO" rev-parse HEAD)")
+  shape=$(nix eval --impure --json --expr "/* relock:shape */ let o = $at; in {
       packages = builtins.attrNames (o.packages or { }); apps = builtins.attrNames (o.apps or { });
       configurations = (o ? nixosConfigurations) || (o ? darwinConfigurations); }") || return 1
   if jq -e '(.packages | length) == 0 and (.configurations | not)' <<<"$shape" >/dev/null; then
@@ -524,7 +537,7 @@ read_shape() {
   fi
   err=$(mktemp)
   while read -r sys; do
-    if nix eval --impure --json --expr "/* relock:probe */ let o = $flake_expr; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
+    if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
       pk_systems+=("$sys")
     else
       unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(grep -m1 'error:' "$err" | sed 's/^ *//')")
@@ -532,7 +545,7 @@ read_shape() {
     fi
   done < <(jq -r '.packages[]' <<<"$shape")
   while read -r sys; do
-    if nix eval --impure --json --expr "/* relock:probe */ let o = $flake_expr; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
+    if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
       ap_systems+=("$sys")
     else
       unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(grep -m1 'error:' "$err" | sed 's/^ *//')")
@@ -542,16 +555,18 @@ read_shape() {
   rm -f "$err"
 }
 nix_list() { local x out="["; for x in "$@"; do out+=" \"$x\""; done; printf '%s ]' "$out"; }
-evalmap() {
+evalmap() { # $1 the revision measured
+  local lock
   if [ "$aggregator" = 1 ]; then
     # A `follows` root input has no lock of its own — it is an input PATH whose target is already
     # counted where it is defined — so it is left out rather than resolved.
+    lock=$(git -C "$REPO" show "$1:flake.lock") || return 1
     jq -S '. as $l | .nodes.root.inputs
       | with_entries(select(.value | type == "string"))
-      | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' "$REPO/flake.lock"
+      | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' <<<"$lock"
     return
   fi
-  nix eval --impure --json --expr "/* relock:measure */ let o = $flake_expr;
+  nix eval --impure --json --expr "/* relock:measure */ let o = $(flake_at "$1");
       each = f: systems: builtins.listToAttrs (map (s: { name = s; value = f s; }) systems); in {
       packages = each ($pk_expr) $(nix_list "${pk_systems[@]}");
       apps = each ($ap_expr) $(nix_list "${ap_systems[@]}");
@@ -560,7 +575,19 @@ evalmap() {
 
 all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }
 
-# `nix flake update` in $1 for the inputs that follow; its stderr lands in `update_err`.
+# The bumped lock as a revision nix can read: HEAD's tree with the checkout's flake.lock, committed by
+# plumbing. No ref names it, and HEAD moves only once the measure has carried the bump.
+lock_commit() {
+  local blob tree
+  GIT_INDEX_FILE=$work/measure.index git -C "$REPO" read-tree HEAD || return 1
+  blob=$(git -C "$REPO" hash-object -w flake.lock) || return 1
+  GIT_INDEX_FILE=$work/measure.index git -C "$REPO" update-index --add --cacheinfo "100644,$blob,flake.lock" || return 1
+  tree=$(GIT_INDEX_FILE=$work/measure.index git -C "$REPO" write-tree) || return 1
+  git -C "$REPO" commit-tree "$tree" -p HEAD -m "relock: a bumped lock, measured"
+}
+
+# `nix flake update` of HEAD for the inputs given, the lock written back into the checkout; its stderr
+# lands in `update_err`.
 # Returns 1 when nix fails, 2 when it SUCCEEDS on a stale copy, and 3 when it fails because the
 # lock would make one input follow an input of another that does not exist (see `deferred`).
 #
@@ -570,10 +597,10 @@ all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }
 # branch. A fetch that did not happen must never read as one that found nothing new.
 update_err=""
 nix_update() {
-  local dir=$1 err rc=0
-  shift
+  local err rc=0
   err=$(mktemp)
-  ( cd "$dir" && nix "${registry_flag[@]}" flake update "$@" --refresh ) >/dev/null 2>"$err" || rc=1
+  nix "${registry_flag[@]}" flake update "$@" --flake "$(rev_ref "$(git -C "$REPO" rev-parse HEAD)")" \
+    --output-lock-file "$REPO/flake.lock" --refresh >/dev/null 2>"$err" || rc=1
   if [ "$rc" = 0 ] && grep -qE "$cache_fallbacks" "$err"; then rc=2; fi
   if [ "$rc" = 1 ] && grep -q 'follows a non-existent input' "$err"; then rc=3; fi
   update_err=$(grep -vE '^evaluation warning' "$err" || true)
@@ -598,7 +625,7 @@ relock_input() { # $1 input name
   printf '  %-18s ' "$1"
   local rc=0 before
   before=$(lockrev "$REPO/flake.lock" "$1")
-  nix_update "$REPO" "$1" || rc=$?
+  nix_update "$1" || rc=$?
   if [ "$rc" = 3 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     if [ "$retrying" = 0 ]; then
@@ -655,11 +682,11 @@ relock_input() { # $1 input name
     echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
     return 1
   fi
-  local after
+  local after measured
   # Checked by hand: relock_input runs as `relock_input … || failed+=…`, and bash switches errexit
   # off for the whole body of a function called in an `||` list. Unchecked, a failed measurement left
   # `after` empty, unequal to the baseline, and the bump was COMMITTED as "derivations moved".
-  if ! after=$(evalmap); then
+  if ! measured=$(lock_commit) || ! after=$(evalmap "$measured"); then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to measure impact — bump NOT carried"
     return 1
@@ -692,7 +719,7 @@ after_input() { # $1 app name
   local -a moved=()
   err=$(mktemp)
   head_before=$(git -C "$REPO" rev-parse HEAD)
-  if ! prog=$(cd "$REPO" && app_program ".#apps.@system@.$1" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
+  if ! prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
     mapfile -t moved < <(git -C "$REPO" diff --name-only)
     if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
     echo "FAILED (after-inputs app $1) — restored ${moved[*]:-nothing}"
@@ -781,7 +808,7 @@ if ! read_shape; then
   echo "FAILED to read what this head exports — nothing reconciled" >&2
   exit 1
 fi
-if ! baseline=$(evalmap); then
+if ! baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)"); then
   echo "FAILED to measure the starting point — nothing reconciled" >&2
   exit 1
 fi

@@ -129,7 +129,18 @@
       });
       lib.relockToolId = relockToolId;
     }
-    // flake-utils.lib.eachDefaultSystem (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
+    // flake-utils.lib.eachDefaultSystem (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      sweepConfigurations = pkgs.writeShellApplication {
+        name = "sweep-configurations";
+        runtimeInputs = [ pkgs.coreutils pkgs.gitMinimal pkgs.jq pkgs.nix ];
+        text = builtins.readFile (
+          pkgs.replaceVars ./nix/sweep-configurations.sh {
+            configurationsNix = "${./nix/configurations.nix}";
+          }
+        );
+      };
+    in {
       # Behaviour tests for relock, run by `nix flake check`. They cover what shellcheck — already a
       # gate of every build — cannot see: the failure paths, where every defect this script had was
       # a silence. The instances under test are built by the SAME factory; the heads they name live in
@@ -145,6 +156,7 @@
           RELOCK_ORPHAN = "${relockOf "t-orphan" [ ]}/bin/relock";
           RELOCK_PEER = "${relockOf "peer" [ ]}/bin/relock";
           RELOCK_PEER2 = "${relockOf "peer2" [ ]}/bin/relock";
+          SWEEP = "${sweepConfigurations}/bin/sweep-configurations";
           RELOCK_TOOL_ID = self.lib.relockToolId;
           PLAN_JQ = ./nix/plan.jq;
         } ''
@@ -157,17 +169,7 @@
       # revision alone: `nix run .#sweep-configurations -- <checkout>`.
       apps.sweep-configurations = {
         type = "app";
-        program = "${
-          pkgs.writeShellApplication {
-            name = "sweep-configurations";
-            runtimeInputs = [ pkgs.coreutils pkgs.gitMinimal pkgs.jq pkgs.nix ];
-            text = builtins.readFile (
-              pkgs.replaceVars ./nix/sweep-configurations.sh {
-                configurationsNix = "${./nix/configurations.nix}";
-              }
-            );
-          }
-        }/bin/sweep-configurations";
+        program = "${sweepConfigurations}/bin/sweep-configurations";
         meta.description = "Prove that relock's neutralised measure of a flake's configurations does not move with the revision alone";
       };
 

@@ -13,12 +13,19 @@ if [ "$#" -ne 1 ] || ! git -C "$1" rev-parse --git-dir >/dev/null 2>&1; then
   exit 2
 fi
 src=$(cd "$1" && pwd -P)
-work=$(realpath "$(mktemp -d)")
+work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-git clone --quiet --no-local "$src" "$work/flake"
-measure() { # $1 neutralise (true|false) -> JSON
+# Checked out with every filter OFF, and read by REVISION — relock's two rules, for its two reasons: the
+# operator's global sops smudge would write the flake's secrets decrypted into the clone, and a
+# `git+file` reference without `rev` copies the tracked files from disk into the store.
+git clone --quiet --no-local --no-checkout "$src" "$work/flake"
+mkdir -p "$work/flake/.git/info" && echo '* -filter' > "$work/flake/.git/info/attributes"
+git -C "$work/flake" reset --quiet --hard
+shallow=""
+if [ "$(git -C "$work/flake" rev-parse --is-shallow-repository)" = true ]; then shallow="&shallow=1"; fi
+measure() { # $1 neutralise (true|false) -> JSON, of the clone's HEAD
   nix eval --json --impure --expr \
-    "import @configurationsNix@ { outputs = (builtins.getFlake \"git+file://$work/flake\").outputs; neutralise = $1; }"
+    "import @configurationsNix@ { outputs = (builtins.getFlake \"git+file://$work/flake?rev=$(git -C "$work/flake" rev-parse HEAD)$shallow\").outputs; neutralise = $1; }"
 }
 before_raw=$(measure false) || exit 1
 before=$(measure true) || exit 1

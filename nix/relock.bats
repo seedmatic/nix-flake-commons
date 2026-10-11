@@ -19,7 +19,7 @@ setup() {
   # read the operator's hooks or write the operator's config.
   export GIT_CONFIG_GLOBAL=$T/.gitconfig GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME=$T/.config
   mkdir -p "$T/bin" "$T/remote/seedmatic" "$T/gh"
-  for v in RELOCK RELOCK_AFTER RELOCK_ORPHAN RELOCK_PEER RELOCK_PEER2; do
+  for v in RELOCK RELOCK_AFTER RELOCK_ORPHAN RELOCK_PEER RELOCK_PEER2 SWEEP; do
     f=$(printf '%s' "$v" | tr 'A-Z_' 'a-z-')
     sed '/^export PATH=/d' "${!v}" > "$T/$f"
     chmod +x "$T/$f"
@@ -31,17 +31,29 @@ setup() {
   cat >> "$T/bin/nix" <<'FAKE'
 echo "$*" >> "$T/calls"
 printf '%s\n' "${NIX_CONFIG:-}" >> "$T/nix-config"
-# What nix does with a git+file flake whose path crosses a symlink: fine while the tree is clean,
-# refused once it is dirty — and a bumped lock makes it dirty.
+# What nix reads of a git+file flake (measured on nix 2.34.8). Given `rev`, the git objects — and a
+# shallow repository needs `shallow=1`. Without `rev`, the working tree's files FROM DISK, clean or
+# dirty: such a call is recorded, for the teardown to refuse, and refused like nix refuses it once
+# its path crosses a symlink and the tree is dirty. In whatever tree a call names, a smudged file is
+# recorded.
+rev=""
 for a in "$@"; do
   case $a in
-    *git+file://*) p=${a#*git+file://}; p=${p%%\"*} ;;
-    /*\#*) p=${a%%#*} ;;
+    *git+file://*) p=${a#*git+file://}; p=${p%%[\"#]*} ;;
+    /*\#*|.\#*) p=${a%%#*} ;;
     *) continue ;;
   esac
-  if [ -d "$p" ] && [ "$(cd "$p" && pwd -P)" != "$p" ] && [ -n "$(git -C "$p" status --porcelain --untracked-files=no)" ]; then
-    echo "error: path '$p' is a symlink" >&2; exit 1
+  q=""; case $p in *\?*) q=${p#*\?}; p=${p%%\?*} ;; esac
+  rev=$(sed -n 's/.*rev=\([0-9a-f]\{40\}\).*/\1/p' <<<"$q")
+  if [ -z "$rev" ]; then
+    echo "$a" >> "$T/worktree-refs"
+    if [[ $p == /* ]] && [ -d "$p" ] && [ "$(cd "$p" && pwd -P)" != "$p" ] && [ -n "$(git -C "$p" status --porcelain --untracked-files=no)" ]; then
+      echo "error: path '$p' is a symlink" >&2; exit 1
+    fi
+  elif [ "$(git -C "$p" rev-parse --is-shallow-repository)" = true ] && [[ $q != *shallow=1* ]]; then
+    echo "error: '$p' is a shallow Git repository, but shallow repositories are only allowed when \`shallow = true;\` is specified" >&2; exit 1
   fi
+  if [ -d "$p" ]; then grep -rlsF --exclude-dir=.git SMUDGED-PLAINTEXT "$p" >> "$T/smudged" || true; fi
 done
 case "$*" in
   *"#lib.relockToolId"*) printf '%s' "${STUB_TOOL_ID:-$RELOCK_TOOL_ID}" ;;
@@ -62,7 +74,7 @@ case "$*" in
     [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
     [ "${STUB_CONFIGS:-ok}" = fail ] && [ "${STUB_HAS_CONFIGS:-false}" = true ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
-    drv=$(cat "$T/drv"); [ "${STUB_DRV_FROM_LOCK:-}" = 1 ] && drv=$(cksum < "$p/flake.lock" | cut -d' ' -f1)
+    drv=$(cat "$T/drv"); [ "${STUB_DRV_FROM_LOCK:-}" = 1 ] && drv=$(git -C "$p" show "$rev:flake.lock" | cksum | cut -d' ' -f1)
     jq -n --arg d "$drv" --arg l "$(cat "$T/drv-linux")" --arg a "$(cat "$T/app-drv")" --arg c "$(cat "$T/cfg-drv")" \
       --arg expr "$*" --arg broken "${STUB_BROKEN_SYSTEM:-}" \
       --argjson haspk "$([ "${STUB_HAS_PACKAGES:-true}" = false ] && echo false || echo true)" \
@@ -84,6 +96,11 @@ case "$*" in
   *"github:seedmatic/peer2/develop#apps."*"relock.program"*) printf '%s' "$T/relock-peer2" ;;
   *"after-x.program"*) printf '%s' "$T/bin/after-x" ;;
   *"flake update"*)
+    # A flake read by revision has its lock written only where it is told to.
+    out=""; prev=""; for a in "$@"; do [ "$prev" = --output-lock-file ] && out=$a; prev=$a; done
+    [[ "$*" == *"--flake git+file://"* ]] || echo "flake update in $PWD" >> "$T/worktree-refs"
+    [ -n "$out" ] || { echo "error: cannot write modified lock file of flake (use '--output-lock-file')" >&2; exit 1; }
+    cd "$(dirname "$out")"
     case ${STUB_UPDATE:-none} in
       rev)    jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo d2 > "$T/drv" ;;
       # A new revision at each run.
@@ -130,6 +147,8 @@ case "$*" in
             jq '.nodes.a.locked.rev = "a2"' flake.lock > l && mv l flake.lock; echo d-a > "$T/drv" ;;
         esac ;;
     esac ;;
+  # sweep-configurations' measure: a flake with no configurations.
+  *"neutralise = "*) echo '{"nixos":{},"darwin":{}}' ;;
   *) echo "fake nix: unexpected call: $*" >&2; exit 99 ;;
 esac
 FAKE
@@ -209,6 +228,29 @@ LOCK
   # A requested run clones https://github.com/<repo>.git: send it to the local bare instead. A file://
   # url, because git ignores --depth for a plain local path: the clone must REALLY be shallow.
   git config --global url."file://$T/remote/seedmatic/t.git".insteadOf "https://github.com/seedmatic/t.git"
+}
+
+# The invariant of every case: nix is never handed a working tree.
+teardown() {
+  if [ -s "$T/worktree-refs" ]; then
+    echo "nix was handed a working tree:"
+    cat "$T/worktree-refs"
+    return 1
+  fi
+}
+
+# The operator's git as it is: a sops-like filter configured GLOBALLY, whose smudge writes a committed
+# secret decrypted into every checkout — here, a marker the fake nix looks for in each tree it is
+# handed. The checkout under test is checked out through it again, so it holds the plaintext.
+smudging_secret() {
+  git config --global filter.fakesops.smudge 'sed s/ENCRYPTED/SMUDGED-PLAINTEXT/'
+  git config --global filter.fakesops.clean 'sed s/SMUDGED-PLAINTEXT/ENCRYPTED/'
+  git config --global filter.fakesops.required true
+  echo 'secret filter=fakesops' > "$T/work/.gitattributes"
+  echo ENCRYPTED > "$T/work/secret"
+  git -C "$T/work" add .gitattributes secret && git -C "$T/work" commit -qm secret && git -C "$T/work" push -q 2>/dev/null
+  rm "$T/work/secret" && git -C "$T/work" checkout -q -- secret
+  grep -q SMUDGED-PLAINTEXT "$T/work/secret"
 }
 
 # A file of a head on the fake GitHub, from stdin.
@@ -551,6 +593,49 @@ LOCK
   [[ "$output" != *"is a symlink"* ]]
   [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
   [ "$(git -C "$T/remote/seedmatic/t.git" rev-parse "develop^")" = "$before" ]
+}
+
+# ── what nix reads ─────────────────────────────────────────────────────────────────────────────────
+
+@test "a requested run checks its clone out with no filter: the operator's smudge never writes there" {
+  smudging_secret
+  mkdir -p "$T/outside" && cd "$T/outside"
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cloned at develop"* ]]
+  [[ "$output" == *"BUMPED"* ]]
+  grep -q 'relock:measure.*git+file://[^?]*/t?rev=[0-9a-f]*&shallow=1' "$T/calls"
+  [ ! -s "$T/smudged" ]
+}
+
+@test "a smudged checkout is read by revision only: nix never sees its working tree" {
+  smudging_secret
+  STUB_UPDATE=rev run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  grep -q 'relock:measure.*git+file://[^?]*/work?rev=' "$T/calls"
+  grep -q 'flake update a --flake git+file://[^?]*/work?rev=' "$T/calls"
+  [ ! -s "$T/worktree-refs" ]
+}
+
+@test "a bump is measured on a commit no ref names, which carries it — and that is what gets committed" {
+  STUB_DRV_FROM_LOCK=1 STUB_UPDATE=rev run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED"* ]]
+  m=$(grep 'relock:measure' "$T/calls" | tail -1 | sed -n 's/.*?rev=\([0-9a-f]\{40\}\).*/\1/p')
+  [ "$(git -C "$T/work" show "$m:flake.lock" | jq -r .nodes.a.locked.rev)" = r2 ]
+  [ -z "$(git -C "$T/work" for-each-ref --contains "$m")" ]
+  [ "$(git -C "$T/work" rev-parse 'HEAD^{tree}')" = "$(git -C "$T/work" rev-parse "$m^{tree}")" ]
+}
+
+@test "sweep clones with no filter and measures revisions: the operator's smudge never reaches nix" {
+  smudging_secret
+  run "$T/sweep" "$T/work"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"0 configurations"* ]]
+  grep -q 'neutralise = true.*' "$T/calls"
+  grep -q 'git+file://[^?]*/flake?rev=' "$T/calls"
+  [ ! -s "$T/smudged" ]
 }
 
 # ── the token ──────────────────────────────────────────────────────────────────────────────────────
