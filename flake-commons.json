@@ -1,0 +1,26 @@
+{
+  "schema": "seedmatic.relock/v1",
+  "head": "flake-commons",
+  "rev": "f994a3f785a72ace4100a500576bf95019b2cd39",
+  "status": {
+    "wave": "flake-commons@2026-10-11T09:19:47Z",
+    "tool": "3441528c8710e06d3fb518a0ec7f7bf8697b0a380245e74d765d35f0253eeb66",
+    "bumped": {
+      "flox": [
+        "0876a444cb836c746a5339239b9dcc324bdf9d92",
+        "744c37e325c194aec80cccf1074f14c7baa594c7"
+      ],
+      "nixpkgs-unstable": [
+        "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8",
+        "6510408d147d8c5e6d76043e899e9251756f6a75"
+      ],
+      "sops-nix": [
+        "dcd241ba97088c22569d1573286e1b9daad340c0",
+        "a8be3b14935d3532604c51c8dfe3021c73d1a885"
+      ]
+    },
+    "dropped": [],
+    "after": [],
+    "unmeasured": []
+  }
+}
