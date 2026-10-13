@@ -640,6 +640,8 @@ lock_commit() {
   blob=$(git -C "$REPO" hash-object -w flake.lock) || return 1
   GIT_INDEX_FILE=$work/measure.index git -C "$REPO" update-index --add --cacheinfo "100644,$blob,flake.lock" || return 1
   tree=$(GIT_INDEX_FILE=$work/measure.index git -C "$REPO" write-tree) || return 1
+  # Unsigned on purpose: no ref names it and it is never pushed — the bump that lands is the signed
+  # `git commit` below, a commit of its own.
   git -C "$REPO" commit-tree "$tree" -p HEAD -m "relock: a bumped lock, measured"
 }
 
@@ -753,7 +755,7 @@ relock_input() { # $1 input name
     dropped+=("$1")
     echo "moved, NO derivation impact -> dropped"
   else
-    if ! git -C "$REPO" commit -q -m "chore(flake): relock $1" -- flake.lock; then
+    if ! git -C "$REPO" commit -q -S -m "chore(flake): relock $1" -- flake.lock; then
       git -C "$REPO" checkout -q -- flake.lock
       echo "FAILED to commit the bump — lock restored"
       return 1
@@ -786,7 +788,7 @@ after_input() { # $1 app name
   fi
   rm -f "$err"
   mapfile -t moved < <(git -C "$REPO" diff --name-only)
-  if [ "${#moved[@]}" -gt 0 ] && ! git -C "$REPO" commit -q -m "chore(relock): $1 after inputs" -- "${moved[@]}"; then
+  if [ "${#moved[@]}" -gt 0 ] && ! git -C "$REPO" commit -q -S -m "chore(relock): $1 after inputs" -- "${moved[@]}"; then
     git -C "$REPO" checkout -q -- "${moved[@]}"
     echo "FAILED to commit what $1 changed — restored"
     return 1
@@ -835,10 +837,13 @@ write_trace() { # $1 the pushed revision
     blob=$(printf '%s\n' "$json" | git -C "$tmp/trace.git" hash-object -w --stdin) || break
     GIT_INDEX_FILE="$tmp/index" git -C "$tmp/trace.git" update-index --add --cacheinfo "100644,$blob,@repoName@.json" || break
     tree=$(GIT_INDEX_FILE="$tmp/index" git -C "$tmp/trace.git" write-tree) || break
+    # -S on every commit relock pushes, and no unsigned fallback: the remotes refuse an unsigned
+    # push, and commit-tree ignores commit.gpgSign (measured, git 2.54), so the config alone signs
+    # nothing here. A signature that cannot be made fails the trace, never weakens it.
     if [ -n "$base" ]; then
-      commit=$(git -C "$tmp/trace.git" commit-tree "$tree" -p "$base" -m "relock(@repoName@): trace of ${1:0:9}") || break
+      commit=$(git -C "$tmp/trace.git" commit-tree -S "$tree" -p "$base" -m "relock(@repoName@): trace of ${1:0:9}") || break
     else
-      commit=$(git -C "$tmp/trace.git" commit-tree "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || break
+      commit=$(git -C "$tmp/trace.git" commit-tree -S "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || break
     fi
     # One retry: another head of this repository may have written its trace in between.
     if git -C "$tmp/trace.git" push -q "$url" "$commit:refs/heads/fabric/relock"; then

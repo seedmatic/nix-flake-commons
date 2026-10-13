@@ -18,6 +18,10 @@ setup() {
   # git's global and system configs are the test's own: a run outside the build sandbox must never
   # read the operator's hooks or write the operator's config.
   export GIT_CONFIG_GLOBAL=$T/.gitconfig GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME=$T/.config
+  # relock signs every commit it pushes (-S): a throwaway ssh key is the test's signer.
+  ssh-keygen -q -t ed25519 -N '' -C relock-test -f "$T/signing" >/dev/null
+  git config --global gpg.format ssh
+  git config --global user.signingkey "$T/signing.pub"
   mkdir -p "$T/bin" "$T/remote/seedmatic" "$T/gh"
   for v in RELOCK RELOCK_AFTER RELOCK_ORPHAN RELOCK_PEER RELOCK_PEER2 SWEEP; do
     f=$(printf '%s' "$v" | tr 'A-Z_' 'a-z-')
@@ -291,6 +295,7 @@ tree_clean()     { [ -z "$(git -C "$T/work" status --porcelain --untracked-files
 lock_unchanged() { git -C "$T/work" diff --quiet HEAD -- flake.lock; }
 remote_rev() { git -C "$T/remote/seedmatic/t.git" rev-parse --verify -q "refs/heads/$1" || echo none; }
 trace_of() { git -C "$T/remote/seedmatic/${2:-t}.git" show "fabric/relock:$1.json" 2>/dev/null; }
+signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^gpgsig -----BEGIN SSH SIGNATURE'; }
 
 # ── who this relock is ─────────────────────────────────────────────────────────────────────────────
 
@@ -801,6 +806,34 @@ LOCK
   [ "$(jq -r .head <<<"$(trace_of t)")" = t ]
   [ "$(jq -r .head <<<"$(trace_of t-orphan)")" = t-orphan ]
   [ "$(jq -r .rev <<<"$(trace_of t-orphan)")" = "$(remote_rev t-orphan/develop)" ]
+}
+
+@test "every commit relock pushes is signed: the bump and the trace" {
+  before=$(remote_rev develop)
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  pushed=$(git -C "$T/remote/seedmatic/t.git" rev-list "$before..develop")
+  [ -n "$pushed" ]
+  for c in $pushed "$(remote_rev fabric/relock)"; do signed "$c"; done
+}
+
+@test "an after-inputs commit is signed too" {
+  before=$(remote_rev develop)
+  STUB_UPDATE=rev STUB_AFTER=ok run "$T/relock-after"
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$T/remote/seedmatic/t.git" rev-list --count "$before..develop")" -eq 2 ]
+  for c in $(git -C "$T/remote/seedmatic/t.git" rev-list "$before..develop"); do signed "$c"; done
+}
+
+@test "a signature that cannot be made commits and pushes NOTHING — no unsigned fallback" {
+  git config --global user.signingkey "$T/no-such-key.pub"
+  before=$(remote_rev develop)
+  STUB_UPDATE=rev run "$T/relock" inputs
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FAILED to commit the bump — lock restored"* ]]
+  [ "$(remote_rev develop)" = "$before" ]
+  [ "$(remote_rev fabric/relock)" = none ]
+  lock_unchanged
 }
 
 @test "a run that commits nothing writes no trace" {

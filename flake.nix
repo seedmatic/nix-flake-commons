@@ -150,7 +150,7 @@
           relockOf = name: afterInputs: self.lib.mkRelockApp { inherit pkgs name afterInputs; };
         in
         pkgs.runCommand "relock-bats" {
-          nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq ];
+          nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq pkgs.openssh ];
           RELOCK = "${relockOf "t" [ ]}/bin/relock";
           RELOCK_AFTER = "${relockOf "t" [ "after-x" ]}/bin/relock";
           RELOCK_ORPHAN = "${relockOf "t-orphan" [ ]}/bin/relock";
