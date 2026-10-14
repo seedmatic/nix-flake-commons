@@ -412,8 +412,10 @@ signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^g
 @test "a bump that moves a package is carried" {
   STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 0 ]
-  [[ "$output" == *"BUMPED"* ]]
+  [[ "$output" == *"BUMPED — derivations moved"* ]]
+  [[ "$output" != *"no derivation moved"* ]]
   [ "$(relock_commits)" -eq 1 ]
+  [ "$(jq -c '.status.pruned' <<<"$(trace_of t)")" = '{}' ]
 }
 
 @test "a bump that moves ONLY an app's program is carried — relock ships itself that way" {
@@ -473,7 +475,9 @@ signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^g
   before=$(remote_rev develop)
   STUB_HAS_CONFIGS=true STUB_UPDATE=pruned run "$T/relock" inputs
   [ "$status" -eq 0 ]
-  [[ "$output" == *"BUMPED — no derivation moved, but the lock lost 1 locked node(s)"* ]]
+  [[ "$output" == *"BUMPED — no derivation moved, but the lock lost 1 locked node(s): x"* ]]
+  git -C "$T/work" log -1 --format=%b | grep -q "the lock lost 1 locked node(s): x"
+  [ "$(jq -r '.status.pruned.a | join(",")' <<<"$(trace_of t)")" = x ]
   [ "$(relock_commits)" -eq 1 ]
   ! git -C "$T/work" show HEAD:flake.lock | jq -e '.nodes.x' >/dev/null
   [ "$(remote_rev develop)" != "$before" ]

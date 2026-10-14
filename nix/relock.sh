@@ -677,6 +677,8 @@ retrying=0
 
 # What this run carried and dropped, for its trace.
 bumped='{}'
+# input -> the sources its bump removed from the lock, for a bump carried with no derivation moved.
+pruned_by='{}'
 dropped=()
 after_done=()
 
@@ -753,8 +755,16 @@ relock_input() { # $1 input name
   # A bump that moves nothing exported is dropped — unless the lock LOST locked sources: an input
   # dropped upstream (bird, a private claude-hub) leaves its nodes in every consumer's lock, and only a
   # carried bump removes them. Moving nothing is then the point, not churn.
-  local pruned=0 nodes_before nodes_after
+  local pruned=0 nodes_before nodes_after lost="" moved=1
+  # A source is what a node fetches: owner/repo, else its url without the query, else its path, else
+  # the node's own name. Lost = in HEAD's lock and in no node of the new one — named in the commit
+  # and the trace, so a "nothing moved" bump shows exactly what it removed.
+  # shellcheck disable=SC2016  # jq's own interpolation, not the shell's
+  local sources='[.nodes | to_entries[] | select(.value.locked) | .value.locked as $l
+    | if $l.owner then "\($l.owner)/\($l.repo)" elif $l.url then ($l.url | sub("[?].*$"; ""))
+      elif $l.path then $l.path else .key end] | unique'
   if [ "$after" = "$baseline" ]; then
+    moved=0
     if ! nodes_before=$(git -C "$REPO" show HEAD:flake.lock | jq '[.nodes[] | select(.locked)] | length') \
       || ! nodes_after=$(jq '[.nodes[] | select(.locked)] | length' "$REPO/flake.lock"); then
       git -C "$REPO" checkout -q -- flake.lock
@@ -762,13 +772,21 @@ relock_input() { # $1 input name
       return 1
     fi
     pruned=$((nodes_before - nodes_after))
+    if [ "$pruned" -gt 0 ] && ! lost=$(jq -rn --argjson a "$(git -C "$REPO" show HEAD:flake.lock | jq -c "$sources")" \
+      --argjson b "$(jq -c "$sources" "$REPO/flake.lock")" '$a - $b | join(", ")'); then
+      git -C "$REPO" checkout -q -- flake.lock
+      echo "FAILED to name the lock's lost sources — bump NOT carried"
+      return 1
+    fi
   fi
   if [ "$after" = "$baseline" ] && [ "$pruned" -le 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     dropped+=("$1")
     echo "moved, NO derivation impact -> dropped"
   else
-    if ! git -C "$REPO" commit -q -S -m "chore(flake): relock $1" -- flake.lock; then
+    local -a body=()
+    if [ "$moved" = 0 ]; then body=(-m "No exported derivation moved; the lock lost ${pruned} locked node(s): ${lost:-unnamed}."); fi
+    if ! git -C "$REPO" commit -q -S -m "chore(flake): relock $1" "${body[@]}" -- flake.lock; then
       git -C "$REPO" checkout -q -- flake.lock
       echo "FAILED to commit the bump — lock restored"
       return 1
@@ -776,8 +794,9 @@ relock_input() { # $1 input name
     baseline=$after
     committed=1
     bumped=$(jq -c --arg i "$1" --arg b "$before" --arg a "$(lockrev "$REPO/flake.lock" "$1")" '. + { ($i): [ $b, $a ] }' <<<"$bumped")
-    if [ "$after" = "$baseline" ]; then
-      echo "BUMPED — no derivation moved, but the lock lost $pruned locked node(s)"
+    if [ "$moved" = 0 ]; then
+      pruned_by=$(jq -c --arg i "$1" --arg l "$lost" '. + { ($i): ($l | split(", ")) }' <<<"$pruned_by")
+      echo "BUMPED — no derivation moved, but the lock lost $pruned locked node(s): ${lost:-unnamed}"
     else
       echo "BUMPED — derivations moved"
     fi
@@ -828,9 +847,9 @@ write_trace() { # $1 the pushed revision
   url=$(git -C "$REPO" remote get-url origin) || return 1
   json=$(jq -n --arg h "@repoName@" --arg r "$1" --arg w "${RELOCK_PASS_WAVE:-@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     --arg t "@toolId@" --argjson b "$bumped" --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
-    --argjson u "$(json_list "${unmeasured[@]}")" --argjson s "$SECONDS" \
+    --argjson u "$(json_list "${unmeasured[@]}")" --argjson s "$SECONDS" --argjson pr "$pruned_by" \
     '{ schema: "seedmatic.relock/v1", head: $h, rev: $r,
-       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a, unmeasured: $u, seconds: $s } }')
+       status: { wave: $w, tool: $t, bumped: $b, pruned: $pr, dropped: $d, after: $a, unmeasured: $u, seconds: $s } }')
   # A repository of its own: a shallow fetch into the operator's would make it SHALLOW, and in the
   # bare store that is the common dir of every worktree of the repo.
   tmp=$(mktemp -d)
