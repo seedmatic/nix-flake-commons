@@ -16,6 +16,7 @@ downstream=0
 jobs=4
 nopush=0
 planonly=0
+script=0
 targets=()
 
 for a in "$@"; do
@@ -23,6 +24,7 @@ for a in "$@"; do
     --downstream) downstream=1 ;;
     --no-push) nopush=1 ;;
     --plan) planonly=1 ;;
+    --script) script=1 ;;
     --jobs=*)
       jobs=${a#--jobs=}
       [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "relock: --jobs wants a count of heads, not '$jobs'" >&2; exit 2; }
@@ -32,7 +34,7 @@ for a in "$@"; do
     --format=*) echo "relock: unknown format '${a#--format=}' (text, jsonl)" >&2; exit 2 ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream [--jobs=N] | --no-push | --plan] [--format=text|jsonl] [target...]
+relock [--downstream [--jobs=N] | --no-push | --plan [--script]] [--format=text|jsonl] [target...]
 
 Reconcile this head's lock. No target = ALL of it.
 
@@ -59,6 +61,10 @@ one's words are kept and shown whole, in the plan's order, when its level ends. 
 Exit 75: everything landed, but a trace could not be written (the heads that pin it still run).
 A pass runs ONE relock everywhere: each head's is built FROM the pass's tool (`lib.relockOf`), never
 through the head's own flake, and a relock of any other code refuses.
+--plan --script prints, instead, a bash script that plays the plan's EDGES with no relock at all: each
+head in order is cloned, its edges updated by revision through its own registry, committed signed and
+pushed. No measure, no guard: the fallback for when no relock can be built. Read `relock --plan`'s
+gaps after it.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
 --format=jsonl prints one JSON line per event on stdout — a pass's start, each head run (its verdicts,
@@ -76,6 +82,10 @@ USAGE
 done
 # A head only ever sees what is pushed, so playing a pass after a run that pushed nothing would
 # relock the next heads against the revision this run did NOT carry — and report success.
+if [ "$script" = 1 ] && [ "$planonly" = 0 ]; then
+  echo "relock: --script prints a plan as a script: it goes with --plan" >&2
+  exit 2
+fi
 if [ "$nopush" = 1 ] && [ "$downstream" = 1 ]; then
   echo "relock: --no-push and --downstream contradict each other — a head sees only what is pushed" >&2
   exit 2
@@ -427,6 +437,51 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   fi
   jq --arg id "@toolId@" --arg ref "$tool_ref" '. + { tool: { id: $id, ref: $ref } }' "$plan" > "$work/plan.next" && mv "$work/plan.next" "$plan"
 
+  if [ "$script" = 1 ]; then
+    if jq -e '.errors | length > 0' "$plan" >/dev/null; then
+      echo "relock(@repoName@): NO SCRIPT — the plan fails:" >&2
+      jq -r '.errors[] | "  " + .' "$plan" >&2
+      exit 1
+    fi
+    # The fallback, generated from the plan so it cannot drift from it: the edges only, head by head in
+    # the plan's order. It stops at the first failure, since what pins a failed head must not move.
+    cat <<'SCRIPT'
+#!/usr/bin/env bash
+SCRIPT
+    jq -r '"# relock --plan --script, from \(.start): the edges of \(.order | length) head(s), in the plan'"'"'s order, with no relock."' "$plan"
+    cat <<'SCRIPT'
+# Each head is cloned shallow with every git filter off, its edges updated BY REVISION through its own
+# registry, committed signed and pushed. No measure and no guard: read `relock --plan`'s gaps after.
+set -euo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+edges() { # $1 head id  $2 owner/repo  $3 branch, then its edge inputs
+  local id=$1 repo=$2 branch=$3 dir="$work/$1" rev shallow="" names
+  local -a reg=()
+  shift 3
+  echo "== $id: $* =="
+  git clone -q --depth=1 --no-checkout --branch "$branch" "https://github.com/$repo.git" "$dir"
+  mkdir -p "$dir/.git/info" && echo '* -filter' > "$dir/.git/info/attributes"
+  git -C "$dir" reset -q --hard
+  if [ -f "$dir/flake-registry.local.json" ]; then reg=(--flake-registry "$dir/flake-registry.local.json")
+  elif [ -f "$dir/flake-registry.json" ]; then reg=(--flake-registry "$dir/flake-registry.json"); fi
+  rev=$(git -C "$dir" rev-parse HEAD)
+  if [ "$(git -C "$dir" rev-parse --is-shallow-repository)" = true ]; then shallow="&shallow=1"; fi
+  nix "${reg[@]}" flake update "$@" --flake "git+file://$dir?rev=$rev$shallow" --output-lock-file "$dir/flake.lock" --refresh
+  if git -C "$dir" diff --quiet -- flake.lock; then echo "  already current"; return; fi
+  names=$(printf '%s, ' "$@"); names=${names%, }
+  git -C "$dir" commit -q -S -m "chore(flake): relock edges ($names)" -- flake.lock
+  git -C "$dir" push -q
+  echo "  pushed $(git -C "$dir" rev-parse --short HEAD)"
+}
+SCRIPT
+    jq -r '. as $p | .order[] as $id
+      | [ $p.edges[] | select(.from == $id) | .input ] | unique as $e
+      | if ($e | length) == 0 then "# \($id): no edge"
+        else "edges " + ([ $id, $p.heads[$id].repo, $p.heads[$id].branch ] + $e | map(@sh) | join(" ")) end' "$plan"
+    echo 'echo "done — now read the gaps: relock --plan"'
+    exit 0
+  fi
   if [ "$planonly" = 1 ]; then
     # Whether the fabric is aligned NOW: the question a plan can answer in seconds, with no pass.
     gaps=$(alignment_gaps "$locks") || gaps='["the alignment could not be judged"]'

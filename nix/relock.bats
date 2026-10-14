@@ -1126,6 +1126,36 @@ LOCK
   [[ "$output" == *"--jobs wants a count of heads, not '0'"* ]]
 }
 
+@test "--plan --script plays the plan's edges with no relock, and the fabric ends aligned" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  run "$T/relock" --plan --script
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" > "$T/fallback.sh"
+  bash -n "$T/fallback.sh"
+  grep -qx "edges 'peer' 'seedmatic/peer' 'develop' 'flake-commons' 't'" "$T/fallback.sh"
+  grep -qx "edges 'peer2' 'seedmatic/peer2' 'develop' 'flake-commons' 'peer'" "$T/fallback.sh"
+  [ "$(grep -n "^edges 'peer' " "$T/fallback.sh" | cut -d: -f1)" -lt "$(grep -n "^edges 'peer2' " "$T/fallback.sh" | cut -d: -f1)" ]
+  never_updated
+  run bash "$T/fallback.sh"
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$T/remote/seedmatic/peer.git" log -1 --format=%s develop)" = "chore(flake): relock edges (flake-commons, t)" ]
+  git -C "$T/remote/seedmatic/peer2.git" cat-file commit develop | grep -q '^gpgsig -----BEGIN SSH SIGNATURE'
+  run "$T/relock" --plan
+  [ "$(jq -c '[.gaps[] | select(test("^peer"))]' <<<"$output")" = '[]' ]
+}
+
+@test "--script goes with --plan only, and a plan that fails prints no script" {
+  run "$T/relock" --script
+  [ "$status" -eq 2 ]
+  lock_of t develop peer
+  run "$T/relock" --plan --script
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"NO SCRIPT — the plan fails"* ]]
+  [[ "$output" != *"#!/usr/bin/env bash"* ]]
+}
+
 @test "a tip that cannot be read fails the alignment, never passes it" {
   mk_orphan
   git -C "$T/work" checkout -q develop
