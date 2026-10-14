@@ -750,7 +750,20 @@ relock_input() { # $1 input name
     echo "FAILED to measure impact — bump NOT carried"
     return 1
   fi
+  # A bump that moves nothing exported is dropped — unless the lock LOST locked sources: an input
+  # dropped upstream (bird, a private claude-hub) leaves its nodes in every consumer's lock, and only a
+  # carried bump removes them. Moving nothing is then the point, not churn.
+  local pruned=0 nodes_before nodes_after
   if [ "$after" = "$baseline" ]; then
+    if ! nodes_before=$(git -C "$REPO" show HEAD:flake.lock | jq '[.nodes[] | select(.locked)] | length') \
+      || ! nodes_after=$(jq '[.nodes[] | select(.locked)] | length' "$REPO/flake.lock"); then
+      git -C "$REPO" checkout -q -- flake.lock
+      echo "FAILED to count the lock's nodes — bump NOT carried"
+      return 1
+    fi
+    pruned=$((nodes_before - nodes_after))
+  fi
+  if [ "$after" = "$baseline" ] && [ "$pruned" -le 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     dropped+=("$1")
     echo "moved, NO derivation impact -> dropped"
@@ -763,7 +776,11 @@ relock_input() { # $1 input name
     baseline=$after
     committed=1
     bumped=$(jq -c --arg i "$1" --arg b "$before" --arg a "$(lockrev "$REPO/flake.lock" "$1")" '. + { ($i): [ $b, $a ] }' <<<"$bumped")
-    echo "BUMPED — derivations moved"
+    if [ "$after" = "$baseline" ]; then
+      echo "BUMPED — no derivation moved, but the lock lost $pruned locked node(s)"
+    else
+      echo "BUMPED — derivations moved"
+    fi
   fi
 }
 

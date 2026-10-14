@@ -137,6 +137,9 @@ case "$*" in
         esac ;;
       app-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo app2 > "$T/app-drv" ;;
       nested) jq '.nodes.x.locked.rev = "x2"' flake.lock > l && mv l flake.lock ;;
+      # `a` drops its input `x` upstream: x's node and the follows through it leave the lock, no
+      # derivation moves — a lock-only cleanup (bird, claude-hub).
+      pruned) jq 'del(.nodes.x) | del(.nodes.a.inputs.x) | del(.nodes.root.inputs.f)' flake.lock > l && mv l flake.lock ;;
       path)   jq '.nodes.a.locked = {"type":"path","path":"/somewhere/local"}' flake.lock > l && mv l flake.lock ;;
       garbage) echo 'not json at all' > flake.lock ;;
       cached)  echo "warning: error: unable to download 'https://api.github.com/repos/o/r/commits/HEAD': HTTP error 404; using cached version" >&2 ;;
@@ -464,6 +467,17 @@ signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^g
   [ "$status" -eq 0 ]
   [[ "$output" == *"BUMPED"* ]]
   [ "$(relock_commits)" -eq 1 ]
+}
+
+@test "an input dropped upstream: the bump moves nothing, the node goes, the bump is CARRIED" {
+  before=$(remote_rev develop)
+  STUB_HAS_CONFIGS=true STUB_UPDATE=pruned run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED — no derivation moved, but the lock lost 1 locked node(s)"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+  ! git -C "$T/work" show HEAD:flake.lock | jq -e '.nodes.x' >/dev/null
+  [ "$(remote_rev develop)" != "$before" ]
+  [ "$(jq -r '.status.bumped | keys | join(",")' <<<"$(trace_of t)")" = a ]
 }
 
 @test "aggregator: a follows root input is left out of the impact projection" {
