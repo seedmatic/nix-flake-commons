@@ -3,21 +3,19 @@
 # docs/architecture/fabric/relock-bootstrap-spec.adoc; built by nix-flake-commons' `lib.mkRelockApp`.
 #
 # Build-time tokens (written WITHOUT at-sigils here so replaceVars does not substitute them in this
-# comment): repoName (the head's id in fabric/heads), system, afterInputs, toolId, toolSlug, planJq,
+# comment): repoName (the head's id in fabric/heads), system, toolId, toolSlug, planJq,
 # configurationsNix.
 #
 # ★ WHY the name is identical in every repo: propagation is a REQUEST, and the caller must know
 # nothing about the callee beyond its name. The same reasoning applies one level down, to the
 # implementation: if each repo wrote its own, "the same rule everywhere" would be a claim nobody could
-# check. So the rule lives once, and each head supplies only what is ITS OWN: its id, and the apps it
-# runs after its inputs.
+# check. So the rule lives once, and each head supplies only what is ITS OWN: its id. The apps it runs
+# after its inputs are its entry's `after` in fabric/heads, read at run time like the rest of it.
 
 downstream=0
 nopush=0
 planonly=0
 targets=()
-
-afterInputs=(@afterInputs@)
 
 for a in "$@"; do
   case $a in
@@ -35,7 +33,7 @@ Reconcile this head's lock. No target = ALL of it.
 
   inputs            every flake input          -> flake.lock
   <input-name>      one input, by its name in flake.lock
-  after             the apps this head runs after its inputs (afterInputs)
+  after             the apps this head runs after its inputs (its `after` in fabric/heads)
 
 An input bump that moves no exported derivation (packages, apps, configurations with their revision
 neutralised) is DROPPED, not carried. After a push, the trace of the change is written on this repo's
@@ -47,8 +45,8 @@ API. A cycle, an id that is not a head, or an id that resolves elsewhere fails i
 --downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
 plan's order; a head that pins a failed head is not run. The pass ends non-zero naming every failure.
 Exit 75: everything landed, but a trace could not be written (the heads that pin it still run).
-A pass runs ONE relock everywhere: each head's is built with `--override-input flake-commons` on the
-pass's tool, and a relock of any other code refuses.
+A pass runs ONE relock everywhere: each head's is built FROM the pass's tool (`lib.relockOf`), never
+through the head's own flake, and a relock of any other code refuses.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
 --format=jsonl prints one JSON line per event on stdout — a pass's start, each head run (its verdicts,
@@ -57,7 +55,7 @@ a human on stderr. A pass hands the channel to every head's relock, so a whole p
 
 GitHub token: read from `gh auth token` at each run and handed ONLY to relock's own nix and API calls,
 as extra-access-tokens appended to NIX_CONFIG, and to curl on its stdin. Never written anywhere, never
-exported, and never passed to the programs relock runs (afterInputs apps, another head's relock).
+exported, and never passed to the programs relock runs (after-inputs apps, another head's relock).
 USAGE
       exit 0 ;;
     -*) echo "relock: unknown flag '$a' (try --help)" >&2; exit 2 ;;
@@ -138,8 +136,8 @@ api_raw() { # $1 owner/repo  $2 branch  $3 path -> the file on stdout
 
 # An app's program, BUILT with the token, so that running it afterwards needs no fetch and gets no
 # token. `nix build` refuses the program string itself, so its context's derivations are built.
-# Empty but for another head's relock, which is built on the pass's tool. An override never writes a
-# lock: nothing here passes --commit-lock-file.
+# Empty but in a pass, where a head's after-inputs app is built on the pass's tool. An override never
+# writes a lock: nothing here passes --commit-lock-file.
 tool_override=()
 # What nix says when it answers from a copy instead of the network — the tarball fetcher's two, and the
 # git fetcher's two (nix-fetchers 2.34.8), none of which makes it fail.
@@ -155,14 +153,15 @@ cache_refused() { # $1 nix's stderr -> 0 when nix fell back to a cache, said
   fi
   return 1
 }
-app_program() { # $1 app installable (flake#apps.<system>.<name>) -> program path on stdout
-  local prog d ctx err
+app_program() { # $1 installable, $2 the function from its value to an app, then nix's flags -> program path on stdout
+  local inst=$1 to_app=$2 prog d ctx err
   local -a drvs=()
+  shift 2
   err=$(mktemp)
-  if ! prog=$(nix eval --raw --refresh "${tool_override[@]}" "$1.program" 2>"$err") || cache_refused "$err"; then
+  if ! prog=$(nix eval --raw --refresh "$@" "$inst" --apply "v: (($to_app) v).program" 2>"$err") || cache_refused "$err"; then
     grep -v '^evaluation warning' "$err" >&2 || true; rm -f "$err"; return 1
   fi
-  if ! ctx=$(nix eval --json --refresh "${tool_override[@]}" "$1.program" --apply 'p: builtins.attrNames (builtins.getContext p)' 2>"$err") || cache_refused "$err"; then
+  if ! ctx=$(nix eval --json --refresh "$@" "$inst" --apply "v: builtins.attrNames (builtins.getContext (($to_app) v).program)" 2>"$err") || cache_refused "$err"; then
     grep -v '^evaluation warning' "$err" >&2 || true; rm -f "$err"; return 1
   fi
   rm -f "$err"
@@ -253,6 +252,11 @@ if [ -z "$selfRepo" ] || [ "$selfKind" != code ]; then
   echo "REFUSING: '@repoName@' is not a code head of fabric/heads — a relock's name is its head's id" >&2
   exit 1
 fi
+if ! jq -e '.["@repoName@"].after // [] | type == "array" and all(type == "string" and test("^[A-Za-z0-9_-]+$"))' "$heads" >/dev/null; then
+  echo "REFUSING: the \`after\` of '@repoName@' in fabric/heads is not a list of app names" >&2
+  exit 1
+fi
+mapfile -t afterInputs < <(jq -r '.["@repoName@"].after // [] | .[]' "$heads")
 toolSlug="@toolSlug@"
 
 # A checkout BELONGS to this head when it is a checkout of the head's repository on the head's
@@ -429,9 +433,10 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
       # The start's own relock, by the very program running here, in the operator's checkout.
       ( cd "$here" && RELOCK_HEAD="$id" "$0" "${targets[@]}" ) || rc=$?
     else
-      repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
-      branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
-      if ! prog=$(app_program "github:$repo/$branch#apps.@system@.relock"); then
+      # From the tool, never through the head's flake: that one locks the head's OLD pins, which the new
+      # tool may no longer satisfy (an input the tool dropped, followed by an old pin of another head),
+      # and the head could then never take the bump that repairs them.
+      if ! prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\""); then
         echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
         rc=1
       else
@@ -677,6 +682,8 @@ retrying=0
 
 # What this run carried and dropped, for its trace.
 bumped='{}'
+# input -> the sources its bump removed from the lock, for a bump carried with no derivation moved.
+pruned_by='{}'
 dropped=()
 after_done=()
 
@@ -750,12 +757,41 @@ relock_input() { # $1 input name
     echo "FAILED to measure impact — bump NOT carried"
     return 1
   fi
+  # A bump that moves nothing exported is dropped — unless the lock LOST locked sources: an input
+  # dropped upstream (bird, a private claude-hub) leaves its nodes in every consumer's lock, and only a
+  # carried bump removes them. Moving nothing is then the point, not churn.
+  local pruned=0 nodes_before nodes_after lost="" moved=1
+  # A source is what a node fetches: owner/repo, else its url without the query, else its path, else
+  # the node's own name. Lost = in HEAD's lock and in no node of the new one — named in the commit
+  # and the trace, so a "nothing moved" bump shows exactly what it removed.
+  # shellcheck disable=SC2016  # jq's own interpolation, not the shell's
+  local sources='[.nodes | to_entries[] | select(.value.locked) | .value.locked as $l
+    | if $l.owner then "\($l.owner)/\($l.repo)" elif $l.url then ($l.url | sub("[?].*$"; ""))
+      elif $l.path then $l.path else .key end] | unique'
   if [ "$after" = "$baseline" ]; then
+    moved=0
+    if ! nodes_before=$(git -C "$REPO" show HEAD:flake.lock | jq '[.nodes[] | select(.locked)] | length') \
+      || ! nodes_after=$(jq '[.nodes[] | select(.locked)] | length' "$REPO/flake.lock"); then
+      git -C "$REPO" checkout -q -- flake.lock
+      echo "FAILED to count the lock's nodes — bump NOT carried"
+      return 1
+    fi
+    pruned=$((nodes_before - nodes_after))
+    if [ "$pruned" -gt 0 ] && ! lost=$(jq -rn --argjson a "$(git -C "$REPO" show HEAD:flake.lock | jq -c "$sources")" \
+      --argjson b "$(jq -c "$sources" "$REPO/flake.lock")" '$a - $b | join(", ")'); then
+      git -C "$REPO" checkout -q -- flake.lock
+      echo "FAILED to name the lock's lost sources — bump NOT carried"
+      return 1
+    fi
+  fi
+  if [ "$after" = "$baseline" ] && [ "$pruned" -le 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     dropped+=("$1")
     echo "moved, NO derivation impact -> dropped"
   else
-    if ! git -C "$REPO" commit -q -S -m "chore(flake): relock $1" -- flake.lock; then
+    local -a body=()
+    if [ "$moved" = 0 ]; then body=(-m "No exported derivation moved; the lock lost ${pruned} locked node(s): ${lost:-unnamed}."); fi
+    if ! git -C "$REPO" commit -q -S -m "chore(flake): relock $1" "${body[@]}" -- flake.lock; then
       git -C "$REPO" checkout -q -- flake.lock
       echo "FAILED to commit the bump — lock restored"
       return 1
@@ -763,7 +799,12 @@ relock_input() { # $1 input name
     baseline=$after
     committed=1
     bumped=$(jq -c --arg i "$1" --arg b "$before" --arg a "$(lockrev "$REPO/flake.lock" "$1")" '. + { ($i): [ $b, $a ] }' <<<"$bumped")
-    echo "BUMPED — derivations moved"
+    if [ "$moved" = 0 ]; then
+      pruned_by=$(jq -c --arg i "$1" --arg l "$lost" '. + { ($i): ($l | split(", ")) }' <<<"$pruned_by")
+      echo "BUMPED — no derivation moved, but the lock lost $pruned locked node(s): ${lost:-unnamed}"
+    else
+      echo "BUMPED — derivations moved"
+    fi
   fi
 }
 
@@ -778,7 +819,7 @@ after_input() { # $1 app name
   local -a moved=()
   err=$(mktemp)
   head_before=$(git -C "$REPO" rev-parse HEAD)
-  if ! prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
+  if ! prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 'a: a' "${tool_override[@]}" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
     mapfile -t moved < <(git -C "$REPO" diff --name-only)
     if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
     echo "FAILED (after-inputs app $1) — restored ${moved[*]:-nothing}"
@@ -811,9 +852,9 @@ write_trace() { # $1 the pushed revision
   url=$(git -C "$REPO" remote get-url origin) || return 1
   json=$(jq -n --arg h "@repoName@" --arg r "$1" --arg w "${RELOCK_PASS_WAVE:-@repoName@@$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     --arg t "@toolId@" --argjson b "$bumped" --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
-    --argjson u "$(json_list "${unmeasured[@]}")" --argjson s "$SECONDS" \
+    --argjson u "$(json_list "${unmeasured[@]}")" --argjson s "$SECONDS" --argjson pr "$pruned_by" \
     '{ schema: "seedmatic.relock/v1", head: $h, rev: $r,
-       status: { wave: $w, tool: $t, bumped: $b, dropped: $d, after: $a, unmeasured: $u, seconds: $s } }')
+       status: { wave: $w, tool: $t, bumped: $b, pruned: $pr, dropped: $d, after: $a, unmeasured: $u, seconds: $s } }')
   # A repository of its own: a shallow fetch into the operator's would make it SHALLOW, and in the
   # bare store that is the common dir of every worktree of the repo.
   tmp=$(mktemp -d)

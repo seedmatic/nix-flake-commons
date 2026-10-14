@@ -17,9 +17,6 @@
   # The head's id in nix-flake-commons' `fabric/heads` — the id the locks name in `original.id`. Its
   # repository and branch come from there, never from here: a second copy is how ids drift apart.
   name,
-  # Apps run AFTER the inputs' bump, before the impact guard measures, because what they produce
-  # resolves through the bumped inputs (flox-catalog's `lock-envs`).
-  afterInputs ? [ ],
   # Injected by `lib.mkRelockApp`, never passed by a head: the tool's identity (a hash of its code)
   # and the repo it is fetched from, so that a pass can build every relock it plays from ONE tool.
   toolId,
@@ -41,7 +38,6 @@ pkgs.writeShellApplication {
       inherit toolId toolSlug;
       repoName = name;
       system = pkgs.stdenv.hostPlatform.system;
-      afterInputs = pkgs.lib.concatStringsSep " " (map (a: ''"${a}"'') afterInputs);
       planJq = "${./plan.jq}";
       configurationsNix = "${./configurations.nix}";
     }

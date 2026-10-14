@@ -23,7 +23,7 @@ setup() {
   git config --global gpg.format ssh
   git config --global user.signingkey "$T/signing.pub"
   mkdir -p "$T/bin" "$T/remote/seedmatic" "$T/gh"
-  for v in RELOCK RELOCK_AFTER RELOCK_ORPHAN RELOCK_PEER RELOCK_PEER2 SWEEP; do
+  for v in RELOCK RELOCK_ORPHAN RELOCK_PEER RELOCK_PEER2 SWEEP; do
     f=$(printf '%s' "$v" | tr 'A-Z_' 'a-z-')
     sed '/^export PATH=/d' "${!v}" > "$T/$f"
     chmod +x "$T/$f"
@@ -96,15 +96,20 @@ case "$*" in
         configurations: (if ($expr | test("configurations = import ")) then
           { darwin: {}, nixos: (if $hascfg then { h: "/nix/store/\($c).drv" } else {} end) } else {} end) }' ;;
   # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
-  *".program"*"getContext"*) echo '[]' ;;
-  *"github:seedmatic/t/t-orphan/develop#apps."*"relock.program"*) printf '%s' "$T/relock-orphan" ;;
-  *"github:seedmatic/t/develop#apps."*"relock.program"*) printf '%s' "$T/relock" ;;
-  *"github:seedmatic/peer/develop#apps."*"relock.program"*)
-    [ "${STUB_PEER:-ok}" = unbuildable ] && { echo "error: peer does not evaluate" >&2; exit 1; }
-    [ "${STUB_PEER:-ok}" = cached ] && echo "warning: unable to download 'https://api.github.com/repos/seedmatic/peer/commits/develop'; using cached version" >&2
-    printf '%s' "$T/relock-peer" ;;
-  *"github:seedmatic/peer2/develop#apps."*"relock.program"*) printf '%s' "$T/relock-peer2" ;;
-  *"after-x.program"*) printf '%s' "$T/bin/after-x" ;;
+  *"getContext"*) echo '[]' ;;
+  # A member's relock, built from the pass's tool: the head is named in the function applied to it.
+  *"#lib.relockOf --apply"*)
+    case "$*" in
+      *'"t-orphan"'*) printf '%s' "$T/relock-orphan" ;;
+      *'"peer2"'*) printf '%s' "$T/relock-peer2" ;;
+      *'"peer"'*)
+        [ "${STUB_PEER:-ok}" = unbuildable ] && { echo "error: peer's relock does not build" >&2; exit 1; }
+        [ "${STUB_PEER:-ok}" = cached ] && echo "warning: unable to download 'https://api.github.com/repos/seedmatic/nix-flake-commons/commits/fc1'; using cached version" >&2
+        printf '%s' "$T/relock-peer" ;;
+      *'"t"'*) printf '%s' "$T/relock" ;;
+      *) echo "error: no such head" >&2; exit 1 ;;
+    esac ;;
+  *".after-x --apply"*) printf '%s' "$T/bin/after-x" ;;
   *"flake update"*)
     # A flake read by revision has its lock written only where it is told to.
     out=""; prev=""; for a in "$@"; do [ "$prev" = --output-lock-file ] && out=$a; prev=$a; done
@@ -137,6 +142,9 @@ case "$*" in
         esac ;;
       app-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo app2 > "$T/app-drv" ;;
       nested) jq '.nodes.x.locked.rev = "x2"' flake.lock > l && mv l flake.lock ;;
+      # `a` drops its input `x` upstream: x's node and the follows through it leave the lock, no
+      # derivation moves — a lock-only cleanup (bird, claude-hub).
+      pruned) jq 'del(.nodes.x) | del(.nodes.a.inputs.x) | del(.nodes.root.inputs.f)' flake.lock > l && mv l flake.lock ;;
       path)   jq '.nodes.a.locked = {"type":"path","path":"/somewhere/local"}' flake.lock > l && mv l flake.lock ;;
       garbage) echo 'not json at all' > flake.lock ;;
       cached)  echo "warning: error: unable to download 'https://api.github.com/repos/o/r/commits/HEAD': HTTP error 404; using cached version" >&2 ;;
@@ -289,6 +297,11 @@ mk_orphan() {
   git -C "$T/work" commit -qm orphan
   git -C "$T/work" push -qu origin t-orphan/develop 2>/dev/null
 }
+# A head's `after`, in the fake fabric/heads.
+after_of() { # $1 head, then its apps
+  local h=$1 f="$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json"; shift
+  jq --arg h "$h" --argjson a "$(printf '%s\n' "$@" | jq -R . | jq -sc .)" '.heads[$h].after = $a' "$f" > "$f.next" && mv "$f.next" "$f"
+}
 never_updated() { ! grep -q "flake update" "$T/calls" 2>/dev/null; }
 relock_commits() { git -C "$T/work" log --format=%s | grep -c '^chore(' || true; }
 tree_clean()     { [ -z "$(git -C "$T/work" status --porcelain --untracked-files=no)" ]; }
@@ -409,8 +422,10 @@ signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^g
 @test "a bump that moves a package is carried" {
   STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 0 ]
-  [[ "$output" == *"BUMPED"* ]]
+  [[ "$output" == *"BUMPED — derivations moved"* ]]
+  [[ "$output" != *"no derivation moved"* ]]
   [ "$(relock_commits)" -eq 1 ]
+  [ "$(jq -c '.status.pruned' <<<"$(trace_of t)")" = '{}' ]
 }
 
 @test "a bump that moves ONLY an app's program is carried — relock ships itself that way" {
@@ -464,6 +479,19 @@ signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^g
   [ "$status" -eq 0 ]
   [[ "$output" == *"BUMPED"* ]]
   [ "$(relock_commits)" -eq 1 ]
+}
+
+@test "an input dropped upstream: the bump moves nothing, the node goes, the bump is CARRIED" {
+  before=$(remote_rev develop)
+  STUB_HAS_CONFIGS=true STUB_UPDATE=pruned run "$T/relock" inputs
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED — no derivation moved, but the lock lost 1 locked node(s): x"* ]]
+  git -C "$T/work" log -1 --format=%b | grep -q "the lock lost 1 locked node(s): x"
+  [ "$(jq -r '.status.pruned.a | join(",")' <<<"$(trace_of t)")" = x ]
+  [ "$(relock_commits)" -eq 1 ]
+  ! git -C "$T/work" show HEAD:flake.lock | jq -e '.nodes.x' >/dev/null
+  [ "$(remote_rev develop)" != "$before" ]
+  [ "$(jq -r '.status.bumped | keys | join(",")' <<<"$(trace_of t)")" = a ]
 }
 
 @test "aggregator: a follows root input is left out of the impact projection" {
@@ -751,21 +779,24 @@ LOCK
 # ── after the inputs ───────────────────────────────────────────────────────────────────────────────
 
 @test "an after-inputs app runs AFTER the inputs, and what it changes is committed" {
-  STUB_UPDATE=rev STUB_AFTER=ok run "$T/relock-after"
+  after_of t after-x
+  STUB_UPDATE=rev STUB_AFTER=ok run "$T/relock"
   [ "$status" -eq 0 ]
   [ "$(git -C "$T/work" log --format=%s -2 | tr '\n' '|')" = "chore(relock): after-x after inputs|chore(flake): relock a|" ]
   tree_clean
 }
 
 @test "an after-inputs app that changes nothing commits nothing" {
-  STUB_UPDATE=none STUB_AFTER=none run "$T/relock-after"
+  after_of t after-x
+  STUB_UPDATE=none STUB_AFTER=none run "$T/relock"
   [ "$status" -eq 0 ]
   [[ "$output" == *"after-x"*"already current"* ]]
   [ "$(relock_commits)" -eq 0 ]
 }
 
 @test "a failing after-inputs app restores the tree, commits nothing of its own, and says why" {
-  STUB_UPDATE=none STUB_AFTER=fail run "$T/relock-after"
+  after_of t after-x
+  STUB_UPDATE=none STUB_AFTER=fail run "$T/relock"
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAILED (after-inputs app after-x)"* ]]
   [[ "$output" == *"after boom"* ]]
@@ -774,9 +805,34 @@ LOCK
 }
 
 @test "an after-inputs app is run WITHOUT the token" {
-  STUB_UPDATE=none STUB_AFTER=ok run "$T/relock-after"
+  after_of t after-x
+  STUB_UPDATE=none STUB_AFTER=ok run "$T/relock"
   [ -f "$T/child-env.after" ]
   ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.after"
+}
+
+@test "a member runs the \`after\` of its head in fabric/heads, read from the pass's plan" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  after_of peer after-x
+  STUB_UPDATE=none STUB_AFTER=ok run "$T/relock" --downstream
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"== peer =="*"== after the inputs =="*"after-x"*"== peer2 =="* ]]
+  [ "$(grep -c '== after the inputs ==' <<<"$output")" -eq 1 ]
+}
+
+@test "an \`after\` that is not a list of app names is refused before anything" {
+  jq '.heads.t.after = "after-x"' "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json" > x && mv x "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json"
+  STUB_UPDATE=rev run "$T/relock" --no-push
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: the \`after\` of 't' in fabric/heads is not a list of app names"* ]]
+  never_updated
+  after_of t 'after-x; true'
+  STUB_UPDATE=rev run "$T/relock" --no-push
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is not a list of app names"* ]]
+  never_updated
 }
 
 # ── the trace ──────────────────────────────────────────────────────────────────────────────────────
@@ -819,7 +875,8 @@ LOCK
 
 @test "an after-inputs commit is signed too" {
   before=$(remote_rev develop)
-  STUB_UPDATE=rev STUB_AFTER=ok run "$T/relock-after"
+  after_of t after-x
+  STUB_UPDATE=rev STUB_AFTER=ok run "$T/relock"
   [ "$status" -eq 0 ]
   [ "$(git -C "$T/remote/seedmatic/t.git" rev-list --count "$before..develop")" -eq 2 ]
   for c in $(git -C "$T/remote/seedmatic/t.git" rev-list "$before..develop"); do signed "$c"; done
@@ -909,7 +966,10 @@ LOCK
   [ "$(grep -E '^== (t|t-orphan|peer|peer2) ==$' <<<"$output" | tr '\n' ' ')" = "== t == == t-orphan == == peer == == peer2 == " ]
   [[ "$output" == *"reconciling the checkout at $T/work (develop)"* ]]
   [[ "$output" == *"relock(peer): not inside this head — cloning seedmatic/peer (develop)"* ]]
-  grep -q -- '--override-input flake-commons github:seedmatic/nix-flake-commons/fc1 github:seedmatic/peer/develop#apps\..*\.relock\.program' "$T/calls"
+  grep -q -- 'eval --raw --refresh github:seedmatic/nix-flake-commons/fc1#lib\.relockOf --apply .*"peer"' "$T/calls"
+  # Never through a member's own flake: its lock may hold pins the new tool no longer satisfies.
+  ! grep -q -- 'github:seedmatic/peer/develop#' "$T/calls"
+  ! grep -q -- 'github:seedmatic/peer2/develop#' "$T/calls"
   ! grep -q -- '--commit-lock-file' "$T/calls"
   [[ "$output" == *"DONE (pass t@"* ]]
 }
@@ -1119,7 +1179,7 @@ HOOK
   [[ "$output" == *"nix answered from its cache — refusing that answer"* ]]
   [[ "$output" == *"FAILED — cannot build peer's relock"* ]]
   [[ "$output" == *"peer2: NOT RUN — it pins peer"* ]]
-  grep -q -- 'eval --raw --refresh --override-input flake-commons' "$T/calls"
+  grep -q -- 'eval --raw --refresh github:seedmatic/nix-flake-commons/fc1#lib\.relockOf' "$T/calls"
 }
 
 # ── review of 1a: a REAL propagation ───────────────────────────────────────────────────────────────

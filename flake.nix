@@ -85,11 +85,6 @@
 
     # nxmatic 
 
-    bird = {
-      flake = true;
-      url = "github:nxmatic/bird?ref=hotfix/v2.15.1-nix-darwin";
-    };
-
     maven-mvnd = {
       flake = true;
       url = "github:nxmatic/nix-maven-mvnd/develop";
@@ -128,6 +123,12 @@
         toolSlug = "seedmatic/nix-flake-commons";
       });
       lib.relockToolId = relockToolId;
+      # A head's relock APP built from THIS tool alone, on its nixpkgs: a pass builds every member's
+      # this way, so a member whose own lock the new tool no longer satisfies can still be relocked.
+      lib.relockOf = system: name: {
+        type = "app";
+        program = "${self.lib.mkRelockApp { pkgs = nixpkgs.legacyPackages.${system}; inherit name; }}/bin/relock";
+      };
     }
     // flake-utils.lib.eachDefaultSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
@@ -147,15 +148,14 @@
       # the test's fake fabric/heads.
       checks.relock =
         let
-          relockOf = name: afterInputs: self.lib.mkRelockApp { inherit pkgs name afterInputs; };
+          relockOf = name: self.lib.relockOf system name;
         in
         pkgs.runCommand "relock-bats" {
           nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq pkgs.openssh ];
-          RELOCK = "${relockOf "t" [ ]}/bin/relock";
-          RELOCK_AFTER = "${relockOf "t" [ "after-x" ]}/bin/relock";
-          RELOCK_ORPHAN = "${relockOf "t-orphan" [ ]}/bin/relock";
-          RELOCK_PEER = "${relockOf "peer" [ ]}/bin/relock";
-          RELOCK_PEER2 = "${relockOf "peer2" [ ]}/bin/relock";
+          RELOCK = (relockOf "t").program;
+          RELOCK_ORPHAN = (relockOf "t-orphan").program;
+          RELOCK_PEER = (relockOf "peer").program;
+          RELOCK_PEER2 = (relockOf "peer2").program;
           SWEEP = "${sweepConfigurations}/bin/sweep-configurations";
           RELOCK_TOOL_ID = self.lib.relockToolId;
           PLAN_JQ = ./nix/plan.jq;
@@ -173,9 +173,7 @@
         meta.description = "Prove that relock's neutralised measure of a flake's configurations does not move with the revision alone";
       };
 
-      apps.relock = {
-        type = "app";
-        program = "${self.lib.mkRelockApp { inherit pkgs; name = "flake-commons"; }}/bin/relock";
+      apps.relock = self.lib.relockOf system "flake-commons" // {
         meta.description = "Reconcile THIS head's locks: bump each input, DROP any bump that moves nothing it exports, push. --plan shows a pass, --downstream plays it over every head of fabric/heads";
       };
     });
