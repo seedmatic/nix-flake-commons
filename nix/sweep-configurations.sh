@@ -1,0 +1,54 @@
+# shellcheck shell=bash
+# sweep-configurations — proves, on a real flake, that relock's measure of the configurations does
+# not move with the revision alone. It takes a clone of the flake, measures every nixos/darwin
+# configuration (raw, and with `system.configurationRevision` neutralised, nix/configurations.nix),
+# adds an EMPTY commit — same tree, new revision — and measures again. The raw measure may move (that
+# is the noise the neutralisation exists for); the neutralised one must not, or relock's guard would
+# carry every bump of that flake.
+#
+# Build-time token (written WITHOUT at-sigils): configurationsNix.
+
+if [ "$#" -ne 1 ] || ! git -C "$1" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "usage: sweep-configurations <checkout of a flake>" >&2
+  exit 2
+fi
+src=$(cd "$1" && pwd -P)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+# Checked out with every filter OFF, and read by REVISION — relock's two rules, for its two reasons: the
+# operator's global sops smudge would write the flake's secrets decrypted into the clone, and a
+# `git+file` reference without `rev` copies the tracked files from disk into the store.
+git clone --quiet --no-local --no-checkout "$src" "$work/flake"
+mkdir -p "$work/flake/.git/info" && echo '* -filter' > "$work/flake/.git/info/attributes"
+git -C "$work/flake" reset --quiet --hard
+shallow=""
+if [ "$(git -C "$work/flake" rev-parse --is-shallow-repository)" = true ]; then shallow="&shallow=1"; fi
+measure() { # $1 neutralise (true|false) -> JSON, of the clone's HEAD
+  nix eval --json --impure --expr \
+    "import @configurationsNix@ { outputs = (builtins.getFlake \"git+file://$work/flake?rev=$(git -C "$work/flake" rev-parse HEAD)$shallow\").outputs; neutralise = $1; }"
+}
+# Each measure evaluates every configuration, minutes for a large flake: say which one runs.
+echo "sweep: measuring the configurations raw (1/4)" >&2
+before_raw=$(measure false) || exit 1
+echo "sweep: neutralised (2/4)" >&2
+before=$(measure true) || exit 1
+# A measuring commit, not a change: the repository's own hooks have nothing to say about it.
+git -C "$work/flake" -c user.name=sweep -c user.email=sweep@localhost -c core.hooksPath=/dev/null commit --quiet --allow-empty -m "sweep: same tree, new revision"
+echo "sweep: same tree, new revision — raw (3/4)" >&2
+after_raw=$(measure false) || exit 1
+echo "sweep: neutralised (4/4)" >&2
+after=$(measure true) || exit 1
+
+jq -rn --argjson br "$before_raw" --argjson ar "$after_raw" --argjson bn "$before" --argjson an "$after" '
+  [ ("nixos", "darwin") as $k | ($bn[$k] | keys[]) as $c
+    | { kind: $k, name: $c,
+        raw: (if $br[$k][$c] == $ar[$k][$c] then "same" else "MOVES" end),
+        neutralised: (if $bn[$k][$c] == $an[$k][$c] then "same" else "MOVES" end) } ]
+  | (["kind", "configuration", "raw", "neutralised"] | @tsv),
+    (.[] | [.kind, .name, .raw, .neutralised] | @tsv),
+    ("\(length) configurations: raw moves on \(map(select(.raw == "MOVES")) | length), neutralised moves on \(map(select(.neutralised == "MOVES")) | length)")'
+moved=$(jq -n --argjson bn "$before" --argjson an "$after" '[ ("nixos", "darwin") as $k | ($bn[$k] | keys[]) as $c | select($bn[$k][$c] != $an[$k][$c]) ] | length')
+if [ "$moved" != 0 ]; then
+  echo "FAILED: $moved neutralised configuration(s) move with the revision alone — relock's guard would carry every bump" >&2
+  exit 1
+fi

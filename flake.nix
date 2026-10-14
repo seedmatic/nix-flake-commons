@@ -41,11 +41,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    cachix = {
-      url = "github:cachix/cachix";
-      inputs.flake-compat.follows = "flake-compat";
-    };
-
     chromium-bin = {
       url = "github:lrworth/chromium-bin-flake";
     };
@@ -62,14 +57,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    devenv = {
-      url = "github:cachix/devenv/latest";
-      inputs.cachix.follows = "cachix";
-      inputs.flake-compat.follows = "flake-compat";
-      inputs.nix.follows = "nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     home-manager = {
       url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -83,11 +70,6 @@
     flox = {
       url = "github:flox/flox?branch=main";
 #     inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    incus-compose = {
-      url = "github:nxmatic/incus-compose/develop";
-      inputs.nixpkgs.follows = "nixpkgs";
     };
 
     nvfetcher.url = "github:berberman/nvfetcher";
@@ -113,24 +95,89 @@
       url = "github:nxmatic/nix-maven-mvnd/develop";
     };
 
-    socket-vmnet = {
-      flake = true;
-      url = "github:nxmatic/nix-socket-vmnet/develop";
-    };
-
-    zen-browser = {
-      flake = true;
-      url = "github:nxmatic/nix-zen-browser/develop";
-    };
-
-    ripvcs = {
-      flake = true;
-      url = "github:nxmatic/nix-ripvcs/develop";
-    };
-
   };
 
+  # The aggregator's first outputs: the shared `relock` tool, and this repo's own use of it.
+  #
+  # `lib.mkRelockApp` is here because this is the ROOT every seedmatic flake already consumes — a
+  # tool the whole chain shares belongs where the whole chain already points. And this repo is a USER
+  # of it, not only its host: it has third-party inputs of its own to bump, and relock measures an
+  # aggregator's impact on the revisions it locks, since its inputs are what it exports.
+  #
+  # Who the heads are is not written here: it is nix-flake-commons' `fabric/heads`, an orphan that
+  # holds only that list, read by every pass. A pass started here covers every head, since every head
+  # pins this one.
+  #
+  # A pass runs ONE tool everywhere, and that tool is known by its CODE, not by this repo's revision:
+  # a commit here that touches none of its files must not make every head read as running another
+  # relock.
   outputs = { self, nixpkgs, flake-utils, home-manager, ... }:
-    {};
+    let
+      relockToolId = builtins.hashString "sha256" (
+        builtins.concatStringsSep "" (map builtins.readFile [
+          ./nix/relock.sh
+          ./nix/relock.nix
+          ./nix/plan.jq
+          ./nix/configurations.nix
+        ])
+      );
+    in
+    {
+      lib.mkRelockApp = args: import ./nix/relock.nix (args // {
+        toolId = relockToolId;
+        toolSlug = "seedmatic/nix-flake-commons";
+      });
+      lib.relockToolId = relockToolId;
+    }
+    // flake-utils.lib.eachDefaultSystem (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      sweepConfigurations = pkgs.writeShellApplication {
+        name = "sweep-configurations";
+        runtimeInputs = [ pkgs.coreutils pkgs.gitMinimal pkgs.jq pkgs.nix ];
+        text = builtins.readFile (
+          pkgs.replaceVars ./nix/sweep-configurations.sh {
+            configurationsNix = "${./nix/configurations.nix}";
+          }
+        );
+      };
+    in {
+      # Behaviour tests for relock, run by `nix flake check`. They cover what shellcheck — already a
+      # gate of every build — cannot see: the failure paths, where every defect this script had was
+      # a silence. The instances under test are built by the SAME factory; the heads they name live in
+      # the test's fake fabric/heads.
+      checks.relock =
+        let
+          relockOf = name: afterInputs: self.lib.mkRelockApp { inherit pkgs name afterInputs; };
+        in
+        pkgs.runCommand "relock-bats" {
+          nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.gnused pkgs.git pkgs.jq pkgs.openssh ];
+          RELOCK = "${relockOf "t" [ ]}/bin/relock";
+          RELOCK_AFTER = "${relockOf "t" [ "after-x" ]}/bin/relock";
+          RELOCK_ORPHAN = "${relockOf "t-orphan" [ ]}/bin/relock";
+          RELOCK_PEER = "${relockOf "peer" [ ]}/bin/relock";
+          RELOCK_PEER2 = "${relockOf "peer2" [ ]}/bin/relock";
+          SWEEP = "${sweepConfigurations}/bin/sweep-configurations";
+          RELOCK_TOOL_ID = self.lib.relockToolId;
+          PLAN_JQ = ./nix/plan.jq;
+        } ''
+          export HOME=$TMPDIR
+          bats --print-output-on-failure ${./nix/relock.bats}
+          touch $out
+        '';
+
+      # Proves on a real flake that the guard's measure of the configurations does not move with the
+      # revision alone: `nix run .#sweep-configurations -- <checkout>`.
+      apps.sweep-configurations = {
+        type = "app";
+        program = "${sweepConfigurations}/bin/sweep-configurations";
+        meta.description = "Prove that relock's neutralised measure of a flake's configurations does not move with the revision alone";
+      };
+
+      apps.relock = {
+        type = "app";
+        program = "${self.lib.mkRelockApp { inherit pkgs; name = "flake-commons"; }}/bin/relock";
+        meta.description = "Reconcile THIS head's locks: bump each input, DROP any bump that moves nothing it exports, push. --plan shows a pass, --downstream plays it over every head of fabric/heads";
+      };
+    });
 
 }
