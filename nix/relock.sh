@@ -179,6 +179,18 @@ app_program() { # $1 installable, $2 the function from its value to an app, then
 # that pin this one, and only names the missing trace.
 failed=()
 trace_failed=()
+# Every evaluation this run made, and how long it took: `what<TAB>milliseconds`, in the order made. A
+# pass is slow where its evaluations are, and the per-head seconds alone cannot say which.
+evals=()
+# The digits only: EPOCHREALTIME's separator is the locale's radix (a comma in fr_FR).
+now_ms() { local us=${EPOCHREALTIME//[!0-9]/}; printf '%s\n' "$(( 10#$us / 1000 ))"; }
+timed() { # $1 what  $2 its start (now_ms)
+  evals+=("$1"$'\t'"$(( $(now_ms) - $2 ))")
+}
+evals_json() {
+  if [ "${#evals[@]}" -eq 0 ]; then echo '[]'; return; fi
+  printf '%s\n' "${evals[@]}" | jq -R 'split("\t") | { what: .[0], seconds: ((.[1] | tonumber) / 1000) }' | jq -sc .
+}
 unmeasured=()
 # The innermost error nix printed, on one line: nix opens with a bare `error:` and its trace, and
 # states the cause last — the first `error:` line alone said nothing.
@@ -203,22 +215,26 @@ log_event() { # $1 event  $2 its fields, a JSON object
 }
 pass_role=0
 finish() { # $1 the word for success
+  local outcome="done" ev
+  ev=$(evals_json)
+  if [ "${#evals[@]}" -gt 0 ]; then
+    echo "evaluations: $(jq -r 'map("\(.what) \(.seconds)s") | join(", ")' <<<"$ev")"
+  fi
   if [ "${#unmeasured[@]}" -gt 0 ]; then
     echo "NOT MEASURED by the impact guard (broken before any bump; a bump that moves only these is dropped):"
     printf '  %s\n' "${unmeasured[@]}"
   fi
-  local outcome="done"
   if [ "${#failed[@]}" -gt 0 ] || [ "${#trace_failed[@]}" -gt 0 ]; then outcome=failed; fi
   if [ "$pass_role" = 1 ]; then
     log_event pass "$(jq -n --arg o "$outcome" --argjson s "$SECONDS" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
-      '{ outcome: $o, seconds: $s, failed: $f }')"
+      --argjson e "$ev" '{ outcome: $o, seconds: $s, failed: $f, evals: $e }')"
   else
     local carried='{}'
     if [ -n "${bumped:-}" ]; then carried=$bumped; fi
     log_event head "$(jq -n --arg o "$outcome" --arg p "${landed:-}" --argjson s "$SECONDS" --argjson b "$carried" \
       --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
       --argjson u "$(json_list "${unmeasured[@]}")" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
-      '{ outcome: $o, pushed: $p, seconds: $s, bumped: $b, dropped: $d, after: $a, unmeasured: $u, failed: $f }')"
+      --argjson e "$ev" '{ outcome: $o, pushed: $p, seconds: $s, bumped: $b, dropped: $d, after: $a, unmeasured: $u, failed: $f, evals: $e }')"
   fi
   if [ "$outcome" = "done" ]; then echo "$1 — $(took)"; exit 0; fi
   echo "FAILED: $(( ${#failed[@]} + ${#trace_failed[@]} )) target(s)"
@@ -436,7 +452,11 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
       # From the tool, never through the head's flake: that one locks the head's OLD pins, which the new
       # tool may no longer satisfy (an input the tool dropped, followed by an old pin of another head),
       # and the head could then never take the bump that repairs them.
-      if ! prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\""); then
+      t0=$(now_ms)
+      prog_rc=0
+      prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\"") || prog_rc=1
+      timed "build $id's relock" "$t0"
+      if [ "$prog_rc" != 0 ]; then
         echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
         rc=1
       else
@@ -580,28 +600,36 @@ aggregator=0
 pk_systems=()
 ap_systems=()
 read_shape() { # what HEAD exports
-  local shape sys err at
+  local shape sys err at t0
   at=$(flake_at "$(git -C "$REPO" rev-parse HEAD)")
+  t0=$(now_ms)
   shape=$(nix eval --impure --json --expr "/* relock:shape */ let o = $at; in {
       packages = builtins.attrNames (o.packages or { }); apps = builtins.attrNames (o.apps or { });
       configurations = (o ? nixosConfigurations) || (o ? darwinConfigurations); }") || return 1
+  timed shape "$t0"
   if jq -e '(.packages | length) == 0 and (.configurations | not)' <<<"$shape" >/dev/null; then
     aggregator=1
     return 0
   fi
   err=$(mktemp)
   while read -r sys; do
+    t0=$(now_ms)
     if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
+      timed "probe packages $sys" "$t0"
       pk_systems+=("$sys")
     else
+      timed "probe packages $sys" "$t0"
       unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
       echo "  ${unmeasured[-1]}"
     fi
   done < <(jq -r '.packages[]' <<<"$shape")
   while read -r sys; do
+    t0=$(now_ms)
     if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
+      timed "probe apps $sys" "$t0"
       ap_systems+=("$sys")
     else
+      timed "probe apps $sys" "$t0"
       unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
       echo "  ${unmeasured[-1]}"
     fi
@@ -748,11 +776,14 @@ relock_input() { # $1 input name
     echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
     return 1
   fi
-  local after measured
+  local after measured t0 measure_rc=0
   # Checked by hand: relock_input runs as `relock_input … || failed+=…`, and bash switches errexit
   # off for the whole body of a function called in an `||` list. Unchecked, a failed measurement left
   # `after` empty, unequal to the baseline, and the bump was COMMITTED as "derivations moved".
-  if ! measured=$(lock_commit) || ! after=$(evalmap "$measured"); then
+  t0=$(now_ms)
+  { measured=$(lock_commit) && after=$(evalmap "$measured"); } || measure_rc=1
+  timed "measure $1" "$t0"
+  if [ "$measure_rc" != 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to measure impact — bump NOT carried"
     return 1
@@ -815,11 +846,14 @@ relock_input() { # $1 input name
 # itself stays; a failure restores the tree and says why.
 after_input() { # $1 app name
   printf '  %-18s ' "$1"
-  local err prog head_before
+  local err prog head_before t0 app_rc=0
   local -a moved=()
   err=$(mktemp)
   head_before=$(git -C "$REPO" rev-parse HEAD)
-  if ! prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 'a: a' "${tool_override[@]}" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
+  t0=$(now_ms)
+  { prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 'a: a' "${tool_override[@]}" 2>"$err") && ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; } || app_rc=1
+  timed "after $1" "$t0"
+  if [ "$app_rc" != 0 ]; then
     mapfile -t moved < <(git -C "$REPO" diff --name-only)
     if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
     echo "FAILED (after-inputs app $1) — restored ${moved[*]:-nothing}"
@@ -909,7 +943,11 @@ if ! read_shape; then
   echo "FAILED to read what this head exports — nothing reconciled" >&2
   exit 1
 fi
-if ! baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)"); then
+t0=$(now_ms)
+baseline_rc=0
+baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)") || baseline_rc=1
+timed baseline "$t0"
+if [ "$baseline_rc" != 0 ]; then
   echo "FAILED to measure the starting point — nothing reconciled" >&2
   exit 1
 fi

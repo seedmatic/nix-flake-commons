@@ -716,6 +716,21 @@ LOCK
   jq -e '.status.seconds | type == "number"' <<<"$(trace_of t)"
 }
 
+@test "every evaluation a run makes is timed, in its event and in one line for a human" {
+  STUB_UPDATE=rev "$T/relock" --format=jsonl inputs >"$T/out" 2>"$T/err"
+  jq -e '.evals | map(.what) == ["shape", "probe packages aarch64-darwin", "probe apps aarch64-darwin", "baseline", "measure a"]' "$T/out"
+  jq -e '.evals | all(.seconds | type == "number" and . >= 0)' "$T/out"
+  grep -qE '^evaluations: shape [0-9.]+s, .*baseline [0-9.]+s, measure a [0-9.]+s$' "$T/err"
+}
+
+@test "a pass times the build of every member's relock" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=none "$T/relock" --format=jsonl --downstream >"$T/out" 2>"$T/err"
+  jq -se '[.[] | select(.event == "pass")][0].evals | map(.what) == ["build t-orphan'"'"'s relock", "build peer'"'"'s relock", "build peer2'"'"'s relock"]' "$T/out"
+}
+
 @test "a run that pushes nothing says so in its event: pushed is empty, not HEAD" {
   STUB_UPDATE=none "$T/relock" --format=jsonl inputs >"$T/out" 2>"$T/err"
   grep -q 'nothing to push' "$T/err"
