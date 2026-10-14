@@ -33,7 +33,8 @@ setup() {
   # bash on PATH, not /usr/bin/env: the Linux build sandbox does not promise /usr/bin/env.
   printf '#!%s\n' "$(command -v bash)" > "$T/bin/nix"
   cat >> "$T/bin/nix" <<'FAKE'
-echo "$*" >> "$T/calls"
+# The fake's own calls to itself (a whole measure answered from its projections) are not relock's.
+if [ -n "${STUB_PREV:-}" ]; then echo "$*" >> "$T/calls-inner"; else echo "$*" >> "$T/calls"; fi
 printf '%s\n' "${NIX_CONFIG:-}" >> "$T/nix-config"
 # What nix reads of a git+file flake (measured on nix 2.34.8). Given `rev`, the git objects — and a
 # shallow repository needs `shallow=1`. Without `rev`, the working tree's files FROM DISK, clean or
@@ -67,10 +68,29 @@ case "$*" in
     systems=$(printf '%s\n' ${STUB_SYSTEMS:-aarch64-darwin} | jq -R . | jq -sc .)
     pk=$systems; [ "${STUB_HAS_PACKAGES:-true}" = false ] && pk='[]'
     printf '{"packages":%s,"apps":%s,"configurations":%s}\n' "$pk" "$systems" "${STUB_HAS_CONFIGS:-false}" ;;
-  # One projection of a measure: the packages or the apps of one system, or the configurations — the
-  # last of every measure, so it counts the measures.
+  # A whole measure, in one evaluation: it counts the measures, and answers from its projections,
+  # each asked of this same fake (so one projection failing fails the whole, as in nix).
+  *"relock:measure all"*)
+    all="$*"; prev=$(cat "$T/measures" 2>/dev/null || echo 0); n=$((prev + 1)); echo "$n" > "$T/measures"
+    [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
+    [ "${STUB_MEASURE:-ok}" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
+    ref=$(sed -n 's/.*getFlake "\([^"]*\)".*/\1/p' <<<"$all")
+    # A measure that names no list of systems is no measure: say so, as nix would refuse to parse it.
+    for k in packages apps; do
+      [[ "$all" =~ $k\ =\ each\ \(.*\)\ \[[^]]*\] ]] || { echo "error: syntax error, unexpected ';' (no $k systems)" >&2; exit 1; }
+    done
+    res='{"packages":{},"apps":{}}'
+    for k in packages apps; do
+      for s in $(jq -rn --arg e "$all" --arg k "$k" '$e | capture("\($k) = each \\(.*?\\) \\[(?<l>[^\\]]*)\\]").l | scan("\"([^\"]+)\"") | .[0]'); do
+        piece=$(STUB_PREV=$prev "$0" eval --impure --json --expr "/* relock:measure $k $s */ let o = (builtins.getFlake \"$ref\").outputs; in x") || exit 1
+        res=$(jq -c --arg k "$k" --arg s "$s" --argjson p "$piece" '.[$k][$s] = $p' <<<"$res")
+      done
+    done
+    cfg=$(STUB_PREV=$prev "$0" eval --impure --json --expr "/* relock:measure configurations */ let o = (builtins.getFlake \"$ref\").outputs; in x") || exit 1
+    jq --argjson c "$cfg" '. + { configurations: $c }' <<<"$res" ;;
+  # One projection of a measure: the packages or the apps of one system, or the configurations.
   *"relock:measure configurations"*)
-    n=$(( $(cat "$T/measures" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/measures"
+    n=$(cat "$T/measures" 2>/dev/null || echo 0)
     [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_MEASURE:-ok}" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_CONFIGS:-ok}" = fail ] && [ "${STUB_HAS_CONFIGS:-false}" = true ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
@@ -93,8 +113,9 @@ case "$*" in
       echo "error: attribute 'broken-by-the-bump' missing" >&2; exit 1
     fi
     # An apps projection that fails once a measure has run: broken by a bump, not before the run.
-    [ "$kind" = apps ] && [ "${STUB_APPS:-ok}" = fail ] && [ "$(cat "$T/measures" 2>/dev/null || echo 0)" -ge 1 ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
-    [ "$kind" = packages ] && [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$(cat "$T/measures" 2>/dev/null || echo 0)" -ge 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
+    before=${STUB_PREV:-$(cat "$T/measures" 2>/dev/null || echo 0)}
+    [ "$kind" = apps ] && [ "${STUB_APPS:-ok}" = fail ] && [ "$before" -ge 1 ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
+    [ "$kind" = packages ] && [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$before" -ge 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     drv=$(cat "$T/drv"); [ "${STUB_DRV_FROM_LOCK:-}" = 1 ] && drv=$(git -C "$p" show "$rev:flake.lock" | cksum | cut -d' ' -f1)
     if [ "$kind" = packages ]; then
       d=$drv; [ "$sys" = aarch64-linux ] && d=$(cat "$T/drv-linux")
@@ -810,6 +831,13 @@ LOCK
   grep -qE '^evaluations: shape [0-9.]+s, .*baseline [0-9.]+s, measure a [0-9.]+s$' "$T/err"
 }
 
+@test "a measure is ONE evaluation when every system evaluates; split only to find a broken one" {
+  STUB_UPDATE=rev run "$T/relock" --no-push inputs
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'relock:measure all' "$T/calls")" -eq 2 ]
+  ! grep -qE 'relock:measure (packages|apps|configurations)' "$T/calls"
+}
+
 @test "a requested head pays no baseline: its edges' measure is its starting point" {
   with_edges
   STUB_UPDATE=edges "$T/relock" --format=jsonl edges after >"$T/out" 2>"$T/err"
@@ -1315,8 +1343,9 @@ LOCK
   [ "$status" -eq 0 ]
   [[ "$output" == *"packages of x86_64-darwin: one of them does not evaluate before any bump, so none of x86_64-darwin is measured — error: attribute 'x86_64-darwin' missing"* ]]
   [[ "$output" == *"BUMPED"* ]]
-  # Tried once, at the run's first HEAD, and never measured again.
-  [ "$(grep 'relock:measure packages x86_64-darwin' "$T/calls" | wc -l)" -eq 1 ]
+  # Measured at the run's first HEAD only: once told broken, never measured again.
+  head0=$(git -C "$T/work" rev-parse HEAD~1)
+  [ "$(grep -E 'relock:measure (all|packages x86_64-darwin)' "$T/calls" | grep 'x86_64-darwin' | grep -vc "rev=$head0")" -eq 0 ]
 }
 
 # ── review of 1a: the trace, absent, rejected, or unreachable ───────────────────────────────────────

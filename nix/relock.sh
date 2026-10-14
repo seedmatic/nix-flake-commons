@@ -678,6 +678,7 @@ read_shape() { # what HEAD exports: its systems by name, and whether it is an ag
   mapfile -t pk_systems < <(jq -r '.packages[]' <<<"$shape")
   mapfile -t ap_systems < <(jq -r '.apps[]' <<<"$shape")
 }
+nix_list() { local x out="["; for x in "$@"; do out+=" \"$x\""; done; printf '%s ]' "$out"; }
 # One projection of a revision: the packages or the apps of one system, or the configurations.
 project() { # $1 revision  $2 packages|apps|configurations  $3 system -> JSON on stdout, nix's words on stderr
   local expr
@@ -689,10 +690,12 @@ project() { # $1 revision  $2 packages|apps|configurations  $3 system -> JSON on
   nix eval --impure --json --expr "/* relock:measure $2${3:+ $3} */ let o = $(flake_at "$1"); in $expr"
 }
 # The measure of a revision, into a file: every measured system's packages and apps, and the
-# configurations. A head's own evaluation warnings are its business, not this measure's: they are left
-# out, so a pass reads as its heads and their verdicts; anything else nix says reaches the terminal.
-# Run in THIS shell, never in `$(…)`: a system found broken before the run leaves the measured set
-# for the rest of it.
+# configurations — in ONE evaluation, since each nix process evaluates the flake again (2026-10-14:
+# nnh 50 s in one, 104 s split in nine). Only when it fails is each projection evaluated on its own,
+# to tell which system does not evaluate. A head's own evaluation warnings are its business, not this
+# measure's: they are left out, so a pass reads as its heads and their verdicts; anything else nix
+# says reaches the terminal. Run in THIS shell, never in `$(…)`: a system found broken before the run
+# leaves the measured set for the rest of it.
 measure_into() { # $1 the file  $2 the revision measured
   local out=$1 rev=$2 kind sys part err res='{"packages":{},"apps":{}}' lock
   local -a kept
@@ -706,6 +709,16 @@ measure_into() { # $1 the file  $2 the revision measured
     return
   fi
   err=$(mktemp)
+  if part=$(nix eval --impure --json --expr "/* relock:measure all */ let o = $(flake_at "$rev");
+      each = f: systems: builtins.listToAttrs (map (s: { name = s; value = f s; }) systems); in {
+      packages = each ($pk_expr) $(nix_list "${pk_systems[@]}");
+      apps = each ($ap_expr) $(nix_list "${ap_systems[@]}");
+      configurations = import @configurationsNix@ { outputs = o; }; }" 2>"$err"); then
+    grep -v '^evaluation warning' "$err" >&2 || true
+    rm -f "$err"
+    jq -S . <<<"$part" > "$out"
+    return
+  fi
   for kind in packages apps; do
     kept=()
     if [ "$kind" = packages ]; then set -- "${pk_systems[@]}"; else set -- "${ap_systems[@]}"; fi
