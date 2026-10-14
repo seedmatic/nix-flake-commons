@@ -13,8 +13,10 @@
 # after its inputs are its entry's `after` in fabric/heads, read at run time like the rest of it.
 
 downstream=0
+jobs=4
 nopush=0
 planonly=0
+script=0
 targets=()
 
 for a in "$@"; do
@@ -22,20 +24,29 @@ for a in "$@"; do
     --downstream) downstream=1 ;;
     --no-push) nopush=1 ;;
     --plan) planonly=1 ;;
+    --script) script=1 ;;
+    --jobs=*)
+      jobs=${a#--jobs=}
+      [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "relock: --jobs wants a count of heads, not '$jobs'" >&2; exit 2; }
+      ;;
     --format=jsonl) RELOCK_FORMAT=jsonl ;;
     --format=text) RELOCK_FORMAT=text ;;
     --format=*) echo "relock: unknown format '${a#--format=}' (text, jsonl)" >&2; exit 2 ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream | --no-push | --plan] [--format=text|jsonl] [target...]
+relock [--downstream [--jobs=N] | --no-push | --plan [--script]] [--format=text|jsonl] [target...]
 
 Reconcile this head's lock. No target = ALL of it.
 
-  inputs            every flake input          -> flake.lock
-  <input-name>      one input, by its name in flake.lock
+  edges             every input that is a head of fabric/heads, in ONE bump, always carried
+  inputs            every other input, one by one, each under the impact guard
+  <input-name>      one input, by its name in flake.lock (an edge is carried, any other guarded)
   after             the apps this head runs after its inputs (its `after` in fabric/heads)
 
-An input bump that moves no exported derivation (packages, apps, configurations with their revision
+An EDGE is an input that pins a head of fabric/heads, as the plan reads it. Propagating one is always
+wanted — a head on an old pin of another is a misaligned fabric, whatever its derivations say — so the
+edges move together, in one bump and one commit, and the head must still evaluate after it. Any OTHER
+input bump that moves no exported derivation (packages, apps, configurations with their revision
 neutralised) is DROPPED, not carried. After a push, the trace of the change is written on this repo's
 `fabric/relock` branch, which nothing pins.
 
@@ -43,10 +54,17 @@ neutralised) is DROPPED, not carried. After a push, the trace of the change is w
 nix-flake-commons' `fabric/heads`, the edges from each code head's lock, both read through the GitHub
 API. A cycle, an id that is not a head, or an id that resolves elsewhere fails it.
 --downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
-plan's order; a head that pins a failed head is not run. The pass ends non-zero naming every failure.
+plan's order; a head that pins a failed head is not run. A pass PROPAGATES: the start runs its whole
+rule, every other head only `edges after` — its third-party inputs move in its own runs. The heads of
+one LEVEL of the plan pin none of each other, so they run at once, at most --jobs at a time (4); each
+one's words are kept and shown whole, in the plan's order, when its level ends. The pass ends non-zero naming every failure.
 Exit 75: everything landed, but a trace could not be written (the heads that pin it still run).
 A pass runs ONE relock everywhere: each head's is built FROM the pass's tool (`lib.relockOf`), never
 through the head's own flake, and a relock of any other code refuses.
+--plan --script prints, instead, a bash script that plays the plan's EDGES with no relock at all: each
+head in order is cloned, its edges updated by revision through its own registry, committed signed and
+pushed. No measure, no guard: the fallback for when no relock can be built. Read `relock --plan`'s
+gaps after it.
 --no-push commits in THIS checkout and stops before anything leaves it, so the commits can be
 reviewed; it prints the exact command that resumes where it stopped.
 --format=jsonl prints one JSON line per event on stdout — a pass's start, each head run (its verdicts,
@@ -64,6 +82,10 @@ USAGE
 done
 # A head only ever sees what is pushed, so playing a pass after a run that pushed nothing would
 # relock the next heads against the revision this run did NOT carry — and report success.
+if [ "$script" = 1 ] && [ "$planonly" = 0 ]; then
+  echo "relock: --script prints a plan as a script: it goes with --plan" >&2
+  exit 2
+fi
 if [ "$nopush" = 1 ] && [ "$downstream" = 1 ]; then
   echo "relock: --no-push and --downstream contradict each other — a head sees only what is pushed" >&2
   exit 2
@@ -133,6 +155,17 @@ api_raw() { # $1 owner/repo  $2 branch  $3 path -> the file on stdout
     printf 'header = "Accept: application/vnd.github.raw"\n'
   } | curl --config - -fsSL "https://api.github.com/repos/$1/contents/$3?ref=$ref"
 }
+api_tip() { # $1 owner/repo  $2 branch -> the branch's head revision on stdout
+  local ref sha
+  ref=$(jq -rn --arg b "$2" '$b | @uri')
+  sha=$({
+    if [ -n "$gh_token" ]; then printf 'header = "Authorization: Bearer %s"\n' "$gh_token"; fi
+    printf 'header = "Accept: application/vnd.github.sha"\n'
+  } | curl --config - -fsSL "https://api.github.com/repos/$1/commits/$ref") || return 1
+  # One word, or nothing: an empty or garbled answer is no tip.
+  [[ "$sha" =~ ^[[:alnum:]]+$ ]] || return 1
+  printf '%s\n' "$sha"
+}
 
 # An app's program, BUILT with the token, so that running it afterwards needs no fetch and gets no
 # token. `nix build` refuses the program string itself, so its context's derivations are built.
@@ -179,6 +212,18 @@ app_program() { # $1 installable, $2 the function from its value to an app, then
 # that pin this one, and only names the missing trace.
 failed=()
 trace_failed=()
+# Every evaluation this run made, and how long it took: `what<TAB>milliseconds`, in the order made. A
+# pass is slow where its evaluations are, and the per-head seconds alone cannot say which.
+evals=()
+# The digits only: EPOCHREALTIME's separator is the locale's radix (a comma in fr_FR).
+now_ms() { local us=${EPOCHREALTIME//[!0-9]/}; printf '%s\n' "$(( 10#$us / 1000 ))"; }
+timed() { # $1 what  $2 its start (now_ms)
+  evals+=("$1"$'\t'"$(( $(now_ms) - $2 ))")
+}
+evals_json() {
+  if [ "${#evals[@]}" -eq 0 ]; then echo '[]'; return; fi
+  printf '%s\n' "${evals[@]}" | jq -R 'split("\t") | { what: .[0], seconds: ((.[1] | tonumber) / 1000) }' | jq -sc .
+}
 unmeasured=()
 # The innermost error nix printed, on one line: nix opens with a bare `error:` and its trace, and
 # states the cause last — the first `error:` line alone said nothing.
@@ -203,22 +248,26 @@ log_event() { # $1 event  $2 its fields, a JSON object
 }
 pass_role=0
 finish() { # $1 the word for success
+  local outcome="done" ev
+  ev=$(evals_json)
+  if [ "${#evals[@]}" -gt 0 ]; then
+    echo "evaluations: $(jq -r 'map("\(.what) \(.seconds)s") | join(", ")' <<<"$ev")"
+  fi
   if [ "${#unmeasured[@]}" -gt 0 ]; then
     echo "NOT MEASURED by the impact guard (broken before any bump; a bump that moves only these is dropped):"
     printf '  %s\n' "${unmeasured[@]}"
   fi
-  local outcome="done"
   if [ "${#failed[@]}" -gt 0 ] || [ "${#trace_failed[@]}" -gt 0 ]; then outcome=failed; fi
   if [ "$pass_role" = 1 ]; then
     log_event pass "$(jq -n --arg o "$outcome" --argjson s "$SECONDS" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
-      '{ outcome: $o, seconds: $s, failed: $f }')"
+      --argjson e "$ev" '{ outcome: $o, seconds: $s, failed: $f, evals: $e }')"
   else
     local carried='{}'
     if [ -n "${bumped:-}" ]; then carried=$bumped; fi
     log_event head "$(jq -n --arg o "$outcome" --arg p "${landed:-}" --argjson s "$SECONDS" --argjson b "$carried" \
       --argjson d "$(json_list "${dropped[@]}")" --argjson a "$(json_list "${after_done[@]}")" \
       --argjson u "$(json_list "${unmeasured[@]}")" --argjson f "$(json_list "${failed[@]}" "${trace_failed[@]}")" \
-      '{ outcome: $o, pushed: $p, seconds: $s, bumped: $b, dropped: $d, after: $a, unmeasured: $u, failed: $f }')"
+      --argjson e "$ev" '{ outcome: $o, pushed: $p, seconds: $s, bumped: $b, dropped: $d, after: $a, unmeasured: $u, failed: $f, evals: $e }')"
   fi
   if [ "$outcome" = "done" ]; then echo "$1 — $(took)"; exit 0; fi
   echo "FAILED: $(( ${#failed[@]} + ${#trace_failed[@]} )) target(s)"
@@ -244,6 +293,21 @@ elif ! jq -e '.schema == "seedmatic.fabric-heads/v1" and (.heads | type == "obje
   exit 1
 else
   jq '.heads' "$work/fabric-heads.json" > "$heads"
+fi
+# Each id, repository and branch is a NAME, checked here: they reach git, nix, curl URLs and the script
+# --plan --script prints, and a newline or a quote in one would be a command there.
+if ! bad=$(jq -r 'to_entries[]
+    | select((.key | test("^[A-Za-z0-9._-]+$") | not)
+      or ((.value.repo // "") | test("^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$") | not)
+      or ((.value.branch // "") | test("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$") | not)
+      or ((.value.kind // "") | test("^(code|data)$") | not))
+    | .key | @json' "$heads"); then
+  echo "relock(@repoName@): fabric/heads cannot be read as a list of heads — refusing it" >&2
+  exit 1
+fi
+if [ -n "$bad" ]; then
+  echo "REFUSING: fabric/heads holds a head whose id, repository, branch or kind is not a plain name: $(tr '\n' ' ' <<<"$bad")" >&2
+  exit 1
 fi
 selfRepo=$(jq -r '.["@repoName@"].repo // empty' "$heads")
 selfBranch=$(jq -r '.["@repoName@"].branch // empty' "$heads")
@@ -337,17 +401,37 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   # start's pushed flake-commons pin. Unpushed code cannot pass for either.
   mapfile -t code_heads < <(jq -r 'to_entries[] | select(.value.kind == "code") | .key' "$heads" | sort)
   plan_errors=()
+  # The PUSHED locks of the heads named, through the GitHub API, into one { id: lock } file.
+  read_locks() { # $1 the file  $2… head ids; what cannot be read lands in plan_errors
+    local out=$1 id repo branch; shift
+    echo '{}' > "$out"
+    for id in "$@"; do
+      repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
+      branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
+      if ! api_raw "$repo" "$branch" flake.lock > "$work/lock-$id.json" || ! jq -e '.nodes' "$work/lock-$id.json" >/dev/null 2>&1; then
+        plan_errors+=("cannot read the lock of $id ($repo:$branch) through the GitHub API")
+        continue
+      fi
+      jq --arg i "$id" --slurpfile l "$work/lock-$id.json" '. + { ($i): $l[0] }' "$out" > "$out.next" && mv "$out.next" "$out"
+    done
+  }
+  # The gaps of the locks given, as a JSON list: every node that resolves to a head, transitive ones
+  # included, must be locked at that head's tip — read now, so a push made by anyone during a pass
+  # shows. A tip that cannot be read is a gap of its own ("whose tip is unknown"), never a pass.
+  alignment_gaps() { # $1 a { id: lock } file
+    local id repo branch sha tips='{}'
+    for id in $(jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$1" \
+        '{ start: $s, heads: $h[0], locks: $l[0] }' | jq -f "@planJq@" | jq -r '.pinned[]'); do
+      repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
+      branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
+      sha=$(api_tip "$repo" "$branch" 2>/dev/null) || continue
+      tips=$(jq -c --arg i "$id" --arg s "$sha" '. + { ($i): $s }' <<<"$tips")
+    done
+    jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$1" --argjson t "$tips" \
+      '{ start: $s, heads: $h[0], locks: $l[0], tips: $t }' | jq -f "@planJq@" | jq -c '.gaps'
+  }
   locks="$work/locks.json"
-  echo '{}' > "$locks"
-  for id in "${code_heads[@]}"; do
-    repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
-    branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
-    if ! api_raw "$repo" "$branch" flake.lock > "$work/lock-$id.json" || ! jq -e '.nodes' "$work/lock-$id.json" >/dev/null 2>&1; then
-      plan_errors+=("cannot read the lock of $id ($repo:$branch) through the GitHub API")
-      continue
-    fi
-    jq --arg i "$id" --slurpfile l "$work/lock-$id.json" '. + { ($i): $l[0] }' "$locks" > "$work/locks.next" && mv "$work/locks.next" "$locks"
-  done
+  read_locks "$locks" "${code_heads[@]}"
   if [ "${#plan_errors[@]}" -gt 0 ]; then
     echo "relock(@repoName@): NO PLAN — the facts could not all be read:" >&2
     printf '  %s\n' "${plan_errors[@]}" >&2
@@ -368,7 +452,55 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   fi
   jq --arg id "@toolId@" --arg ref "$tool_ref" '. + { tool: { id: $id, ref: $ref } }' "$plan" > "$work/plan.next" && mv "$work/plan.next" "$plan"
 
+  if [ "$script" = 1 ]; then
+    if jq -e '.errors | length > 0' "$plan" >/dev/null; then
+      echo "relock(@repoName@): NO SCRIPT — the plan fails:" >&2
+      jq -r '.errors[] | "  " + .' "$plan" >&2
+      exit 1
+    fi
+    # The fallback, generated from the plan so it cannot drift from it: the edges only, head by head in
+    # the plan's order. It stops at the first failure, since what pins a failed head must not move.
+    cat <<'SCRIPT'
+#!/usr/bin/env bash
+SCRIPT
+    jq -r '"# relock --plan --script, from \(.start): the edges of \(.order | length) head(s), in the plan'"'"'s order, with no relock."' "$plan"
+    cat <<'SCRIPT'
+# Each head is cloned shallow with every git filter off, its edges updated BY REVISION through its own
+# registry, committed signed and pushed. No measure and no guard: read `relock --plan`'s gaps after.
+set -euo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+edges() { # $1 head id  $2 owner/repo  $3 branch, then its edge inputs
+  local id=$1 repo=$2 branch=$3 dir="$work/$1" rev shallow="" names
+  local -a reg=()
+  shift 3
+  echo "== $id: $* =="
+  git clone -q --depth=1 --no-checkout --branch "$branch" "https://github.com/$repo.git" "$dir"
+  mkdir -p "$dir/.git/info" && echo '* -filter' > "$dir/.git/info/attributes"
+  git -C "$dir" reset -q --hard
+  if [ -f "$dir/flake-registry.local.json" ]; then reg=(--flake-registry "$dir/flake-registry.local.json")
+  elif [ -f "$dir/flake-registry.json" ]; then reg=(--flake-registry "$dir/flake-registry.json"); fi
+  rev=$(git -C "$dir" rev-parse HEAD)
+  if [ "$(git -C "$dir" rev-parse --is-shallow-repository)" = true ]; then shallow="&shallow=1"; fi
+  nix "${reg[@]}" flake update "$@" --flake "git+file://$dir?rev=$rev$shallow" --output-lock-file "$dir/flake.lock" --refresh
+  if git -C "$dir" diff --quiet -- flake.lock; then echo "  already current"; return; fi
+  names=$(printf '%s, ' "$@"); names=${names%, }
+  git -C "$dir" commit -q -S -m "chore(flake): relock edges ($names)" -- flake.lock
+  git -C "$dir" push -q
+  echo "  pushed $(git -C "$dir" rev-parse --short HEAD)"
+}
+SCRIPT
+    jq -r '. as $p | .order[] as $id
+      | [ $p.edges[] | select(.from == $id) | .input ] | unique as $e
+      | if ($e | length) == 0 then "# \($id): no edge"
+        else "edges " + ([ $id, $p.heads[$id].repo, $p.heads[$id].branch ] + $e | map(@sh) | join(" ")) end' "$plan"
+    echo 'echo "done — now read the gaps: relock --plan"'
+    exit 0
+  fi
   if [ "$planonly" = 1 ]; then
+    # Whether the fabric is aligned NOW: the question a plan can answer in seconds, with no pass.
+    gaps=$(alignment_gaps "$locks") || gaps='["the alignment could not be judged"]'
+    jq --argjson g "$gaps" '. + { gaps: $g }' "$plan" > "$work/plan.next" && mv "$work/plan.next" "$plan"
     jq 'del(.heads)' "$plan"
     log_event plan "$(jq -c 'del(.heads)' "$plan")"
     if jq -e '.errors | length > 0' "$plan" >/dev/null; then exit 1; fi
@@ -412,53 +544,144 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   pass_role=1
   log_event pass-start "$(jq -n --arg t "$RELOCK_PASS_TOOL_REF" --argjson o "$(json_list "${order[@]}")" '{ tool: $t, order: $o }')"
   echo
-  declare -A down=()
+  declare -A down=() progs=() pids=()
   here=$(pwd)
-  for id in "${order[@]}"; do
-    # A head that pins a head which failed, or was not run, would relock against what that head did
-    # NOT carry: it is not run, and the failure is said with the head it waits on.
-    blocked=$(jq -r --arg i "$id" '.edges[] | select(.from == $i) | .to' "$plan" | while read -r d; do
-      if [ -n "${down[$d]:-}" ]; then printf '%s\n' "$d"; fi; done | head -n1)
-    if [ -n "$blocked" ]; then
-      echo "== $id: NOT RUN — it pins $blocked, which did not land in this pass =="
-      log_event not-run "$(jq -n --arg i "$id" --arg b "$blocked" '{ target: $i, pins: $b }')"
-      failed+=("head $id (pins $blocked)")
-      down[$id]=1
-      continue
-    fi
-    echo "== $id =="
-    head_started=$SECONDS
-    rc=0
-    if [ "$id" = "@repoName@" ]; then
-      # The start's own relock, by the very program running here, in the operator's checkout.
-      ( cd "$here" && RELOCK_HEAD="$id" "$0" "${targets[@]}" ) || rc=$?
-    else
-      # From the tool, never through the head's flake: that one locks the head's OLD pins, which the new
-      # tool may no longer satisfy (an input the tool dropped, followed by an old pin of another head),
-      # and the head could then never take the bump that repairs them.
-      if ! prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\""); then
-        echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
-        rc=1
+  bufs="$work/heads"
+  mkdir -p "$bufs"
+  # One head's run, into its buffer: its words, its events (fd 3 in jsonl), its exit code, its seconds.
+  run_head() { # $1 id
+    local id=$1 buf="$bufs/$1" started=$SECONDS rc=0 elsewhere
+    mkdir -p "$buf"
+    {
+      if [ "$id" = "@repoName@" ]; then
+        # The start's own relock, by the very program running here, in the operator's checkout.
+        ( cd "$here" && RELOCK_HEAD="$id" RELOCK_PASS_LANDED_FILE="$buf/landed" "$0" "${targets[@]}" ) || rc=$?
       else
         # Run from outside any checkout, so the head clones its own branch.
         elsewhere=$(mktemp -d)
-        ( cd "$elsewhere" && RELOCK_HEAD="$id" "$prog" ) || rc=$?
+        ( cd "$elsewhere" && RELOCK_HEAD="$id" RELOCK_PASS_LANDED_FILE="$buf/landed" "${progs[$id]}" ) || rc=$?
         rm -rf "$elsewhere"
       fi
+    } > "$buf/out" 2>&1 3> "$buf/events"
+    echo "$rc" > "$buf/rc"
+    echo $((SECONDS - started)) > "$buf/seconds"
+  }
+  mapfile -t levels < <(jq -c '.levels[]' "$plan")
+  for level in "${levels[@]}"; do
+    mapfile -t ids < <(jq -r '.[]' <<<"$level")
+    runnable=()
+    for id in "${ids[@]}"; do
+      # A head that pins a head which failed, or was not run, would relock against what that head did
+      # NOT carry: it is not run, and the failure is said with the head it waits on.
+      blocked=$(jq -r --arg i "$id" '.edges[] | select(.from == $i) | .to' "$plan" | while read -r d; do
+        if [ -n "${down[$d]:-}" ]; then printf '%s\n' "$d"; fi; done | head -n1)
+      if [ -n "$blocked" ]; then
+        echo "== $id: NOT RUN — it pins $blocked, which did not land in this pass =="
+        log_event not-run "$(jq -n --arg i "$id" --arg b "$blocked" '{ target: $i, pins: $b }')"
+        failed+=("head $id (pins $blocked)")
+        down[$id]=1
+        continue
+      fi
+      if [ "$id" != "@repoName@" ]; then
+        # From the tool, never through the head's flake: that one locks the head's OLD pins, which the
+        # new tool may no longer satisfy (an input the tool dropped, followed by an old pin of another
+        # head), and the head could then never take the bump that repairs them. Built here, one by
+        # one, so each build is timed and a failure is said before the level runs.
+        t0=$(now_ms)
+        prog_rc=0
+        prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\"") || prog_rc=1
+        timed "build $id's relock" "$t0"
+        if [ "$prog_rc" != 0 ]; then
+          echo "== $id =="
+          echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
+          echo "  ^ FAILED — $id's relock exited 1 (its output is above) — $(took 0)"
+          echo
+          failed+=("head $id")
+          down[$id]=1
+          continue
+        fi
+        progs[$id]=$prog
+      fi
+      runnable+=("$id")
+    done
+    [ "${#runnable[@]}" -gt 0 ] || continue
+    if [ "${#runnable[@]}" -gt 1 ]; then
+      echo "== level: ${runnable[*]} — at once, at most $jobs at a time =="
     fi
-    head_took=$(took $((SECONDS - head_started)))
-    if [ "$rc" = 75 ]; then
-      echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
-      trace_failed+=("trace $id (its change landed)")
-    elif [ "$rc" != 0 ]; then
-      echo "  ^ FAILED — $id's relock exited $rc (its output is above) — $head_took"
-      failed+=("head $id")
-      down[$id]=1
-    else
-      echo "  ^ $id done ($head_took)"
-    fi
-    echo
+    for id in "${runnable[@]}"; do
+      while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n || true; done
+      run_head "$id" &
+      pids[$id]=$!
+    done
+    for id in "${runnable[@]}"; do
+      wait "${pids[$id]}" || true
+      if [ "${#runnable[@]}" -gt 1 ]; then echo "  ended: $id ($(took "$(cat "$bufs/$id/seconds")"))"; fi
+    done
+    [ "${#runnable[@]}" -gt 1 ] && echo
+    for id in "${runnable[@]}"; do
+      echo "== $id =="
+      cat "$bufs/$id/out"
+      if [ "${RELOCK_FORMAT:-text}" = jsonl ]; then cat "$bufs/$id/events" >&"$RELOCK_EVENTS_FD"; fi
+      rc=$(cat "$bufs/$id/rc")
+      head_took=$(took "$(cat "$bufs/$id/seconds")")
+      # What this head landed, as it says, for the heads that pin it to take exactly that — and only
+      # while its branch's tip IS that: a push by anyone after it ended would otherwise pass for it.
+      # Unknown either way, the heads that pin it are not run: the guard never opens on a doubt.
+      landed_ok=1
+      if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then
+        landed_sha=$(cat "$bufs/$id/landed" 2>/dev/null || true)
+        if [ -z "$landed_sha" ]; then
+          echo "  FAILED — $id did not say what it landed"
+          landed_ok=0
+        elif ! tip=$(api_tip "$(jq -r --arg i "$id" '.[$i].repo' "$heads")" "$(jq -r --arg i "$id" '.[$i].branch' "$heads")" 2>/dev/null); then
+          echo "  FAILED — the tip of $id cannot be read, so what it landed cannot be confirmed"
+          landed_ok=0
+        elif [ "$tip" != "$landed_sha" ]; then
+          echo "  FAILED — $id landed ${landed_sha:0:9}, but its branch is at ${tip:0:9}: someone pushed after it"
+          landed_ok=0
+        else
+          jq --arg i "$id" --arg t "$landed_sha" '.landed = ((.landed // {}) + { ($i): $t })' "$RELOCK_PASS_PLAN" > "$RELOCK_PASS_PLAN.next" \
+            && mv "$RELOCK_PASS_PLAN.next" "$RELOCK_PASS_PLAN"
+        fi
+      fi
+      if [ "$landed_ok" = 0 ]; then
+        echo "  ^ FAILED — what $id landed is not confirmed; what pins it is not run — $head_took"
+        failed+=("head $id (landed unconfirmed)")
+        down[$id]=1
+      elif [ "$rc" = 75 ]; then
+        echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
+        trace_failed+=("trace $id (its change landed)")
+      elif [ "$rc" != 0 ]; then
+        echo "  ^ FAILED — $id's relock exited $rc (its output is above) — $head_took"
+        failed+=("head $id")
+        down[$id]=1
+      else
+        echo "  ^ $id done ($head_took)"
+      fi
+      echo
+    done
   done
+  # ALIGNED, or every gap named: the pushed locks of the pass's heads, read again, every pin at its
+  # head's tip. A head that failed, or a push made by anyone during the pass, shows here.
+  echo "== alignment =="
+  t0=$(now_ms)
+  plan_errors=()
+  read_locks "$work/locks-end.json" "${order[@]}"
+  if [ "${#plan_errors[@]}" -gt 0 ]; then
+    printf '  %s\n' "${plan_errors[@]}"
+    failed+=("alignment (a lock could not be read)")
+  elif ! gaps=$(alignment_gaps "$work/locks-end.json"); then
+    failed+=("alignment (it could not be judged)")
+  elif [ "$(jq length <<<"$gaps")" -gt 0 ]; then
+    while read -r g; do
+      echo "  NOT ALIGNED — $g"
+      failed+=("not aligned: $g")
+    done < <(jq -r '.[]' <<<"$gaps")
+  else
+    echo "  aligned: every pin of the ${#order[@]} head(s) is at its head's tip"
+  fi
+  timed "alignment check" "$t0"
+  echo
   finish "DONE (pass $RELOCK_PASS_WAVE)"
 fi
 
@@ -553,13 +776,15 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
 # A flake with neither `packages` nor configurations is an AGGREGATOR: what it exports is its inputs,
 # which the heads that pin it follow — so its impact is the revision each root input is locked at.
 #
-# The SHAPE is read once, before anything moves: which systems the flake exposes, and which of them
-# evaluate. A system that does not evaluate at the start is said, with its error, and left out — it was
-# broken before this run (measured 2026-10-09: rke2lab's x86_64 systems). A measured system that stops
-# evaluating after a bump is fatal: absent and broken must not look alike.
+# The SHAPE is read once, before anything moves: which systems the flake exposes — names only, nothing
+# of them is evaluated. A measure evaluates each system on its own, so a system that does not evaluate
+# is known by name: broken BEFORE this run (it fails at the HEAD the run started from) it is said, with
+# its error, and left out (measured 2026-10-09: rke2lab's x86_64 systems); broken BY a bump it is
+# fatal — absent and broken must not look alike. There is no separate probe: it evaluated what the
+# measure evaluates again, and cost a pass half its time (2026-10-14: ndh 51 s of probes, no bump).
 #
-# ⚠️ Every failure is returned EXPLICITLY — evalmap runs inside `$(…)`, where errexit does not carry
-# (no `inherit_errexit`).
+# ⚠️ Every failure is returned EXPLICITLY — a measure runs inside `{ … } ||` lists, where errexit
+# does not carry.
 #
 # What nix reads of this head is a REVISION, never its working tree. A `git+file` reference without
 # `rev` copies the tracked files FROM DISK, clean tree or dirty alike (measured 2026-10-11, nix 2.34.8,
@@ -579,60 +804,94 @@ ap_expr='sys: builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a
 aggregator=0
 pk_systems=()
 ap_systems=()
-read_shape() { # what HEAD exports
-  local shape sys err at
-  at=$(flake_at "$(git -C "$REPO" rev-parse HEAD)")
+head0=""
+read_shape() { # what HEAD exports: its systems by name, and whether it is an aggregator
+  local shape at t0
+  head0=$(git -C "$REPO" rev-parse HEAD)
+  at=$(flake_at "$head0")
+  t0=$(now_ms)
   shape=$(nix eval --impure --json --expr "/* relock:shape */ let o = $at; in {
       packages = builtins.attrNames (o.packages or { }); apps = builtins.attrNames (o.apps or { });
       configurations = (o ? nixosConfigurations) || (o ? darwinConfigurations); }") || return 1
+  timed shape "$t0"
   if jq -e '(.packages | length) == 0 and (.configurations | not)' <<<"$shape" >/dev/null; then
     aggregator=1
     return 0
   fi
-  err=$(mktemp)
-  while read -r sys; do
-    if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
-      pk_systems+=("$sys")
-    else
-      unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
-      echo "  ${unmeasured[-1]}"
-    fi
-  done < <(jq -r '.packages[]' <<<"$shape")
-  while read -r sys; do
-    if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
-      ap_systems+=("$sys")
-    else
-      unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
-      echo "  ${unmeasured[-1]}"
-    fi
-  done < <(jq -r '.apps[]' <<<"$shape")
-  rm -f "$err"
+  mapfile -t pk_systems < <(jq -r '.packages[]' <<<"$shape")
+  mapfile -t ap_systems < <(jq -r '.apps[]' <<<"$shape")
 }
 nix_list() { local x out="["; for x in "$@"; do out+=" \"$x\""; done; printf '%s ]' "$out"; }
-evalmap() { # $1 the revision measured
-  local lock
+# One projection of a revision: the packages or the apps of one system, or the configurations.
+project() { # $1 revision  $2 packages|apps|configurations  $3 system -> JSON on stdout, nix's words on stderr
+  local expr
+  case $2 in
+    packages) expr="($pk_expr) \"$3\"" ;;
+    apps) expr="($ap_expr) \"$3\"" ;;
+    configurations) expr="import @configurationsNix@ { outputs = o; }" ;;
+  esac
+  nix eval --impure --json --expr "/* relock:measure $2${3:+ $3} */ let o = $(flake_at "$1"); in $expr"
+}
+# The measure of a revision, into a file: every measured system's packages and apps, and the
+# configurations — in ONE evaluation, since each nix process evaluates the flake again (2026-10-14:
+# nnh 50 s in one, 104 s split in nine). Only when it fails is each projection evaluated on its own,
+# to tell which system does not evaluate. A head's own evaluation warnings are its business, not this
+# measure's: they are left out, so a pass reads as its heads and their verdicts; anything else nix
+# says reaches the terminal. Run in THIS shell, never in `$(…)`: a system found broken before the run
+# leaves the measured set for the rest of it.
+measure_into() { # $1 the file  $2 the revision measured
+  local out=$1 rev=$2 kind sys part err res='{"packages":{},"apps":{}}' lock
+  local -a kept
   if [ "$aggregator" = 1 ]; then
     # A `follows` root input has no lock of its own — it is an input PATH whose target is already
     # counted where it is defined — so it is left out rather than resolved.
-    lock=$(git -C "$REPO" show "$1:flake.lock") || return 1
+    lock=$(git -C "$REPO" show "$rev:flake.lock") || return 1
     jq -S '. as $l | .nodes.root.inputs
       | with_entries(select(.value | type == "string"))
-      | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' <<<"$lock"
+      | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' <<<"$lock" > "$out"
     return
   fi
-  # A head's own evaluation warnings are its business, not this measure's: they are left out, so a
-  # pass reads as its heads and their verdicts. Anything else nix says still reaches the terminal.
-  local err out rc=0
   err=$(mktemp)
-  out=$(nix eval --impure --json --expr "/* relock:measure */ let o = $(flake_at "$1");
+  if part=$(nix eval --impure --json --expr "/* relock:measure all */ let o = $(flake_at "$rev");
       each = f: systems: builtins.listToAttrs (map (s: { name = s; value = f s; }) systems); in {
       packages = each ($pk_expr) $(nix_list "${pk_systems[@]}");
       apps = each ($ap_expr) $(nix_list "${ap_systems[@]}");
-      configurations = import @configurationsNix@ { outputs = o; }; }" 2>"$err") || rc=1
+      configurations = import @configurationsNix@ { outputs = o; }; }" 2>"$err"); then
+    grep -v '^evaluation warning' "$err" >&2 || true
+    rm -f "$err"
+    jq -S . <<<"$part" > "$out"
+    return
+  fi
+  for kind in packages apps; do
+    kept=()
+    if [ "$kind" = packages ]; then set -- "${pk_systems[@]}"; else set -- "${ap_systems[@]}"; fi
+    for sys in "$@"; do
+      if part=$(project "$rev" "$kind" "$sys" 2>"$err"); then
+        grep -v '^evaluation warning' "$err" >&2 || true
+        res=$(jq -c --arg k "$kind" --arg s "$sys" --argjson p "$part" '.[$k][$s] = $p' <<<"$res")
+        kept+=("$sys")
+        continue
+      fi
+      # Broken before this run: it fails at the run's first HEAD too. Known only while no measure
+      # has set the measured systems — after one, a system that stops evaluating is the bump's doing.
+      if [ "$baseline_known" = 0 ] && { [ "$rev" = "$head0" ] || ! project "$head0" "$kind" "$sys" >/dev/null 2>&1; }; then
+        unmeasured+=("$kind of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
+        continue
+      fi
+      grep -v '^evaluation warning' "$err" >&2 || true
+      rm -f "$err"
+      return 1
+    done
+    if [ "$kind" = packages ]; then pk_systems=("${kept[@]}"); else ap_systems=("${kept[@]}"); fi
+  done
+  if ! part=$(project "$rev" configurations 2>"$err"); then
+    grep -v '^evaluation warning' "$err" >&2 || true
+    rm -f "$err"
+    return 1
+  fi
   grep -v '^evaluation warning' "$err" >&2 || true
   rm -f "$err"
-  [ "$rc" = 0 ] || return 1
-  jq -S . <<<"$out" || return 1
+  jq -S --argjson c "$part" '. + { configurations: $c }' <<<"$res" > "$out"
 }
 
 all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }
@@ -687,47 +946,13 @@ pruned_by='{}'
 dropped=()
 after_done=()
 
-relock_input() { # $1 input name
-  printf '  %-18s ' "$1"
-  local rc=0 before
-  before=$(lockrev "$REPO/flake.lock" "$1")
-  nix_update "$1" || rc=$?
-  if [ "$rc" = 3 ]; then
-    git -C "$REPO" checkout -q -- flake.lock
-    if [ "$retrying" = 0 ]; then
-      deferred+=("$1")
-      echo "deferred — it is coupled to another input's bump; retried after the others"
-      return 0
-    fi
-    echo "FAILED — still coupled after the other bumps; nothing carried"
-    printf '%s\n' "$update_err" | grep 'follows a non-existent input' | sed 's/^/    /' >&2
-    echo "    the inputs named above can only move together: nix flake update <both>, then relock" >&2
-    return 1
-  fi
-  if [ "$rc" = 1 ]; then
-    git -C "$REPO" checkout -q -- flake.lock
-    echo "FAILED to resolve"
-    printf '%s\n' "$update_err" | sed 's/^/    /' >&2
-    return 1
-  fi
-  if [ "$rc" = 2 ]; then
-    git -C "$REPO" checkout -q -- flake.lock
-    echo "FAILED to fetch — nix fell back to a cached copy, so the bump is NOT carried"
-    printf '%s\n' "$update_err" | grep -E "$cache_fallbacks|error|status" | sed 's/^/    /' >&2
-    return 1
-  fi
-  if git -C "$REPO" diff --quiet -- flake.lock; then
-    echo "already current"
-    return 0
-  fi
-  # A lock has to be fetchable by everyone, not only by whoever ran this. The ONLY way a local
-  # revision can enter one is a path- or file-typed ref: a `github:` fetch physically cannot see an
-  # unpushed commit, which is what makes the chain push-gated to begin with. So this single check IS
-  # the invariant.
-  local locked_at
-  # Checked: an unreadable lock left `locked_at` empty, and an empty answer is what "not local" looks
-  # like — the guard against machine-local locks would have waved it through in silence.
-  if ! locked_at=$(jq -r --arg i "$1" '
+# Whether an input's bumped lock pins a revision only this machine can fetch: printed, empty when not.
+# A lock has to be fetchable by everyone, not only by whoever ran this. The ONLY way a local revision
+# can enter one is a path- or file-typed ref: a `github:` fetch physically cannot see an unpushed
+# commit, which is what makes the chain push-gated to begin with. So this single check IS the
+# invariant. Checked: an unreadable lock returns 1 — an empty answer is what "not local" looks like.
+local_lock_of() { # $1 input name
+  jq -r --arg i "$1" '
     (.nodes.root.inputs[$i]) as $n
     | if ($n | type) != "string" then ""
       else
@@ -735,24 +960,175 @@ relock_input() { # $1 input name
         | if .type == "path" then "path:" + (.path // "")
           elif ((.url // "") | test("^(file|git\\+file)://")) then .url
           else "" end
-      end' "$REPO/flake.lock"); then
+      end' "$REPO/flake.lock"
+}
+local_lock_refused() { # $1 what  $2 the local ref
+  echo "LOCAL lock REFUSED ($1) -> $2"
+  echo "relock: that revision resolves only on this machine, so the lock would be unfetchable" >&2
+  echo "        for every other head. Aim this id at a PUSHED ref and run again — another" >&2
+  echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
+}
+
+# A bump that failed: the lock restored, and why. Returns 0 when the bump was set aside to be retried.
+update_failed() { # $1 nix_update's code  $2 what, for the deferral
+  git -C "$REPO" checkout -q -- flake.lock
+  case $1 in
+    3)
+      if [ "$retrying" = 0 ]; then
+        deferred+=("$2")
+        echo "deferred — it is coupled to another input's bump; retried after the others"
+        return 0
+      fi
+      echo "FAILED — still coupled after the other bumps; nothing carried"
+      printf '%s\n' "$update_err" | grep 'follows a non-existent input' | sed 's/^/    /' >&2
+      echo "    the inputs named above can only move together: nix flake update <both>, then relock" >&2 ;;
+    1)
+      echo "FAILED to resolve"
+      printf '%s\n' "$update_err" | sed 's/^/    /' >&2 ;;
+    2)
+      echo "FAILED to fetch — nix fell back to a cached copy, so the bump is NOT carried"
+      printf '%s\n' "$update_err" | grep -E "$cache_fallbacks|error|status" | sed 's/^/    /' >&2 ;;
+  esac
+  return 1
+}
+
+# THE EDGES, in one bump: every input that is a head moves together — coupled ones (ndh, which
+# follows an input the new flake-commons dropped) by construction — and the head must still evaluate
+# after it. No impact guard: the measure is the evaluability check, and the new baseline of the
+# guarded inputs after it.
+relock_edges() { # $@ edge input names
+  printf '  %-18s ' "edges"
+  local rc=0 e t0 measured after ref
+  local -a carried=() body=()
+  local -A was=()
+  for e in "$@"; do was[$e]=$(lockrev "$REPO/flake.lock" "$e"); done
+  nix_update "$@" || rc=$?
+  if [ "$rc" != 0 ]; then update_failed "$rc" ":edges"; return; fi
+  if git -C "$REPO" diff --quiet -- flake.lock; then
+    echo "already current ($*)"
+    return 0
+  fi
+  for e in "$@"; do
+    if ! ref=$(local_lock_of "$e"); then
+      git -C "$REPO" checkout -q -- flake.lock
+      echo "FAILED to read the updated lock — bump NOT carried"
+      return 1
+    fi
+    if [ -n "$ref" ]; then
+      git -C "$REPO" checkout -q -- flake.lock
+      local_lock_refused "edge $e" "$ref"
+      return 1
+    fi
+  done
+  # In a pass, an edge takes the revision its head LANDED in this pass, which the starter wrote into the
+  # plan when that head ended: a head pushed by anyone in between would leave this lock off what the
+  # pass carried, so it is refused here, before anything is pushed.
+  if [ "$member" = 1 ]; then
+    local to want got
+    for e in "$@"; do
+      to=$(jq -r --arg i "$e" '.[] | select(.input == $i) | .to' <<<"$edges_json")
+      want=$(jq -r --arg i "$to" '.landed[$i] // empty' "$RELOCK_PASS_PLAN")
+      got=$(lockrev "$REPO/flake.lock" "$e")
+      if [ -n "$want" ] && [ "$got" != "$want" ]; then
+        git -C "$REPO" checkout -q -- flake.lock
+        echo "FAILED — edge $e resolved ${got:0:9}, but $to landed ${want:0:9} in this pass: it moved during the pass"
+        return 1
+      fi
+    done
+  fi
+  t0=$(now_ms)
+  { measured=$(lock_commit) && measure_into "$work/measure.json" "$measured" && after=$(cat "$work/measure.json"); } || rc=1
+  timed "measure edges" "$t0"
+  if [ "$rc" != 0 ]; then
+    git -C "$REPO" checkout -q -- flake.lock
+    echo "FAILED — this head does not evaluate with its edges bumped; nothing carried"
+    return 1
+  fi
+  for e in "$@"; do
+    if [ "$(lockrev "$REPO/flake.lock" "$e")" != "${was[$e]}" ]; then
+      carried+=("$e")
+      body+=(-m "$e: ${was[$e]:0:9} -> $(lockrev "$REPO/flake.lock" "$e" | cut -c1-9)")
+      bumped=$(jq -c --arg i "$e" --arg b "${was[$e]}" --arg a "$(lockrev "$REPO/flake.lock" "$e")" '. + { ($i): [ $b, $a ] }' <<<"$bumped")
+    fi
+  done
+  local names
+  names=$(printf '%s, ' "${carried[@]}"); names=${names%, }
+  if [ "${#carried[@]}" -eq 0 ]; then names="their lock only"; fi
+  if ! git -C "$REPO" commit -q -S -m "chore(flake): relock edges ($names)" "${body[@]}" -- flake.lock; then
+    git -C "$REPO" checkout -q -- flake.lock
+    echo "FAILED to commit the bump — lock restored"
+    return 1
+  fi
+  baseline=$after
+  baseline_known=1
+  committed=1
+  echo "BUMPED — edges carried, no impact guard: $names"
+}
+
+# The starting point of the impact guard, measured only when a guarded input first needs it: a head a
+# pass requests runs `edges after`, and the measure of its edges IS its baseline, so a full evaluation
+# of HEAD would be thrown away (one per head of every pass, measured 2026-10-14).
+baseline=""
+baseline_known=0
+ensure_baseline() {
+  [ "$baseline_known" = 1 ] && return 0
+  local t0 rc=0
+  t0=$(now_ms)
+  { measure_into "$work/measure.json" "$(git -C "$REPO" rev-parse HEAD)" && baseline=$(cat "$work/measure.json"); } || rc=1
+  timed baseline "$t0"
+  [ "$rc" = 0 ] || return 1
+  baseline_known=1
+}
+
+retry_deferred() {
+  [ "${#deferred[@]}" -gt 0 ] || return 0
+  echo "== deferred inputs: retried once, after the others =="
+  retrying=1
+  local i
+  for i in "${deferred[@]}"; do
+    if [ "$i" = ":edges" ]; then
+      relock_edges "${edge_inputs[@]}" || failed+=("edges")
+    else
+      relock_input "$i" || failed+=("input $i")
+    fi
+  done
+  deferred=()
+  echo
+}
+
+relock_input() { # $1 input name
+  printf '  %-18s ' "$1"
+  local rc=0 before
+  if ! ensure_baseline; then
+    echo "FAILED to measure the starting point — nothing reconciled for it"
+    return 1
+  fi
+  before=$(lockrev "$REPO/flake.lock" "$1")
+  nix_update "$1" || rc=$?
+  if [ "$rc" != 0 ]; then update_failed "$rc" "$1"; return; fi
+  if git -C "$REPO" diff --quiet -- flake.lock; then
+    echo "already current"
+    return 0
+  fi
+  local locked_at
+  if ! locked_at=$(local_lock_of "$1"); then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to read the updated lock — bump NOT carried"
     return 1
   fi
   if [ -n "$locked_at" ]; then
     git -C "$REPO" checkout -q -- flake.lock
-    echo "LOCAL lock REFUSED -> $locked_at"
-    echo "relock: that revision resolves only on this machine, so the lock would be unfetchable" >&2
-    echo "        for every other head. Aim this id at a PUSHED ref and run again — another" >&2
-    echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
+    local_lock_refused "$1" "$locked_at"
     return 1
   fi
-  local after measured
+  local after measured t0 measure_rc=0
   # Checked by hand: relock_input runs as `relock_input … || failed+=…`, and bash switches errexit
   # off for the whole body of a function called in an `||` list. Unchecked, a failed measurement left
   # `after` empty, unequal to the baseline, and the bump was COMMITTED as "derivations moved".
-  if ! measured=$(lock_commit) || ! after=$(evalmap "$measured"); then
+  t0=$(now_ms)
+  { measured=$(lock_commit) && measure_into "$work/measure.json" "$measured" && after=$(cat "$work/measure.json"); } || measure_rc=1
+  timed "measure $1" "$t0"
+  if [ "$measure_rc" != 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to measure impact — bump NOT carried"
     return 1
@@ -815,11 +1191,14 @@ relock_input() { # $1 input name
 # itself stays; a failure restores the tree and says why.
 after_input() { # $1 app name
   printf '  %-18s ' "$1"
-  local err prog head_before
+  local err prog head_before t0 app_rc=0
   local -a moved=()
   err=$(mktemp)
   head_before=$(git -C "$REPO" rev-parse HEAD)
-  if ! prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 'a: a' "${tool_override[@]}" 2>"$err") || ! ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; then
+  t0=$(now_ms)
+  { prog=$(app_program "$(rev_ref "$head_before")#apps.@system@.$1" 'a: a' "${tool_override[@]}" 2>"$err") && ( cd "$REPO" && "$prog" ) >/dev/null 2>>"$err"; } || app_rc=1
+  timed "after $1" "$t0"
+  if [ "$app_rc" != 0 ]; then
     mapfile -t moved < <(git -C "$REPO" diff --name-only)
     if [ "${#moved[@]}" -gt 0 ]; then git -C "$REPO" checkout -q -- "${moved[@]}"; fi
     echo "FAILED (after-inputs app $1) — restored ${moved[*]:-nothing}"
@@ -859,7 +1238,7 @@ write_trace() { # $1 the pushed revision
   # bare store that is the common dir of every worktree of the repo.
   tmp=$(mktemp -d)
   git init -q --bare "$tmp/trace.git" || { rm -rf "$tmp"; return 1; }
-  for attempt in 1 2; do
+  for attempt in 1 2 3 4 5; do
     base=""
     # "Absent" is ls-remote's exit 2 (no such ref); anything else it cannot answer is an error, never
     # read as absent — a root commit pushed over an unseen branch is a rejected push at best.
@@ -886,19 +1265,38 @@ write_trace() { # $1 the pushed revision
     else
       commit=$(git -C "$tmp/trace.git" commit-tree -S "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || break
     fi
-    # One retry: another head of this repository may have written its trace in between.
+    # Retried, on a fresh fetch: the heads of one repository that end together in a level all write
+    # its fabric/relock.
     if git -C "$tmp/trace.git" push -q "$url" "$commit:refs/heads/fabric/relock"; then
       rm -rf "$tmp"
       return 0
     fi
-    [ "$attempt" = 1 ] && echo "  the trace's push was rejected — fetching fabric/relock again, once"
+    [ "$attempt" -lt 5 ] && echo "  the trace's push was rejected — fetching fabric/relock again ($attempt of 4 retries)"
   done
   rm -rf "$tmp"
   return 1
 }
 
+# The EDGES of this head: its root inputs that pin a head, by the plan's own definition (plan.jq on
+# this head's lock alone), so the plan and the local rule cannot disagree on what an edge is.
+if ! edges_json=$(jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$REPO/flake.lock" \
+  '{ start: $s, heads: $h[0], locks: { ($s): $l[0] } }' | jq -f "@planJq@" | jq -c --arg s "@repoName@" \
+  '[ .edges[] | select(.from == $s) | { input, to } ] | unique_by(.input)'); then
+  echo "FAILED to read this head's edges — nothing reconciled" >&2
+  exit 1
+fi
+mapfile -t edge_inputs < <(jq -r '.[].input' <<<"$edges_json")
+is_edge() { jq -e --arg i "$1" 'map(.input) | index($i) != null' <<<"$edges_json" >/dev/null; }
+third_party_inputs() { all_inputs | while read -r i; do is_edge "$i" || printf '%s\n' "$i"; done; }
+
 if [ "${#targets[@]}" -eq 0 ]; then
-  targets=(inputs after)
+  # A pass propagates: a head it requests moves its edges and what runs after them; the start, which
+  # runs its own relock, moves everything.
+  if [ "$member" = 1 ] && [ "$(jq -r .start "$RELOCK_PASS_PLAN")" != "@repoName@" ]; then
+    targets=(edges after)
+  else
+    targets=(edges inputs after)
+  fi
 fi
 
 echo "head: @repoName@ ($selfRepo:$selfBranch) at $REPO ($cur)"
@@ -909,27 +1307,25 @@ if ! read_shape; then
   echo "FAILED to read what this head exports — nothing reconciled" >&2
   exit 1
 fi
-if ! baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)"); then
-  echo "FAILED to measure the starting point — nothing reconciled" >&2
-  exit 1
-fi
 committed=0
 for t in "${targets[@]}"; do
   case $t in
+    edges)
+      echo "== edges =="
+      if [ "${#edge_inputs[@]}" -gt 0 ]; then
+        relock_edges "${edge_inputs[@]}" || failed+=("edges")
+      else
+        echo "  none"
+      fi
+      echo ;;
     inputs)
       echo "== inputs =="
-      while read -r i; do relock_input "$i" || failed+=("input $i"); done < <(all_inputs)
+      while read -r i; do relock_input "$i" || failed+=("input $i"); done < <(third_party_inputs)
       echo ;;
     after)
       if [ "${#afterInputs[@]}" -gt 0 ]; then
         # The deferred inputs first: what runs after the inputs runs after ALL of them.
-        if [ "${#deferred[@]}" -gt 0 ]; then
-          echo "== deferred inputs: retried once, after the others =="
-          retrying=1
-          for i in "${deferred[@]}"; do relock_input "$i" || failed+=("input $i"); done
-          deferred=()
-          echo
-        fi
+        retry_deferred
         echo "== after the inputs =="
         for app in "${afterInputs[@]}"; do after_input "$app" || failed+=("after $app"); done
         echo
@@ -937,7 +1333,11 @@ for t in "${targets[@]}"; do
     *)
       if all_inputs | grep -qx -- "$t"; then
         echo "== input $t =="
-        relock_input "$t" || failed+=("input $t")
+        if is_edge "$t"; then
+          relock_edges "$t" || failed+=("input $t")
+        else
+          relock_input "$t" || failed+=("input $t")
+        fi
         echo
       else
         echo "relock: unknown target '$t' (try --help)" >&2
@@ -946,12 +1346,7 @@ for t in "${targets[@]}"; do
   esac
 done
 
-if [ "${#deferred[@]}" -gt 0 ]; then
-  echo "== deferred inputs: retried once, after the others =="
-  retrying=1
-  for i in "${deferred[@]}"; do relock_input "$i" || failed+=("input $i"); done
-  echo
-fi
+retry_deferred
 
 if [ "$nopush" = 1 ]; then
   ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
@@ -979,6 +1374,11 @@ if [ "$committed" = 1 ]; then
 else
   pushed_head=$(git -C "$REPO" rev-parse HEAD)
   echo "  @repoName@ @ ${pushed_head:0:9}: nothing to push"
+fi
+# In a pass, what this head LANDED — what it pushed, or the tip it found when it had nothing to push — is
+# told to the starter, which compares it to the branch's tip: anything else there is someone else's.
+if [ -n "${RELOCK_PASS_LANDED_FILE:-}" ]; then
+  printf '%s\n' "$pushed_head" > "$RELOCK_PASS_LANDED_FILE"
 fi
 if [ "$committed" = 1 ]; then
   if write_trace "$pushed_head"; then
