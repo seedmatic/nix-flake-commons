@@ -1,29 +1,20 @@
 {
   "schema": "seedmatic.relock/v1",
   "head": "flake-commons",
-  "rev": "f50b98300f8802befbb6d4e644884c21371ec547",
+  "rev": "d2aefe87a7451b65a6910ef620f02b3ab43519df",
   "status": {
-    "wave": "flake-commons@2026-10-14T11:57:01Z",
-    "tool": "c980f36a158ba9ee5551726319f5c0e6d25c7767400145958bb524a78326e9ae",
+    "wave": "flake-commons@2026-10-14T12:34:17Z",
+    "tool": "86be1ecfd7d9b28e3810862652e40b9f25ae6bfd19a4787b0b1d99d3f965404c",
     "bumped": {
-      "home-manager": [
-        "db7d5e2332710f5abb088f6b5de927d7f9511b35",
-        "32904dfe1cf86039f3c8c9f41f94e1cfd76dbb34"
+      "flox": [
+        "71fbf071397403858b30430c1dee7465a3e3bd50",
+        "af0fdbe58ab821decba7cd01f05fe26fb255aa53"
       ]
     },
     "pruned": {},
-    "dropped": [
-      "chromium-bin",
-      "darwin",
-      "determinate",
-      "disko",
-      "extra-container",
-      "flake-compat",
-      "flake-utils",
-      "flox"
-    ],
+    "dropped": [],
     "after": [],
     "unmeasured": [],
-    "seconds": 24
+    "seconds": 20
   }
 }
