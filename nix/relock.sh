@@ -13,6 +13,7 @@
 # after its inputs are its entry's `after` in fabric/heads, read at run time like the rest of it.
 
 downstream=0
+jobs=4
 nopush=0
 planonly=0
 targets=()
@@ -22,12 +23,16 @@ for a in "$@"; do
     --downstream) downstream=1 ;;
     --no-push) nopush=1 ;;
     --plan) planonly=1 ;;
+    --jobs=*)
+      jobs=${a#--jobs=}
+      [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "relock: --jobs wants a count of heads, not '$jobs'" >&2; exit 2; }
+      ;;
     --format=jsonl) RELOCK_FORMAT=jsonl ;;
     --format=text) RELOCK_FORMAT=text ;;
     --format=*) echo "relock: unknown format '${a#--format=}' (text, jsonl)" >&2; exit 2 ;;
     -h|--help)
       cat <<'USAGE'
-relock [--downstream | --no-push | --plan] [--format=text|jsonl] [target...]
+relock [--downstream [--jobs=N] | --no-push | --plan] [--format=text|jsonl] [target...]
 
 Reconcile this head's lock. No target = ALL of it.
 
@@ -48,7 +53,9 @@ nix-flake-commons' `fabric/heads`, the edges from each code head's lock, both re
 API. A cycle, an id that is not a head, or an id that resolves elsewhere fails it.
 --downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
 plan's order; a head that pins a failed head is not run. A pass PROPAGATES: the start runs its whole
-rule, every other head only `edges after` — its third-party inputs move in its own runs. The pass ends non-zero naming every failure.
+rule, every other head only `edges after` — its third-party inputs move in its own runs. The heads of
+one LEVEL of the plan pin none of each other, so they run at once, at most --jobs at a time (4); each
+one's words are kept and shown whole, in the plan's order, when its level ends. The pass ends non-zero naming every failure.
 Exit 75: everything landed, but a trace could not be written (the heads that pin it still run).
 A pass runs ONE relock everywhere: each head's is built FROM the pass's tool (`lib.relockOf`), never
 through the head's own flake, and a relock of any other code refuses.
@@ -467,63 +474,105 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   pass_role=1
   log_event pass-start "$(jq -n --arg t "$RELOCK_PASS_TOOL_REF" --argjson o "$(json_list "${order[@]}")" '{ tool: $t, order: $o }')"
   echo
-  declare -A down=()
+  declare -A down=() progs=() pids=()
   here=$(pwd)
-  for id in "${order[@]}"; do
-    # A head that pins a head which failed, or was not run, would relock against what that head did
-    # NOT carry: it is not run, and the failure is said with the head it waits on.
-    blocked=$(jq -r --arg i "$id" '.edges[] | select(.from == $i) | .to' "$plan" | while read -r d; do
-      if [ -n "${down[$d]:-}" ]; then printf '%s\n' "$d"; fi; done | head -n1)
-    if [ -n "$blocked" ]; then
-      echo "== $id: NOT RUN — it pins $blocked, which did not land in this pass =="
-      log_event not-run "$(jq -n --arg i "$id" --arg b "$blocked" '{ target: $i, pins: $b }')"
-      failed+=("head $id (pins $blocked)")
-      down[$id]=1
-      continue
-    fi
-    echo "== $id =="
-    head_started=$SECONDS
-    rc=0
-    if [ "$id" = "@repoName@" ]; then
-      # The start's own relock, by the very program running here, in the operator's checkout.
-      ( cd "$here" && RELOCK_HEAD="$id" "$0" "${targets[@]}" ) || rc=$?
-    else
-      # From the tool, never through the head's flake: that one locks the head's OLD pins, which the new
-      # tool may no longer satisfy (an input the tool dropped, followed by an old pin of another head),
-      # and the head could then never take the bump that repairs them.
-      t0=$(now_ms)
-      prog_rc=0
-      prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\"") || prog_rc=1
-      timed "build $id's relock" "$t0"
-      if [ "$prog_rc" != 0 ]; then
-        echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
-        rc=1
+  bufs="$work/heads"
+  mkdir -p "$bufs"
+  # One head's run, into its buffer: its words, its events (fd 3 in jsonl), its exit code, its seconds.
+  run_head() { # $1 id
+    local id=$1 buf="$bufs/$1" started=$SECONDS rc=0 elsewhere
+    mkdir -p "$buf"
+    {
+      if [ "$id" = "@repoName@" ]; then
+        # The start's own relock, by the very program running here, in the operator's checkout.
+        ( cd "$here" && RELOCK_HEAD="$id" "$0" "${targets[@]}" ) || rc=$?
       else
         # Run from outside any checkout, so the head clones its own branch.
         elsewhere=$(mktemp -d)
-        ( cd "$elsewhere" && RELOCK_HEAD="$id" "$prog" ) || rc=$?
+        ( cd "$elsewhere" && RELOCK_HEAD="$id" "${progs[$id]}" ) || rc=$?
         rm -rf "$elsewhere"
       fi
-    fi
-    head_took=$(took $((SECONDS - head_started)))
-    # What this head landed — its tip once it ended — for the heads that pin it to take exactly that.
-    if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then
-      if tip=$(api_tip "$(jq -r --arg i "$id" '.[$i].repo' "$heads")" "$(jq -r --arg i "$id" '.[$i].branch' "$heads")" 2>/dev/null); then
-        jq --arg i "$id" --arg t "$tip" '.landed = ((.landed // {}) + { ($i): $t })' "$RELOCK_PASS_PLAN" > "$RELOCK_PASS_PLAN.next" \
-          && mv "$RELOCK_PASS_PLAN.next" "$RELOCK_PASS_PLAN"
+    } > "$buf/out" 2>&1 3> "$buf/events"
+    echo "$rc" > "$buf/rc"
+    echo $((SECONDS - started)) > "$buf/seconds"
+  }
+  mapfile -t levels < <(jq -c '.levels[]' "$plan")
+  for level in "${levels[@]}"; do
+    mapfile -t ids < <(jq -r '.[]' <<<"$level")
+    runnable=()
+    for id in "${ids[@]}"; do
+      # A head that pins a head which failed, or was not run, would relock against what that head did
+      # NOT carry: it is not run, and the failure is said with the head it waits on.
+      blocked=$(jq -r --arg i "$id" '.edges[] | select(.from == $i) | .to' "$plan" | while read -r d; do
+        if [ -n "${down[$d]:-}" ]; then printf '%s\n' "$d"; fi; done | head -n1)
+      if [ -n "$blocked" ]; then
+        echo "== $id: NOT RUN — it pins $blocked, which did not land in this pass =="
+        log_event not-run "$(jq -n --arg i "$id" --arg b "$blocked" '{ target: $i, pins: $b }')"
+        failed+=("head $id (pins $blocked)")
+        down[$id]=1
+        continue
       fi
+      if [ "$id" != "@repoName@" ]; then
+        # From the tool, never through the head's flake: that one locks the head's OLD pins, which the
+        # new tool may no longer satisfy (an input the tool dropped, followed by an old pin of another
+        # head), and the head could then never take the bump that repairs them. Built here, one by
+        # one, so each build is timed and a failure is said before the level runs.
+        t0=$(now_ms)
+        prog_rc=0
+        prog=$(app_program "$RELOCK_PASS_TOOL_REF#lib.relockOf" "f: f \"@system@\" \"$id\"") || prog_rc=1
+        timed "build $id's relock" "$t0"
+        if [ "$prog_rc" != 0 ]; then
+          echo "== $id =="
+          echo "  FAILED — cannot build $id's relock on the pass's tool (its error is above)"
+          echo "  ^ FAILED — $id's relock exited 1 (its output is above) — $(took 0)"
+          echo
+          failed+=("head $id")
+          down[$id]=1
+          continue
+        fi
+        progs[$id]=$prog
+      fi
+      runnable+=("$id")
+    done
+    [ "${#runnable[@]}" -gt 0 ] || continue
+    if [ "${#runnable[@]}" -gt 1 ]; then
+      echo "== level: ${runnable[*]} — at once, at most $jobs at a time =="
     fi
-    if [ "$rc" = 75 ]; then
-      echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
-      trace_failed+=("trace $id (its change landed)")
-    elif [ "$rc" != 0 ]; then
-      echo "  ^ FAILED — $id's relock exited $rc (its output is above) — $head_took"
-      failed+=("head $id")
-      down[$id]=1
-    else
-      echo "  ^ $id done ($head_took)"
-    fi
-    echo
+    for id in "${runnable[@]}"; do
+      while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n || true; done
+      run_head "$id" &
+      pids[$id]=$!
+    done
+    for id in "${runnable[@]}"; do
+      wait "${pids[$id]}" || true
+      if [ "${#runnable[@]}" -gt 1 ]; then echo "  ended: $id ($(took "$(cat "$bufs/$id/seconds")"))"; fi
+    done
+    [ "${#runnable[@]}" -gt 1 ] && echo
+    for id in "${runnable[@]}"; do
+      echo "== $id =="
+      cat "$bufs/$id/out"
+      if [ "${RELOCK_FORMAT:-text}" = jsonl ]; then cat "$bufs/$id/events" >&"$RELOCK_EVENTS_FD"; fi
+      rc=$(cat "$bufs/$id/rc")
+      head_took=$(took "$(cat "$bufs/$id/seconds")")
+      # What this head landed — its tip once it ended — for the heads that pin it to take exactly that.
+      if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then
+        if tip=$(api_tip "$(jq -r --arg i "$id" '.[$i].repo' "$heads")" "$(jq -r --arg i "$id" '.[$i].branch' "$heads")" 2>/dev/null); then
+          jq --arg i "$id" --arg t "$tip" '.landed = ((.landed // {}) + { ($i): $t })' "$RELOCK_PASS_PLAN" > "$RELOCK_PASS_PLAN.next" \
+            && mv "$RELOCK_PASS_PLAN.next" "$RELOCK_PASS_PLAN"
+        fi
+      fi
+      if [ "$rc" = 75 ]; then
+        echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
+        trace_failed+=("trace $id (its change landed)")
+      elif [ "$rc" != 0 ]; then
+        echo "  ^ FAILED — $id's relock exited $rc (its output is above) — $head_took"
+        failed+=("head $id")
+        down[$id]=1
+      else
+        echo "  ^ $id done ($head_took)"
+      fi
+      echo
+    done
   done
   # ALIGNED, or every gap named: the pushed locks of the pass's heads, read again, every pin at its
   # head's tip. A head that failed, or a push made by anyone during the pass, shows here.
@@ -1102,7 +1151,7 @@ write_trace() { # $1 the pushed revision
   # bare store that is the common dir of every worktree of the repo.
   tmp=$(mktemp -d)
   git init -q --bare "$tmp/trace.git" || { rm -rf "$tmp"; return 1; }
-  for attempt in 1 2; do
+  for attempt in 1 2 3 4 5; do
     base=""
     # "Absent" is ls-remote's exit 2 (no such ref); anything else it cannot answer is an error, never
     # read as absent — a root commit pushed over an unseen branch is a rejected push at best.
@@ -1129,12 +1178,13 @@ write_trace() { # $1 the pushed revision
     else
       commit=$(git -C "$tmp/trace.git" commit-tree -S "$tree" -m "relock(@repoName@): trace of ${1:0:9}") || break
     fi
-    # One retry: another head of this repository may have written its trace in between.
+    # Retried, on a fresh fetch: the heads of one repository that end together in a level all write
+    # its fabric/relock.
     if git -C "$tmp/trace.git" push -q "$url" "$commit:refs/heads/fabric/relock"; then
       rm -rf "$tmp"
       return 0
     fi
-    [ "$attempt" = 1 ] && echo "  the trace's push was rejected — fetching fabric/relock again, once"
+    [ "$attempt" -lt 5 ] && echo "  the trace's push was rejected — fetching fabric/relock again ($attempt of 4 retries)"
   done
   rm -rf "$tmp"
   return 1

@@ -64,6 +64,9 @@ case "$*" in
   *"#lib.relockToolId"*) printf '%s' "${STUB_TOOL_ID:-$RELOCK_TOOL_ID}" ;;
   # What the head exports: its systems, and whether it has configurations.
   *"relock:shape"*)
+    if [ -n "${STUB_SLOW:-}" ]; then
+      h=${RELOCK_HEAD:-?}; echo "start $h $(date +%s%N | cut -c1-13)" >> "$T/slow"; sleep "$STUB_SLOW"; echo "end $h $(date +%s%N | cut -c1-13)" >> "$T/slow"
+    fi
     [ "${STUB_HAS_PACKAGES:-true}" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     systems=$(printf '%s\n' ${STUB_SYSTEMS:-aarch64-darwin} | jq -R . | jq -sc .)
     pk=$systems; [ "${STUB_HAS_PACKAGES:-true}" = false ] && pk='[]'
@@ -1095,6 +1098,34 @@ LOCK
   [[ "$output" == *"NOT ALIGNED — peer: node \`t\` pins t at t1"* ]]
 }
 
+@test "a pass runs each level of its plan at once, and shows each head whole, in the plan's order" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  run "$T/relock" --plan
+  [ "$(jq -c .levels <<<"$output")" = '[["t","t-orphan"],["peer"],["peer2"]]' ]
+  STUB_UPDATE=none STUB_SLOW=2 run "$T/relock" --downstream
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"== level: t t-orphan — at once, at most 4 at a time =="*"  ended: t"*"  ended: t-orphan"*"== t =="*"== t-orphan =="*"== peer =="*"== peer2 =="* ]]
+  # t and t-orphan overlapped: each started before the other ended.
+  started_t=$(grep -m1 "^start t " "$T/slow" | cut -d' ' -f3); ended_o=$(grep -m1 "^end t-orphan " "$T/slow" | cut -d' ' -f3)
+  started_o=$(grep -m1 "^start t-orphan " "$T/slow" | cut -d' ' -f3); ended_t=$(grep -m1 "^end t " "$T/slow" | cut -d' ' -f3)
+  [ "$started_o" -lt "$ended_t" ] && [ "$started_t" -lt "$ended_o" ]
+}
+
+@test "--jobs=1 runs a level one head at a time; a count that is not one is refused" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=none STUB_SLOW=1 run "$T/relock" --downstream --jobs=1
+  [ "$status" -eq 0 ]
+  ended_t=$(grep -m1 "^end t " "$T/slow" | cut -d' ' -f3); started_o=$(grep -m1 "^start t-orphan " "$T/slow" | cut -d' ' -f3)
+  [ "$started_o" -ge "$ended_t" ]
+  run "$T/relock" --downstream --jobs=0
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--jobs wants a count of heads, not '0'"* ]]
+}
+
 @test "a tip that cannot be read fails the alignment, never passes it" {
   mk_orphan
   git -C "$T/work" checkout -q develop
@@ -1383,7 +1414,7 @@ HOOK
 }
 
 @test "a trace that cannot be written is its own failure, exit 75 — the change itself has landed" {
-  reject_trace_pushes 2
+  reject_trace_pushes 5
   STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 75 ]
   [[ "$output" == *"FAILED to write the trace on fabric/relock — the change itself is pushed, and has landed"* ]]
@@ -1391,11 +1422,12 @@ HOOK
   [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
 }
 
-@test "a rejected trace push is retried ONCE, on a fresh fetch" {
-  reject_trace_pushes 1
+@test "a rejected trace push is retried on a fresh fetch, up to four times" {
+  reject_trace_pushes 4
   STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 0 ]
-  [[ "$output" == *"the trace's push was rejected — fetching fabric/relock again, once"* ]]
+  [[ "$output" == *"the trace's push was rejected — fetching fabric/relock again (1 of 4 retries)"* ]]
+  [[ "$output" == *"(4 of 4 retries)"* ]]
   [ "$(jq -r .head <<<"$(trace_of t)")" = t ]
 }
 

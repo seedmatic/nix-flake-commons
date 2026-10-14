@@ -1,6 +1,6 @@
 # The plan of a relock pass, from facts only: the heads of fabric/heads, and the lock of each code
 # head. Input: { start, heads: { <id>: { repo, branch, kind } }, locks: { <code id>: <flake.lock> },
-# tips?: { <id>: <rev> } }. Output: { start, heads, edges, order, errors, pinned, gaps? }. Nothing is
+# tips?: { <id>: <rev> } }. Output: { start, heads, edges, order, levels, errors, pinned, gaps? }. Nothing is
 # declared: an edge is a pin of a lock.
 #
 # An edge `from -> to` says `from` pins `to`, so `to` runs first. A root input that is a list is a
@@ -48,16 +48,17 @@ def head_pins($H; $locks):
     | { from: $from, node: .key, head: head_of($H; .value), rev: .value.locked.rev }
     | select(.head != null) ];
 
-# Kahn's order, deterministic: at each step every head whose pins have all run, sorted.
+# Kahn's order, deterministic: at each step every head whose pins have all run, sorted. The heads of
+# one step pin none of each other: they are a LEVEL, which a pass may run at once.
 def topo($nodes; $E):
-  { done: [], left: $nodes, stuck: false }
+  { done: [], steps: [], left: $nodes, stuck: false }
   | until((.left | length) == 0 or .stuck;
       . as $s
       | [ $s.left[] as $n
           | select([ $E[] | select(.from == $n) | .to ] | all(. as $d | $s.done | index($d) != null))
           | $n ] as $ready
       | if ($ready | length) == 0 then .stuck = true
-        else .done += ($ready | sort) | .left -= $ready end);
+        else .done += ($ready | sort) | .steps += [ $ready | sort ] | .left -= $ready end);
 
 # What is left when Kahn's order sticks is the cycles plus the heads downstream of them. A head that no
 # head left pins cannot be on a cycle: drop it, again and again, and only the cycles remain.
@@ -92,6 +93,7 @@ def reach($E; $set):
     heads: $H,
     edges: $E,
     order: [ $t.done[] | select(. as $n | ($scope | index($n)) != null and $H[$n].kind == "code") ],
+    levels: [ $t.steps[] | map(select(. as $n | ($scope | index($n)) != null and $H[$n].kind == "code")) | select(length > 0) ],
     errors: ($startErrors + $idErrors + $cycleErrors),
     pinned: ([ head_pins($H; $in.locks)[] | .head ] | unique)
   }
