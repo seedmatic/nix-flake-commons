@@ -1,25 +1,5 @@
 {
   "nodes": {
-    "bird": {
-      "inputs": {
-        "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
-      },
-      "locked": {
-        "lastModified": 1728808915,
-        "narHash": "sha256-XnOgiKnjDWYEwD18vPJp0M6pvDppjgX480XD6X9nKHs=",
-        "owner": "nxmatic",
-        "repo": "bird",
-        "rev": "2da14fdc1a27b1f532a4de25cbf74b9816c94804",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nxmatic",
-        "ref": "hotfix/v2.15.1-nix-darwin",
-        "repo": "bird",
-        "type": "github"
-      }
-    },
     "chromium-bin": {
       "inputs": {
         "flake-parts": "flake-parts",
@@ -377,24 +357,6 @@
       "original": {
         "owner": "hercules-ci",
         "repo": "flake-parts",
-        "type": "github"
-      }
-    },
-    "flake-utils": {
-      "inputs": {
-        "systems": "systems"
-      },
-      "locked": {
-        "lastModified": 1726560853,
-        "narHash": "sha256-X6rJYSESBVr3hBoH0WbKE5KvhPU5bloyZ2L4K60/fPQ=",
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "rev": "c1dfcf08411b08f6b8615f7d8971a2bfa81d5e8a",
-        "type": "github"
-      },
-      "original": {
-        "owner": "numtide",
-        "repo": "flake-utils",
         "type": "github"
       }
     },
@@ -878,22 +840,6 @@
         "type": "github"
       }
     },
-    "nixpkgs": {
-      "locked": {
-        "lastModified": 1728538411,
-        "narHash": "sha256-f0SBJz1eZ2yOuKUr5CA9BHULGXVSn6miBuUWdTyhUhU=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "b69de56fac8c2b6f8fd27f2eca01dcda8e0a4221",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixpkgs-unstable",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
     "nixpkgs-23-11": {
       "locked": {
         "lastModified": 1717159533,
@@ -1225,7 +1171,6 @@
     },
     "root": {
       "inputs": {
-        "bird": "bird",
         "chromium-bin": "chromium-bin",
         "darwin": "darwin",
         "determinate": "determinate",
@@ -1283,21 +1228,6 @@
       "original": {
         "owner": "Mic92",
         "repo": "sops-nix",
-        "type": "github"
-      }
-    },
-    "systems": {
-      "locked": {
-        "lastModified": 1681028828,
-        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
-        "owner": "nix-systems",
-        "repo": "default",
-        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-systems",
-        "repo": "default",
         "type": "github"
       }
     },
