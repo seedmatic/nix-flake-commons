@@ -10,7 +10,7 @@
     "nnh":              { "repo": "seedmatic/nnh",               "branch": "develop",                "kind": "code" },
     "rke2lab":          { "repo": "seedmatic/rke2lab",           "branch": "develop",                "kind": "code" },
     "seed-incluster":   { "repo": "seedmatic/rke2lab",           "branch": "seed-incluster/develop", "kind": "code" },
-    "flox-catalog":     { "repo": "seedmatic/rke2lab",           "branch": "flox-catalog/develop",   "kind": "code" },
+    "flox-catalog":     { "repo": "seedmatic/rke2lab",           "branch": "flox-catalog/develop",   "kind": "code", "after": [ "lock-envs" ] },
     "workspace":        { "repo": "seedmatic/rke2lab",           "branch": "workspace/develop",      "kind": "code" },
     "fabric-plan":      { "repo": "seedmatic/rke2lab",           "branch": "fabric/plan",            "kind": "data" },
     "nnh-contribution": { "repo": "seedmatic/nnh",               "branch": "fabric/contribution",    "kind": "data" }
