@@ -138,6 +138,17 @@ api_raw() { # $1 owner/repo  $2 branch  $3 path -> the file on stdout
     printf 'header = "Accept: application/vnd.github.raw"\n'
   } | curl --config - -fsSL "https://api.github.com/repos/$1/contents/$3?ref=$ref"
 }
+api_tip() { # $1 owner/repo  $2 branch -> the branch's head revision on stdout
+  local ref sha
+  ref=$(jq -rn --arg b "$2" '$b | @uri')
+  sha=$({
+    if [ -n "$gh_token" ]; then printf 'header = "Authorization: Bearer %s"\n' "$gh_token"; fi
+    printf 'header = "Accept: application/vnd.github.sha"\n'
+  } | curl --config - -fsSL "https://api.github.com/repos/$1/commits/$ref") || return 1
+  # One word, or nothing: an empty or garbled answer is no tip.
+  [[ "$sha" =~ ^[[:alnum:]]+$ ]] || return 1
+  printf '%s\n' "$sha"
+}
 
 # An app's program, BUILT with the token, so that running it afterwards needs no fetch and gets no
 # token. `nix build` refuses the program string itself, so its context's derivations are built.
@@ -358,17 +369,37 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   # start's pushed flake-commons pin. Unpushed code cannot pass for either.
   mapfile -t code_heads < <(jq -r 'to_entries[] | select(.value.kind == "code") | .key' "$heads" | sort)
   plan_errors=()
+  # The PUSHED locks of the heads named, through the GitHub API, into one { id: lock } file.
+  read_locks() { # $1 the file  $2… head ids; what cannot be read lands in plan_errors
+    local out=$1 id repo branch; shift
+    echo '{}' > "$out"
+    for id in "$@"; do
+      repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
+      branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
+      if ! api_raw "$repo" "$branch" flake.lock > "$work/lock-$id.json" || ! jq -e '.nodes' "$work/lock-$id.json" >/dev/null 2>&1; then
+        plan_errors+=("cannot read the lock of $id ($repo:$branch) through the GitHub API")
+        continue
+      fi
+      jq --arg i "$id" --slurpfile l "$work/lock-$id.json" '. + { ($i): $l[0] }' "$out" > "$out.next" && mv "$out.next" "$out"
+    done
+  }
+  # The gaps of the locks given, as a JSON list: every node that resolves to a head, transitive ones
+  # included, must be locked at that head's tip — read now, so a push made by anyone during a pass
+  # shows. A tip that cannot be read is a gap of its own ("whose tip is unknown"), never a pass.
+  alignment_gaps() { # $1 a { id: lock } file
+    local id repo branch sha tips='{}'
+    for id in $(jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$1" \
+        '{ start: $s, heads: $h[0], locks: $l[0] }' | jq -f "@planJq@" | jq -r '.pinned[]'); do
+      repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
+      branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
+      sha=$(api_tip "$repo" "$branch" 2>/dev/null) || continue
+      tips=$(jq -c --arg i "$id" --arg s "$sha" '. + { ($i): $s }' <<<"$tips")
+    done
+    jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$1" --argjson t "$tips" \
+      '{ start: $s, heads: $h[0], locks: $l[0], tips: $t }' | jq -f "@planJq@" | jq -c '.gaps'
+  }
   locks="$work/locks.json"
-  echo '{}' > "$locks"
-  for id in "${code_heads[@]}"; do
-    repo=$(jq -r --arg i "$id" '.[$i].repo' "$heads")
-    branch=$(jq -r --arg i "$id" '.[$i].branch' "$heads")
-    if ! api_raw "$repo" "$branch" flake.lock > "$work/lock-$id.json" || ! jq -e '.nodes' "$work/lock-$id.json" >/dev/null 2>&1; then
-      plan_errors+=("cannot read the lock of $id ($repo:$branch) through the GitHub API")
-      continue
-    fi
-    jq --arg i "$id" --slurpfile l "$work/lock-$id.json" '. + { ($i): $l[0] }' "$locks" > "$work/locks.next" && mv "$work/locks.next" "$locks"
-  done
+  read_locks "$locks" "${code_heads[@]}"
   if [ "${#plan_errors[@]}" -gt 0 ]; then
     echo "relock(@repoName@): NO PLAN — the facts could not all be read:" >&2
     printf '  %s\n' "${plan_errors[@]}" >&2
@@ -390,6 +421,9 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
   jq --arg id "@toolId@" --arg ref "$tool_ref" '. + { tool: { id: $id, ref: $ref } }' "$plan" > "$work/plan.next" && mv "$work/plan.next" "$plan"
 
   if [ "$planonly" = 1 ]; then
+    # Whether the fabric is aligned NOW: the question a plan can answer in seconds, with no pass.
+    gaps=$(alignment_gaps "$locks") || gaps='["the alignment could not be judged"]'
+    jq --argjson g "$gaps" '. + { gaps: $g }' "$plan" > "$work/plan.next" && mv "$work/plan.next" "$plan"
     jq 'del(.heads)' "$plan"
     log_event plan "$(jq -c 'del(.heads)' "$plan")"
     if jq -e '.errors | length > 0' "$plan" >/dev/null; then exit 1; fi
@@ -484,6 +518,27 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
     fi
     echo
   done
+  # ALIGNED, or every gap named: the pushed locks of the pass's heads, read again, every pin at its
+  # head's tip. A head that failed, or a push made by anyone during the pass, shows here.
+  echo "== alignment =="
+  t0=$(now_ms)
+  plan_errors=()
+  read_locks "$work/locks-end.json" "${order[@]}"
+  if [ "${#plan_errors[@]}" -gt 0 ]; then
+    printf '  %s\n' "${plan_errors[@]}"
+    failed+=("alignment (a lock could not be read)")
+  elif ! gaps=$(alignment_gaps "$work/locks-end.json"); then
+    failed+=("alignment (it could not be judged)")
+  elif [ "$(jq length <<<"$gaps")" -gt 0 ]; then
+    while read -r g; do
+      echo "  NOT ALIGNED — $g"
+      failed+=("not aligned: $g")
+    done < <(jq -r '.[]' <<<"$gaps")
+  else
+    echo "  aligned: every pin of the ${#order[@]} head(s) is at its head's tip"
+  fi
+  timed "alignment check" "$t0"
+  echo
   finish "DONE (pass $RELOCK_PASS_WAVE)"
 fi
 

@@ -1,6 +1,7 @@
 # The plan of a relock pass, from facts only: the heads of fabric/heads, and the lock of each code
-# head. Input: { start, heads: { <id>: { repo, branch, kind } }, locks: { <code id>: <flake.lock> } }.
-# Output: { start, heads, edges, order, errors }. Nothing is declared: an edge is a pin of a lock.
+# head. Input: { start, heads: { <id>: { repo, branch, kind } }, locks: { <code id>: <flake.lock> },
+# tips?: { <id>: <rev> } }. Output: { start, heads, edges, order, errors, pinned, gaps? }. Nothing is
+# declared: an edge is a pin of a lock.
 #
 # An edge `from -> to` says `from` pins `to`, so `to` runs first. A root input that is a list is a
 # `follows`, not an edge. An indirect id must be a head, and must resolve to that head's repository; a
@@ -28,6 +29,24 @@ def edges_of($H; $locks):
         else empty end)
   | map(if .edge != null and .edge.from == .edge.to
         then { error: "\(.edge.from): input `\(.edge.input)` pins its own id — a cycle of one" } else . end);
+
+# The head a lock node resolves to, by the edges' own mapping — at ANY depth of the lock, so that the
+# copy of flake-commons ndh pins, inside rke2lab's lock, counts like rke2lab's own pin.
+def head_of($H; $node):
+  ($node.original // {}) as $o
+  | if $o.type == "indirect" and $H[$o.id] != null then $o.id
+    elif $o.type == "github" then
+      [ $H | to_entries[] | select(.value.repo == "\($o.owner)/\($o.repo)" and .value.branch == ($o.ref // "develop")) | .key ]
+      | if length == 1 then .[0] else null end
+    else null end;
+
+# Every locked node of every lock that resolves to a head: { from, node, head, rev }.
+def head_pins($H; $locks):
+  [ $locks | to_entries[] | .key as $from | .value as $l
+    | $l.nodes | to_entries[]
+    | select(.key != $l.root and .value.locked != null)
+    | { from: $from, node: .key, head: head_of($H; .value), rev: .value.locked.rev }
+    | select(.head != null) ];
 
 # Kahn's order, deterministic: at each step every head whose pins have all run, sorted.
 def topo($nodes; $E):
@@ -73,5 +92,13 @@ def reach($E; $set):
     heads: $H,
     edges: $E,
     order: [ $t.done[] | select(. as $n | ($scope | index($n)) != null and $H[$n].kind == "code") ],
-    errors: ($startErrors + $idErrors + $cycleErrors)
+    errors: ($startErrors + $idErrors + $cycleErrors),
+    pinned: ([ head_pins($H; $in.locks)[] | .head ] | unique)
   }
+# ALIGNED means every node that resolves to a head, transitive ones included, is locked at that head's
+# tip. Each gap is named; a head whose tip is not given cannot be judged, and is a gap too.
+| if $in.tips == null then . else
+    . + { gaps: [ head_pins($H; $in.locks)[] | select(.rev != $in.tips[.head])
+      | if $in.tips[.head] == null then "\(.from): node `\(.node)` pins \(.head), whose tip is unknown"
+        else "\(.from): node `\(.node)` pins \(.head) at \((.rev // "none")[0:9]), \(.head) is at \($in.tips[.head][0:9])" end ] }
+  end
