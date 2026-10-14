@@ -67,35 +67,41 @@ case "$*" in
     systems=$(printf '%s\n' ${STUB_SYSTEMS:-aarch64-darwin} | jq -R . | jq -sc .)
     pk=$systems; [ "${STUB_HAS_PACKAGES:-true}" = false ] && pk='[]'
     printf '{"packages":%s,"apps":%s,"configurations":%s}\n' "$pk" "$systems" "${STUB_HAS_CONFIGS:-false}" ;;
-  # One system, tried before anything moves.
-  *"relock:probe"*)
-    if [ -n "${STUB_BROKEN_SYSTEM:-}" ] && [[ "$*" == *"\"$STUB_BROKEN_SYSTEM\""* ]]; then
-      if [ "${STUB_ERROR_STYLE:-}" = nix ]; then
-        printf "error:\n       … while evaluating the attribute 'packages'\n\n       error: attribute '%s' missing\n" "$STUB_BROKEN_SYSTEM" >&2
-      else
-        echo "error: attribute '$STUB_BROKEN_SYSTEM' missing" >&2
-      fi
-      exit 1
-    fi ;;
-  # The measure: packages and apps of every measured system, and the configurations.
-  *"relock:measure"*)
+  # One projection of a measure: the packages or the apps of one system, or the configurations — the
+  # last of every measure, so it counts the measures.
+  *"relock:measure configurations"*)
     n=$(( $(cat "$T/measures" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/measures"
-    [ -n "${STUB_EVAL_WARNING:-}" ] && echo "evaluation warning: $STUB_EVAL_WARNING" >&2
     [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_MEASURE:-ok}" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
-    [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
     [ "${STUB_CONFIGS:-ok}" = fail ] && [ "${STUB_HAS_CONFIGS:-false}" = true ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
+    jq -n --arg c "$(cat "$T/cfg-drv")" --argjson hascfg "${STUB_HAS_CONFIGS:-false}" \
+      '{ darwin: {}, nixos: (if $hascfg then { h: "/nix/store/\($c).drv" } else {} end) }' ;;
+  *"relock:measure "*)
+    all="$*"; m=${all#*relock:measure }; kind=${m%% *}; sys=${m#* }; sys=${sys%% *}
+    if [ -n "${STUB_BROKEN_SYSTEM:-}" ] && [ "$sys" = "$STUB_BROKEN_SYSTEM" ]; then
+      if [ "${STUB_ERROR_STYLE:-}" = nix ]; then
+        printf "error:\n       … while evaluating the attribute 'packages'\n\n       error: attribute '%s' missing\n" "$sys" >&2
+      else
+        echo "error: attribute '$sys' missing" >&2
+      fi
+      exit 1
+    fi
+    [ -n "${STUB_EVAL_WARNING:-}" ] && echo "evaluation warning: $STUB_EVAL_WARNING" >&2
+    # A system broken BY a bump: it evaluates at the pushed head, not at any other revision.
+    if [ -n "${STUB_BREAKS_ON_BUMP:-}" ] && [ "$sys" = "$STUB_BREAKS_ON_BUMP" ] \
+      && [ "$rev" != "$(git -C "$T/remote/seedmatic/t.git" rev-parse develop)" ]; then
+      echo "error: attribute 'broken-by-the-bump' missing" >&2; exit 1
+    fi
+    # An apps projection that fails once a measure has run: broken by a bump, not before the run.
+    [ "$kind" = apps ] && [ "${STUB_APPS:-ok}" = fail ] && [ "$(cat "$T/measures" 2>/dev/null || echo 0)" -ge 1 ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
+    [ "$kind" = packages ] && [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$(cat "$T/measures" 2>/dev/null || echo 0)" -ge 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     drv=$(cat "$T/drv"); [ "${STUB_DRV_FROM_LOCK:-}" = 1 ] && drv=$(git -C "$p" show "$rev:flake.lock" | cksum | cut -d' ' -f1)
-    jq -n --arg d "$drv" --arg l "$(cat "$T/drv-linux")" --arg a "$(cat "$T/app-drv")" --arg c "$(cat "$T/cfg-drv")" \
-      --arg expr "$*" --arg broken "${STUB_BROKEN_SYSTEM:-}" \
-      --argjson haspk "$([ "${STUB_HAS_PACKAGES:-true}" = false ] && echo false || echo true)" \
-      --argjson hascfg "${STUB_HAS_CONFIGS:-false}" '
-      # Only what the expression asks for: its systems, and the configurations if it imports them.
-      def asked($k): [ $expr | capture("\($k) = each \\(.*?\\) \\[(?<l>[^\\]]*)\\]").l | scan("\"([^\"]+)\"") | .[0] ];
-      { packages: ([ asked("packages")[] | { (.): { p: ("/nix/store/" + (if . == "aarch64-linux" then $l else $d end) + ".drv") } } ] | add // {}),
-        apps: ([ asked("apps")[] | { (.): { relock: [ "/nix/store/\($a).drv" ] } } ] | add // {}),
-        configurations: (if ($expr | test("configurations = import ")) then
-          { darwin: {}, nixos: (if $hascfg then { h: "/nix/store/\($c).drv" } else {} end) } else {} end) }' ;;
+    if [ "$kind" = packages ]; then
+      d=$drv; [ "$sys" = aarch64-linux ] && d=$(cat "$T/drv-linux")
+      jq -n --arg d "$d" '{ p: ("/nix/store/" + $d + ".drv") }'
+    else
+      jq -n --arg a "$(cat "$T/app-drv")" '{ relock: [ "/nix/store/\($a).drv" ] }'
+    fi ;;
   # An app's program: its path, then its (empty) context — relock builds it, then runs it itself.
   *"getContext"*) echo '[]' ;;
   # A member's relock, built from the pass's tool: the head is named in the function applied to it.
@@ -799,7 +805,7 @@ LOCK
 
 @test "every evaluation a run makes is timed, in its event and in one line for a human" {
   STUB_UPDATE=rev "$T/relock" --format=jsonl inputs >"$T/out" 2>"$T/err"
-  jq -e '.evals | map(.what) == ["shape", "probe packages aarch64-darwin", "probe apps aarch64-darwin", "baseline", "measure a"]' "$T/out"
+  jq -e '.evals | map(.what) == ["shape", "baseline", "measure a"]' "$T/out"
   jq -e '.evals | all(.seconds | type == "number" and . >= 0)' "$T/out"
   grep -qE '^evaluations: shape [0-9.]+s, .*baseline [0-9.]+s, measure a [0-9.]+s$' "$T/err"
 }
@@ -807,7 +813,7 @@ LOCK
 @test "a requested head pays no baseline: its edges' measure is its starting point" {
   with_edges
   STUB_UPDATE=edges "$T/relock" --format=jsonl edges after >"$T/out" 2>"$T/err"
-  jq -e '.evals | map(.what) == ["shape", "probe packages aarch64-darwin", "probe apps aarch64-darwin", "measure edges"]' "$T/out"
+  jq -e '.evals | map(.what) == ["shape", "measure edges"]' "$T/out"
 }
 
 @test "a requested head whose edges are current pays no full evaluation at all" {
@@ -968,6 +974,20 @@ LOCK
   [[ "$output" == *"FAILED — this head does not evaluate with its edges bumped; nothing carried"* ]]
   [ "$(relock_commits)" -eq 0 ]
   lock_unchanged
+}
+
+@test "with no baseline, a system broken BEFORE the run is left out, one broken BY the edges is fatal" {
+  with_edges
+  STUB_SYSTEMS="aarch64-darwin x86_64-darwin" STUB_BROKEN_SYSTEM=x86_64-darwin STUB_UPDATE=edges run "$T/relock" --no-push edges
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BUMPED — edges carried"* ]]
+  [[ "$output" == *"packages of x86_64-darwin: one of them does not evaluate before any bump"* ]]
+  git -C "$T/work" reset -q --hard '@{u}'
+  STUB_SYSTEMS="aarch64-darwin aarch64-linux" STUB_BREAKS_ON_BUMP=aarch64-linux STUB_UPDATE=edges run "$T/relock" --no-push edges
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED — this head does not evaluate with its edges bumped; nothing carried"* ]]
+  [[ "$output" == *"broken-by-the-bump"* ]]
+  [ "$(relock_commits)" -eq 0 ]
 }
 
 @test "a named edge that cannot move alone is retried with every edge, and carried" {
@@ -1295,7 +1315,8 @@ LOCK
   [ "$status" -eq 0 ]
   [[ "$output" == *"packages of x86_64-darwin: one of them does not evaluate before any bump, so none of x86_64-darwin is measured — error: attribute 'x86_64-darwin' missing"* ]]
   [[ "$output" == *"BUMPED"* ]]
-  ! grep 'relock:measure' "$T/calls" | grep -q '"x86_64-darwin"'
+  # Tried once, at the run's first HEAD, and never measured again.
+  [ "$(grep 'relock:measure packages x86_64-darwin' "$T/calls" | wc -l)" -eq 1 ]
 }
 
 # ── review of 1a: the trace, absent, rejected, or unreachable ───────────────────────────────────────

@@ -633,13 +633,15 @@ lockrev() { # $1 flake.lock  $2 root-input name -> resolved node rev
 # A flake with neither `packages` nor configurations is an AGGREGATOR: what it exports is its inputs,
 # which the heads that pin it follow — so its impact is the revision each root input is locked at.
 #
-# The SHAPE is read once, before anything moves: which systems the flake exposes, and which of them
-# evaluate. A system that does not evaluate at the start is said, with its error, and left out — it was
-# broken before this run (measured 2026-10-09: rke2lab's x86_64 systems). A measured system that stops
-# evaluating after a bump is fatal: absent and broken must not look alike.
+# The SHAPE is read once, before anything moves: which systems the flake exposes — names only, nothing
+# of them is evaluated. A measure evaluates each system on its own, so a system that does not evaluate
+# is known by name: broken BEFORE this run (it fails at the HEAD the run started from) it is said, with
+# its error, and left out (measured 2026-10-09: rke2lab's x86_64 systems); broken BY a bump it is
+# fatal — absent and broken must not look alike. There is no separate probe: it evaluated what the
+# measure evaluates again, and cost a pass half its time (2026-10-14: ndh 51 s of probes, no bump).
 #
-# ⚠️ Every failure is returned EXPLICITLY — evalmap runs inside `$(…)`, where errexit does not carry
-# (no `inherit_errexit`).
+# ⚠️ Every failure is returned EXPLICITLY — a measure runs inside `{ … } ||` lists, where errexit
+# does not carry.
 #
 # What nix reads of this head is a REVISION, never its working tree. A `git+file` reference without
 # `rev` copies the tracked files FROM DISK, clean tree or dirty alike (measured 2026-10-11, nix 2.34.8,
@@ -659,9 +661,11 @@ ap_expr='sys: builtins.mapAttrs (_: a: builtins.attrNames (builtins.getContext a
 aggregator=0
 pk_systems=()
 ap_systems=()
-read_shape() { # what HEAD exports
-  local shape sys err at t0
-  at=$(flake_at "$(git -C "$REPO" rev-parse HEAD)")
+head0=""
+read_shape() { # what HEAD exports: its systems by name, and whether it is an aggregator
+  local shape at t0
+  head0=$(git -C "$REPO" rev-parse HEAD)
+  at=$(flake_at "$head0")
   t0=$(now_ms)
   shape=$(nix eval --impure --json --expr "/* relock:shape */ let o = $at; in {
       packages = builtins.attrNames (o.packages or { }); apps = builtins.attrNames (o.apps or { });
@@ -671,56 +675,67 @@ read_shape() { # what HEAD exports
     aggregator=1
     return 0
   fi
-  err=$(mktemp)
-  while read -r sys; do
-    t0=$(now_ms)
-    if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($pk_expr) \"$sys\"" >/dev/null 2>"$err"; then
-      timed "probe packages $sys" "$t0"
-      pk_systems+=("$sys")
-    else
-      timed "probe packages $sys" "$t0"
-      unmeasured+=("packages of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
-      echo "  ${unmeasured[-1]}"
-    fi
-  done < <(jq -r '.packages[]' <<<"$shape")
-  while read -r sys; do
-    t0=$(now_ms)
-    if nix eval --impure --json --expr "/* relock:probe */ let o = $at; in ($ap_expr) \"$sys\"" >/dev/null 2>"$err"; then
-      timed "probe apps $sys" "$t0"
-      ap_systems+=("$sys")
-    else
-      timed "probe apps $sys" "$t0"
-      unmeasured+=("apps of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
-      echo "  ${unmeasured[-1]}"
-    fi
-  done < <(jq -r '.apps[]' <<<"$shape")
-  rm -f "$err"
+  mapfile -t pk_systems < <(jq -r '.packages[]' <<<"$shape")
+  mapfile -t ap_systems < <(jq -r '.apps[]' <<<"$shape")
 }
-nix_list() { local x out="["; for x in "$@"; do out+=" \"$x\""; done; printf '%s ]' "$out"; }
-evalmap() { # $1 the revision measured
-  local lock
+# One projection of a revision: the packages or the apps of one system, or the configurations.
+project() { # $1 revision  $2 packages|apps|configurations  $3 system -> JSON on stdout, nix's words on stderr
+  local expr
+  case $2 in
+    packages) expr="($pk_expr) \"$3\"" ;;
+    apps) expr="($ap_expr) \"$3\"" ;;
+    configurations) expr="import @configurationsNix@ { outputs = o; }" ;;
+  esac
+  nix eval --impure --json --expr "/* relock:measure $2${3:+ $3} */ let o = $(flake_at "$1"); in $expr"
+}
+# The measure of a revision, into a file: every measured system's packages and apps, and the
+# configurations. A head's own evaluation warnings are its business, not this measure's: they are left
+# out, so a pass reads as its heads and their verdicts; anything else nix says reaches the terminal.
+# Run in THIS shell, never in `$(…)`: a system found broken before the run leaves the measured set
+# for the rest of it.
+measure_into() { # $1 the file  $2 the revision measured
+  local out=$1 rev=$2 kind sys part err res='{"packages":{},"apps":{}}' lock
+  local -a kept
   if [ "$aggregator" = 1 ]; then
     # A `follows` root input has no lock of its own — it is an input PATH whose target is already
     # counted where it is defined — so it is left out rather than resolved.
-    lock=$(git -C "$REPO" show "$1:flake.lock") || return 1
+    lock=$(git -C "$REPO" show "$rev:flake.lock") || return 1
     jq -S '. as $l | .nodes.root.inputs
       | with_entries(select(.value | type == "string"))
-      | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' <<<"$lock"
+      | map_values($l.nodes[.].locked.rev // $l.nodes[.].locked.narHash)' <<<"$lock" > "$out"
     return
   fi
-  # A head's own evaluation warnings are its business, not this measure's: they are left out, so a
-  # pass reads as its heads and their verdicts. Anything else nix says still reaches the terminal.
-  local err out rc=0
   err=$(mktemp)
-  out=$(nix eval --impure --json --expr "/* relock:measure */ let o = $(flake_at "$1");
-      each = f: systems: builtins.listToAttrs (map (s: { name = s; value = f s; }) systems); in {
-      packages = each ($pk_expr) $(nix_list "${pk_systems[@]}");
-      apps = each ($ap_expr) $(nix_list "${ap_systems[@]}");
-      configurations = import @configurationsNix@ { outputs = o; }; }" 2>"$err") || rc=1
+  for kind in packages apps; do
+    kept=()
+    if [ "$kind" = packages ]; then set -- "${pk_systems[@]}"; else set -- "${ap_systems[@]}"; fi
+    for sys in "$@"; do
+      if part=$(project "$rev" "$kind" "$sys" 2>"$err"); then
+        grep -v '^evaluation warning' "$err" >&2 || true
+        res=$(jq -c --arg k "$kind" --arg s "$sys" --argjson p "$part" '.[$k][$s] = $p' <<<"$res")
+        kept+=("$sys")
+        continue
+      fi
+      # Broken before this run: it fails at the run's first HEAD too. Known only while no measure
+      # has set the measured systems — after one, a system that stops evaluating is the bump's doing.
+      if [ "$baseline_known" = 0 ] && { [ "$rev" = "$head0" ] || ! project "$head0" "$kind" "$sys" >/dev/null 2>&1; }; then
+        unmeasured+=("$kind of $sys: one of them does not evaluate before any bump, so none of $sys is measured — $(error_of "$err")")
+        continue
+      fi
+      grep -v '^evaluation warning' "$err" >&2 || true
+      rm -f "$err"
+      return 1
+    done
+    if [ "$kind" = packages ]; then pk_systems=("${kept[@]}"); else ap_systems=("${kept[@]}"); fi
+  done
+  if ! part=$(project "$rev" configurations 2>"$err"); then
+    grep -v '^evaluation warning' "$err" >&2 || true
+    rm -f "$err"
+    return 1
+  fi
   grep -v '^evaluation warning' "$err" >&2 || true
   rm -f "$err"
-  [ "$rc" = 0 ] || return 1
-  jq -S . <<<"$out" || return 1
+  jq -S --argjson c "$part" '. + { configurations: $c }' <<<"$res" > "$out"
 }
 
 all_inputs() { jq -r '.nodes.root.inputs | keys[]' "$REPO/flake.lock"; }
@@ -850,7 +865,7 @@ relock_edges() { # $@ edge input names
     fi
   done
   t0=$(now_ms)
-  { measured=$(lock_commit) && after=$(evalmap "$measured"); } || rc=1
+  { measured=$(lock_commit) && measure_into "$work/measure.json" "$measured" && after=$(cat "$work/measure.json"); } || rc=1
   timed "measure edges" "$t0"
   if [ "$rc" != 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
@@ -887,7 +902,7 @@ ensure_baseline() {
   [ "$baseline_known" = 1 ] && return 0
   local t0 rc=0
   t0=$(now_ms)
-  baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)") || rc=1
+  { measure_into "$work/measure.json" "$(git -C "$REPO" rev-parse HEAD)" && baseline=$(cat "$work/measure.json"); } || rc=1
   timed baseline "$t0"
   [ "$rc" = 0 ] || return 1
   baseline_known=1
@@ -939,7 +954,7 @@ relock_input() { # $1 input name
   # off for the whole body of a function called in an `||` list. Unchecked, a failed measurement left
   # `after` empty, unequal to the baseline, and the bump was COMMITTED as "derivations moved".
   t0=$(now_ms)
-  { measured=$(lock_commit) && after=$(evalmap "$measured"); } || measure_rc=1
+  { measured=$(lock_commit) && measure_into "$work/measure.json" "$measured" && after=$(cat "$work/measure.json"); } || measure_rc=1
   timed "measure $1" "$t0"
   if [ "$measure_rc" != 0 ]; then
     git -C "$REPO" checkout -q -- flake.lock
