@@ -294,6 +294,21 @@ elif ! jq -e '.schema == "seedmatic.fabric-heads/v1" and (.heads | type == "obje
 else
   jq '.heads' "$work/fabric-heads.json" > "$heads"
 fi
+# Each id, repository and branch is a NAME, checked here: they reach git, nix, curl URLs and the script
+# --plan --script prints, and a newline or a quote in one would be a command there.
+if ! bad=$(jq -r 'to_entries[]
+    | select((.key | test("^[A-Za-z0-9._-]+$") | not)
+      or ((.value.repo // "") | test("^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$") | not)
+      or ((.value.branch // "") | test("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$") | not)
+      or ((.value.kind // "") | test("^(code|data)$") | not))
+    | .key | @json' "$heads"); then
+  echo "relock(@repoName@): fabric/heads cannot be read as a list of heads — refusing it" >&2
+  exit 1
+fi
+if [ -n "$bad" ]; then
+  echo "REFUSING: fabric/heads holds a head whose id, repository, branch or kind is not a plain name: $(tr '\n' ' ' <<<"$bad")" >&2
+  exit 1
+fi
 selfRepo=$(jq -r '.["@repoName@"].repo // empty' "$heads")
 selfBranch=$(jq -r '.["@repoName@"].branch // empty' "$heads")
 selfKind=$(jq -r '.["@repoName@"].kind // empty' "$heads")
@@ -540,11 +555,11 @@ SCRIPT
     {
       if [ "$id" = "@repoName@" ]; then
         # The start's own relock, by the very program running here, in the operator's checkout.
-        ( cd "$here" && RELOCK_HEAD="$id" "$0" "${targets[@]}" ) || rc=$?
+        ( cd "$here" && RELOCK_HEAD="$id" RELOCK_PASS_LANDED_FILE="$buf/landed" "$0" "${targets[@]}" ) || rc=$?
       else
         # Run from outside any checkout, so the head clones its own branch.
         elsewhere=$(mktemp -d)
-        ( cd "$elsewhere" && RELOCK_HEAD="$id" "${progs[$id]}" ) || rc=$?
+        ( cd "$elsewhere" && RELOCK_HEAD="$id" RELOCK_PASS_LANDED_FILE="$buf/landed" "${progs[$id]}" ) || rc=$?
         rm -rf "$elsewhere"
       fi
     } > "$buf/out" 2>&1 3> "$buf/events"
@@ -609,14 +624,31 @@ SCRIPT
       if [ "${RELOCK_FORMAT:-text}" = jsonl ]; then cat "$bufs/$id/events" >&"$RELOCK_EVENTS_FD"; fi
       rc=$(cat "$bufs/$id/rc")
       head_took=$(took "$(cat "$bufs/$id/seconds")")
-      # What this head landed — its tip once it ended — for the heads that pin it to take exactly that.
+      # What this head landed, as it says, for the heads that pin it to take exactly that — and only
+      # while its branch's tip IS that: a push by anyone after it ended would otherwise pass for it.
+      # Unknown either way, the heads that pin it are not run: the guard never opens on a doubt.
+      landed_ok=1
       if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then
-        if tip=$(api_tip "$(jq -r --arg i "$id" '.[$i].repo' "$heads")" "$(jq -r --arg i "$id" '.[$i].branch' "$heads")" 2>/dev/null); then
-          jq --arg i "$id" --arg t "$tip" '.landed = ((.landed // {}) + { ($i): $t })' "$RELOCK_PASS_PLAN" > "$RELOCK_PASS_PLAN.next" \
+        landed_sha=$(cat "$bufs/$id/landed" 2>/dev/null || true)
+        if [ -z "$landed_sha" ]; then
+          echo "  FAILED — $id did not say what it landed"
+          landed_ok=0
+        elif ! tip=$(api_tip "$(jq -r --arg i "$id" '.[$i].repo' "$heads")" "$(jq -r --arg i "$id" '.[$i].branch' "$heads")" 2>/dev/null); then
+          echo "  FAILED — the tip of $id cannot be read, so what it landed cannot be confirmed"
+          landed_ok=0
+        elif [ "$tip" != "$landed_sha" ]; then
+          echo "  FAILED — $id landed ${landed_sha:0:9}, but its branch is at ${tip:0:9}: someone pushed after it"
+          landed_ok=0
+        else
+          jq --arg i "$id" --arg t "$landed_sha" '.landed = ((.landed // {}) + { ($i): $t })' "$RELOCK_PASS_PLAN" > "$RELOCK_PASS_PLAN.next" \
             && mv "$RELOCK_PASS_PLAN.next" "$RELOCK_PASS_PLAN"
         fi
       fi
-      if [ "$rc" = 75 ]; then
+      if [ "$landed_ok" = 0 ]; then
+        echo "  ^ FAILED — what $id landed is not confirmed; what pins it is not run — $head_took"
+        failed+=("head $id (landed unconfirmed)")
+        down[$id]=1
+      elif [ "$rc" = 75 ]; then
         echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
         trace_failed+=("trace $id (its change landed)")
       elif [ "$rc" != 0 ]; then
@@ -1342,6 +1374,11 @@ if [ "$committed" = 1 ]; then
 else
   pushed_head=$(git -C "$REPO" rev-parse HEAD)
   echo "  @repoName@ @ ${pushed_head:0:9}: nothing to push"
+fi
+# In a pass, what this head LANDED — what it pushed, or the tip it found when it had nothing to push — is
+# told to the starter, which compares it to the branch's tip: anything else there is someone else's.
+if [ -n "${RELOCK_PASS_LANDED_FILE:-}" ]; then
+  printf '%s\n' "$pushed_head" > "$RELOCK_PASS_LANDED_FILE"
 fi
 if [ "$committed" = 1 ]; then
   if write_trace "$pushed_head"; then

@@ -251,7 +251,13 @@ echo "$*" >> "$T/curl-calls"
 r=${url#https://api.github.com/repos/}
 if [[ "$r" == */commits/* ]]; then
   [ "${STUB_TIPS:-ok}" = fail ] && { echo "curl: (22) The requested URL returned error: 403" >&2; exit 22; }
-  ref=${r#*/commits/}; exec "$T/bin/fake-tip" "${r%%/commits/*}" "${ref//%2F//}"
+  ref=${r#*/commits/}; ref=${ref//%2F//}
+  if [ -n "${STUB_RACE_AFTER:-}" ] && [ "${r%%/commits/*}" = "seedmatic/$STUB_RACE_AFTER" ] && [ ! -f "$T/raced-after" ]; then
+    touch "$T/raced-after"; bare="$T/remote/seedmatic/$STUB_RACE_AFTER.git"
+    c=$(git -C "$bare" commit-tree "$ref^{tree}" -p "$ref" -m "someone else's push, after the head ended")
+    git -C "$bare" update-ref "refs/heads/$ref" "$c"
+  fi
+  exec "$T/bin/fake-tip" "${r%%/commits/*}" "$ref"
 fi
 repo=${r%%/contents/*}; rest=${r#*/contents/}
 path=${rest%%\?ref=*}; ref=${rest#*\?ref=}; ref=${ref//%2F//}
@@ -1156,12 +1162,40 @@ LOCK
   [[ "$output" != *"#!/usr/bin/env bash"* ]]
 }
 
+@test "a head pushed by someone else after it ended is not taken as landed; what pins it is not run" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=rev STUB_RACE_AFTER=t run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED — t landed "*", but its branch is at "*": someone pushed after it"* ]]
+  [[ "$output" == *"== peer: NOT RUN — it pins t, which did not land in this pass =="* ]]
+  [[ "$output" == *"head t (landed unconfirmed)"* ]]
+}
+
+@test "a fabric/heads id, repository or branch that is not a plain name is refused before anything" {
+  jq '.heads["evil\necho pwned"] = { repo: "seedmatic/t", branch: "develop", kind: "code" }' \
+    "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json" > "$T/x" && mv "$T/x" "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json"
+  run "$T/relock" --plan --script
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"REFUSING: fabric/heads holds a head whose id, repository, branch or kind is not a plain name"* ]]
+  [[ "$output" != *"#!/usr/bin/env bash"* ]]
+  jq 'del(.heads["evil\necho pwned"]) | .heads.peer.branch = "develop; rm -rf ~"' \
+    "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json" > "$T/x" && mv "$T/x" "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json"
+  run "$T/relock" --plan
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"\"peer\""* ]]
+  never_updated
+}
+
 @test "a tip that cannot be read fails the alignment, never passes it" {
   mk_orphan
   git -C "$T/work" checkout -q develop
   peers peer peer2
   STUB_UPDATE=none STUB_TIPS=fail run "$T/relock" --downstream
   [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED — the tip of t cannot be read, so what it landed cannot be confirmed"* ]]
+  [[ "$output" == *"== peer: NOT RUN — it pins t"* ]]
   [[ "$output" == *"NOT ALIGNED — "*"whose tip is unknown"* ]]
   [[ "$output" != *"aligned: every pin"* ]]
 }
