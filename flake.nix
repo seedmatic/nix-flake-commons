@@ -85,11 +85,6 @@
 
     # nxmatic 
 
-    bird = {
-      flake = true;
-      url = "github:nxmatic/bird?ref=hotfix/v2.15.1-nix-darwin";
-    };
-
     maven-mvnd = {
       flake = true;
       url = "github:nxmatic/nix-maven-mvnd/develop";
