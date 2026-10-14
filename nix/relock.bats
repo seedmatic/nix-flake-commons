@@ -154,6 +154,16 @@ case "$*" in
       failing) echo "error: cannot fetch" >&2; exit 1 ;;
       # The git fetcher's fallback: a warning, exit 0, the old revision.
       git-cached) echo "warning: could not update local clone of Git repository 'https://example/a.git'; continuing with the most recent version" >&2 ;;
+      # Two edges coupled like ndh and flake-commons: either one alone breaks a follows; together they
+      # move, and no exported derivation moves with them.
+      edges)
+        if [[ " $* " == *" flake-commons "* && " $* " == *" peer "* ]]; then
+          jq '.nodes.fc.locked.rev = "fc2" | .nodes.peer.locked.rev = "peer2"' flake.lock > l && mv l flake.lock
+        elif [[ " $* " == *" flake-commons "* || " $* " == *" peer "* ]]; then
+          echo "error: input 'peer/bird' follows a non-existent input 'peer/flake-commons/bird'" >&2; exit 1
+        else
+          jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock
+        fi ;;
       coupled|coupled-forever)
         case "$*" in
           *"flake update b "*)
@@ -296,6 +306,16 @@ mk_orphan() {
   git -C "$T/work" checkout -q --orphan t-orphan/develop
   git -C "$T/work" commit -qm orphan
   git -C "$T/work" push -qu origin t-orphan/develop 2>/dev/null
+}
+# t's checkout gains two edges: flake-commons and peer, both heads of the fake fabric/heads.
+with_edges() {
+  jq '.nodes.root.inputs += { "flake-commons": "fc", peer: "peer" }
+      | .nodes.fc = { original: { type: "indirect", id: "flake-commons" },
+                      locked: { type: "github", owner: "seedmatic", repo: "nix-flake-commons", rev: "fc1" } }
+      | .nodes.peer = { original: { type: "indirect", id: "peer" },
+                        locked: { type: "github", owner: "seedmatic", repo: "peer", rev: "peer1" } }' \
+    "$T/work/flake.lock" > "$T/x" && mv "$T/x" "$T/work/flake.lock"
+  git -C "$T/work" commit -qam "t pins two heads" && git -C "$T/work" push -q 2>/dev/null
 }
 # A head's `after`, in the fake fabric/heads.
 after_of() { # $1 head, then its apps
@@ -850,6 +870,59 @@ LOCK
   never_updated
 }
 
+# ── the edges ─────────────────────────────────────────────────────────────────────────────────────
+
+@test "the edges move in ONE bump, carried though no derivation moves; the other inputs stay guarded" {
+  with_edges
+  before=$(remote_rev develop)
+  STUB_UPDATE=edges run "$T/relock"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"targets: edges inputs after"* ]]
+  [[ "$output" == *"edges              BUMPED — edges carried, no impact guard: flake-commons, peer"* ]]
+  [[ "$output" == *"a                  moved, NO derivation impact -> dropped"* ]]
+  [ "$(git -C "$T/remote/seedmatic/t.git" log --format=%s "$before..develop")" = "chore(flake): relock edges (flake-commons, peer)" ]
+  git -C "$T/remote/seedmatic/t.git" log -1 --format=%b develop | grep -qx 'flake-commons: fc1 -> fc2'
+  git -C "$T/remote/seedmatic/t.git" log -1 --format=%b develop | grep -qx 'peer: peer1 -> peer2'
+  [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r '[.nodes.fc.locked.rev, .nodes.peer.locked.rev, .nodes.a.locked.rev] | join(" ")')" = "fc2 peer2 r1" ]
+  [ "$(jq -c '.status.bumped | keys' <<<"$(trace_of t)")" = '["flake-commons","peer"]' ]
+  [ "$(jq -c '.status.dropped' <<<"$(trace_of t)")" = '["a","f"]' ]
+}
+
+@test "an edge bump after which the head no longer evaluates is not carried" {
+  with_edges
+  STUB_UPDATE=edges STUB_MEASURE=fail-after-first run "$T/relock" --no-push edges
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED — this head does not evaluate with its edges bumped; nothing carried"* ]]
+  [ "$(relock_commits)" -eq 0 ]
+  lock_unchanged
+}
+
+@test "a named edge that cannot move alone is retried with every edge, and carried" {
+  with_edges
+  STUB_UPDATE=edges run "$T/relock" --no-push peer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"== input peer =="*"deferred — it is coupled"*"== deferred inputs: retried once, after the others =="*"edges              BUMPED — edges carried, no impact guard: flake-commons, peer"* ]]
+  [ "$(relock_commits)" -eq 1 ]
+}
+
+@test "a head without edges says so, and its inputs are guarded as before" {
+  STUB_UPDATE=none run "$T/relock" --no-push
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"== edges =="*"  none"*"== inputs =="* ]]
+}
+
+@test "in a pass, a requested head moves only its edges and its after; the start moves everything" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=rev run "$T/relock" --downstream
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^targets: edges after$' <<<"$output")" -eq 3 ]
+  [ "$(grep -c '^targets: edges inputs after$' <<<"$output")" -eq 1 ]
+  [ "$(git -C "$T/remote/seedmatic/t.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r2 ]
+  [ "$(git -C "$T/remote/seedmatic/peer.git" show develop:flake.lock | jq -r .nodes.a.locked.rev)" = r1 ]
+}
+
 # ── the trace ──────────────────────────────────────────────────────────────────────────────────────
 
 @test "after a pushed change, the trace is written on fabric/relock, naming the pushed revision" {
@@ -1203,7 +1276,7 @@ HOOK
   peers peer peer2
   # peer's own lock pins t at the current head.
   git clone -q "$T/remote/seedmatic/peer.git" "$T/peer-src"
-  jq --arg r "$(remote_rev develop)" '.nodes.root.inputs.t = "t" | .nodes.t = {"locked":{"type":"github","owner":"seedmatic","repo":"t","rev":$r}}' \
+  jq --arg r "$(remote_rev develop)" '.nodes.root.inputs.t = "t" | .nodes.t = {"original":{"type":"indirect","id":"t"},"locked":{"type":"github","owner":"seedmatic","repo":"t","rev":$r}}' \
     "$T/peer-src/flake.lock" > "$T/x" && mv "$T/x" "$T/peer-src/flake.lock"
   git -C "$T/peer-src" commit -qam "peer pins t" && git -C "$T/peer-src" push -q 2>/dev/null
   git clone -q --bare "$T/remote/seedmatic/t.git" "$T/remote/seedmatic/t-orphan-src.git"

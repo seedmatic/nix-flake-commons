@@ -31,11 +31,15 @@ relock [--downstream | --no-push | --plan] [--format=text|jsonl] [target...]
 
 Reconcile this head's lock. No target = ALL of it.
 
-  inputs            every flake input          -> flake.lock
-  <input-name>      one input, by its name in flake.lock
+  edges             every input that is a head of fabric/heads, in ONE bump, always carried
+  inputs            every other input, one by one, each under the impact guard
+  <input-name>      one input, by its name in flake.lock (an edge is carried, any other guarded)
   after             the apps this head runs after its inputs (its `after` in fabric/heads)
 
-An input bump that moves no exported derivation (packages, apps, configurations with their revision
+An EDGE is an input that pins a head of fabric/heads, as the plan reads it. Propagating one is always
+wanted — a head on an old pin of another is a misaligned fabric, whatever its derivations say — so the
+edges move together, in one bump and one commit, and the head must still evaluate after it. Any OTHER
+input bump that moves no exported derivation (packages, apps, configurations with their revision
 neutralised) is DROPPED, not carried. After a push, the trace of the change is written on this repo's
 `fabric/relock` branch, which nothing pins.
 
@@ -43,7 +47,8 @@ neutralised) is DROPPED, not carried. After a push, the trace of the change is w
 nix-flake-commons' `fabric/heads`, the edges from each code head's lock, both read through the GitHub
 API. A cycle, an id that is not a head, or an id that resolves elsewhere fails it.
 --downstream plays that plan: each head of it runs its own relock once, on the pass's tool, in the
-plan's order; a head that pins a failed head is not run. The pass ends non-zero naming every failure.
+plan's order; a head that pins a failed head is not run. A pass PROPAGATES: the start runs its whole
+rule, every other head only `edges after` — its third-party inputs move in its own runs. The pass ends non-zero naming every failure.
 Exit 75: everything landed, but a trace could not be written (the heads that pin it still run).
 A pass runs ONE relock everywhere: each head's is built FROM the pass's tool (`lib.relockOf`), never
 through the head's own flake, and a relock of any other code refuses.
@@ -715,47 +720,13 @@ pruned_by='{}'
 dropped=()
 after_done=()
 
-relock_input() { # $1 input name
-  printf '  %-18s ' "$1"
-  local rc=0 before
-  before=$(lockrev "$REPO/flake.lock" "$1")
-  nix_update "$1" || rc=$?
-  if [ "$rc" = 3 ]; then
-    git -C "$REPO" checkout -q -- flake.lock
-    if [ "$retrying" = 0 ]; then
-      deferred+=("$1")
-      echo "deferred — it is coupled to another input's bump; retried after the others"
-      return 0
-    fi
-    echo "FAILED — still coupled after the other bumps; nothing carried"
-    printf '%s\n' "$update_err" | grep 'follows a non-existent input' | sed 's/^/    /' >&2
-    echo "    the inputs named above can only move together: nix flake update <both>, then relock" >&2
-    return 1
-  fi
-  if [ "$rc" = 1 ]; then
-    git -C "$REPO" checkout -q -- flake.lock
-    echo "FAILED to resolve"
-    printf '%s\n' "$update_err" | sed 's/^/    /' >&2
-    return 1
-  fi
-  if [ "$rc" = 2 ]; then
-    git -C "$REPO" checkout -q -- flake.lock
-    echo "FAILED to fetch — nix fell back to a cached copy, so the bump is NOT carried"
-    printf '%s\n' "$update_err" | grep -E "$cache_fallbacks|error|status" | sed 's/^/    /' >&2
-    return 1
-  fi
-  if git -C "$REPO" diff --quiet -- flake.lock; then
-    echo "already current"
-    return 0
-  fi
-  # A lock has to be fetchable by everyone, not only by whoever ran this. The ONLY way a local
-  # revision can enter one is a path- or file-typed ref: a `github:` fetch physically cannot see an
-  # unpushed commit, which is what makes the chain push-gated to begin with. So this single check IS
-  # the invariant.
-  local locked_at
-  # Checked: an unreadable lock left `locked_at` empty, and an empty answer is what "not local" looks
-  # like — the guard against machine-local locks would have waved it through in silence.
-  if ! locked_at=$(jq -r --arg i "$1" '
+# Whether an input's bumped lock pins a revision only this machine can fetch: printed, empty when not.
+# A lock has to be fetchable by everyone, not only by whoever ran this. The ONLY way a local revision
+# can enter one is a path- or file-typed ref: a `github:` fetch physically cannot see an unpushed
+# commit, which is what makes the chain push-gated to begin with. So this single check IS the
+# invariant. Checked: an unreadable lock returns 1 — an empty answer is what "not local" looks like.
+local_lock_of() { # $1 input name
+  jq -r --arg i "$1" '
     (.nodes.root.inputs[$i]) as $n
     | if ($n | type) != "string" then ""
       else
@@ -763,17 +734,129 @@ relock_input() { # $1 input name
         | if .type == "path" then "path:" + (.path // "")
           elif ((.url // "") | test("^(file|git\\+file)://")) then .url
           else "" end
-      end' "$REPO/flake.lock"); then
+      end' "$REPO/flake.lock"
+}
+local_lock_refused() { # $1 what  $2 the local ref
+  echo "LOCAL lock REFUSED ($1) -> $2"
+  echo "relock: that revision resolves only on this machine, so the lock would be unfetchable" >&2
+  echo "        for every other head. Aim this id at a PUSHED ref and run again — another" >&2
+  echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
+}
+
+# A bump that failed: the lock restored, and why. Returns 0 when the bump was set aside to be retried.
+update_failed() { # $1 nix_update's code  $2 what, for the deferral
+  git -C "$REPO" checkout -q -- flake.lock
+  case $1 in
+    3)
+      if [ "$retrying" = 0 ]; then
+        deferred+=("$2")
+        echo "deferred — it is coupled to another input's bump; retried after the others"
+        return 0
+      fi
+      echo "FAILED — still coupled after the other bumps; nothing carried"
+      printf '%s\n' "$update_err" | grep 'follows a non-existent input' | sed 's/^/    /' >&2
+      echo "    the inputs named above can only move together: nix flake update <both>, then relock" >&2 ;;
+    1)
+      echo "FAILED to resolve"
+      printf '%s\n' "$update_err" | sed 's/^/    /' >&2 ;;
+    2)
+      echo "FAILED to fetch — nix fell back to a cached copy, so the bump is NOT carried"
+      printf '%s\n' "$update_err" | grep -E "$cache_fallbacks|error|status" | sed 's/^/    /' >&2 ;;
+  esac
+  return 1
+}
+
+# THE EDGES, in one bump: every input that is a head moves together — coupled ones (ndh, which
+# follows an input the new flake-commons dropped) by construction — and the head must still evaluate
+# after it. No impact guard: the measure is the evaluability check, and the new baseline of the
+# guarded inputs after it.
+relock_edges() { # $@ edge input names
+  printf '  %-18s ' "edges"
+  local rc=0 e t0 measured after ref
+  local -a carried=() body=()
+  local -A was=()
+  for e in "$@"; do was[$e]=$(lockrev "$REPO/flake.lock" "$e"); done
+  nix_update "$@" || rc=$?
+  if [ "$rc" != 0 ]; then update_failed "$rc" ":edges"; return; fi
+  if git -C "$REPO" diff --quiet -- flake.lock; then
+    echo "already current ($*)"
+    return 0
+  fi
+  for e in "$@"; do
+    if ! ref=$(local_lock_of "$e"); then
+      git -C "$REPO" checkout -q -- flake.lock
+      echo "FAILED to read the updated lock — bump NOT carried"
+      return 1
+    fi
+    if [ -n "$ref" ]; then
+      git -C "$REPO" checkout -q -- flake.lock
+      local_lock_refused "edge $e" "$ref"
+      return 1
+    fi
+  done
+  t0=$(now_ms)
+  { measured=$(lock_commit) && after=$(evalmap "$measured"); } || rc=1
+  timed "measure edges" "$t0"
+  if [ "$rc" != 0 ]; then
+    git -C "$REPO" checkout -q -- flake.lock
+    echo "FAILED — this head does not evaluate with its edges bumped; nothing carried"
+    return 1
+  fi
+  for e in "$@"; do
+    if [ "$(lockrev "$REPO/flake.lock" "$e")" != "${was[$e]}" ]; then
+      carried+=("$e")
+      body+=(-m "$e: ${was[$e]:0:9} -> $(lockrev "$REPO/flake.lock" "$e" | cut -c1-9)")
+      bumped=$(jq -c --arg i "$e" --arg b "${was[$e]}" --arg a "$(lockrev "$REPO/flake.lock" "$e")" '. + { ($i): [ $b, $a ] }' <<<"$bumped")
+    fi
+  done
+  local names
+  names=$(printf '%s, ' "${carried[@]}"); names=${names%, }
+  if [ "${#carried[@]}" -eq 0 ]; then names="their lock only"; fi
+  if ! git -C "$REPO" commit -q -S -m "chore(flake): relock edges ($names)" "${body[@]}" -- flake.lock; then
+    git -C "$REPO" checkout -q -- flake.lock
+    echo "FAILED to commit the bump — lock restored"
+    return 1
+  fi
+  baseline=$after
+  committed=1
+  echo "BUMPED — edges carried, no impact guard: $names"
+}
+
+retry_deferred() {
+  [ "${#deferred[@]}" -gt 0 ] || return 0
+  echo "== deferred inputs: retried once, after the others =="
+  retrying=1
+  local i
+  for i in "${deferred[@]}"; do
+    if [ "$i" = ":edges" ]; then
+      relock_edges "${edge_inputs[@]}" || failed+=("edges")
+    else
+      relock_input "$i" || failed+=("input $i")
+    fi
+  done
+  deferred=()
+  echo
+}
+
+relock_input() { # $1 input name
+  printf '  %-18s ' "$1"
+  local rc=0 before
+  before=$(lockrev "$REPO/flake.lock" "$1")
+  nix_update "$1" || rc=$?
+  if [ "$rc" != 0 ]; then update_failed "$rc" "$1"; return; fi
+  if git -C "$REPO" diff --quiet -- flake.lock; then
+    echo "already current"
+    return 0
+  fi
+  local locked_at
+  if ! locked_at=$(local_lock_of "$1"); then
     git -C "$REPO" checkout -q -- flake.lock
     echo "FAILED to read the updated lock — bump NOT carried"
     return 1
   fi
   if [ -n "$locked_at" ]; then
     git -C "$REPO" checkout -q -- flake.lock
-    echo "LOCAL lock REFUSED -> $locked_at"
-    echo "relock: that revision resolves only on this machine, so the lock would be unfetchable" >&2
-    echo "        for every other head. Aim this id at a PUSHED ref and run again — another" >&2
-    echo "        branch is fine (its revisions are on the remote), a local checkout is not." >&2
+    local_lock_refused "$1" "$locked_at"
     return 1
   fi
   local after measured t0 measure_rc=0
@@ -931,8 +1014,26 @@ write_trace() { # $1 the pushed revision
   return 1
 }
 
+# The EDGES of this head: its root inputs that pin a head, by the plan's own definition (plan.jq on
+# this head's lock alone), so the plan and the local rule cannot disagree on what an edge is.
+if ! edges_json=$(jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$REPO/flake.lock" \
+  '{ start: $s, heads: $h[0], locks: { ($s): $l[0] } }' | jq -f "@planJq@" | jq -c --arg s "@repoName@" \
+  '[ .edges[] | select(.from == $s) | .input ] | unique'); then
+  echo "FAILED to read this head's edges — nothing reconciled" >&2
+  exit 1
+fi
+mapfile -t edge_inputs < <(jq -r '.[]' <<<"$edges_json")
+is_edge() { jq -e --arg i "$1" 'index($i) != null' <<<"$edges_json" >/dev/null; }
+third_party_inputs() { all_inputs | while read -r i; do is_edge "$i" || printf '%s\n' "$i"; done; }
+
 if [ "${#targets[@]}" -eq 0 ]; then
-  targets=(inputs after)
+  # A pass propagates: a head it requests moves its edges and what runs after them; the start, which
+  # runs its own relock, moves everything.
+  if [ "$member" = 1 ] && [ "$(jq -r .start "$RELOCK_PASS_PLAN")" != "@repoName@" ]; then
+    targets=(edges after)
+  else
+    targets=(edges inputs after)
+  fi
 fi
 
 echo "head: @repoName@ ($selfRepo:$selfBranch) at $REPO ($cur)"
@@ -954,20 +1055,22 @@ fi
 committed=0
 for t in "${targets[@]}"; do
   case $t in
+    edges)
+      echo "== edges =="
+      if [ "${#edge_inputs[@]}" -gt 0 ]; then
+        relock_edges "${edge_inputs[@]}" || failed+=("edges")
+      else
+        echo "  none"
+      fi
+      echo ;;
     inputs)
       echo "== inputs =="
-      while read -r i; do relock_input "$i" || failed+=("input $i"); done < <(all_inputs)
+      while read -r i; do relock_input "$i" || failed+=("input $i"); done < <(third_party_inputs)
       echo ;;
     after)
       if [ "${#afterInputs[@]}" -gt 0 ]; then
         # The deferred inputs first: what runs after the inputs runs after ALL of them.
-        if [ "${#deferred[@]}" -gt 0 ]; then
-          echo "== deferred inputs: retried once, after the others =="
-          retrying=1
-          for i in "${deferred[@]}"; do relock_input "$i" || failed+=("input $i"); done
-          deferred=()
-          echo
-        fi
+        retry_deferred
         echo "== after the inputs =="
         for app in "${afterInputs[@]}"; do after_input "$app" || failed+=("after $app"); done
         echo
@@ -975,7 +1078,11 @@ for t in "${targets[@]}"; do
     *)
       if all_inputs | grep -qx -- "$t"; then
         echo "== input $t =="
-        relock_input "$t" || failed+=("input $t")
+        if is_edge "$t"; then
+          relock_edges "$t" || failed+=("input $t")
+        else
+          relock_input "$t" || failed+=("input $t")
+        fi
         echo
       else
         echo "relock: unknown target '$t' (try --help)" >&2
@@ -984,12 +1091,7 @@ for t in "${targets[@]}"; do
   esac
 done
 
-if [ "${#deferred[@]}" -gt 0 ]; then
-  echo "== deferred inputs: retried once, after the others =="
-  retrying=1
-  for i in "${deferred[@]}"; do relock_input "$i" || failed+=("input $i"); done
-  echo
-fi
+retry_deferred
 
 if [ "$nopush" = 1 ]; then
   ahead=$(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
