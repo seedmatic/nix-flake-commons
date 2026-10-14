@@ -506,6 +506,13 @@ if [ "$member" = 0 ] && { [ "$downstream" = 1 ] || [ "$planonly" = 1 ]; }; then
       fi
     fi
     head_took=$(took $((SECONDS - head_started)))
+    # What this head landed — its tip once it ended — for the heads that pin it to take exactly that.
+    if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then
+      if tip=$(api_tip "$(jq -r --arg i "$id" '.[$i].repo' "$heads")" "$(jq -r --arg i "$id" '.[$i].branch' "$heads")" 2>/dev/null); then
+        jq --arg i "$id" --arg t "$tip" '.landed = ((.landed // {}) + { ($i): $t })' "$RELOCK_PASS_PLAN" > "$RELOCK_PASS_PLAN.next" \
+          && mv "$RELOCK_PASS_PLAN.next" "$RELOCK_PASS_PLAN"
+      fi
+    fi
     if [ "$rc" = 75 ]; then
       echo "  ^ $id landed, but its trace was not written (its output is above) — $head_took"
       trace_failed+=("trace $id (its change landed)")
@@ -877,6 +884,22 @@ relock_edges() { # $@ edge input names
       return 1
     fi
   done
+  # In a pass, an edge takes the revision its head LANDED in this pass, which the starter wrote into the
+  # plan when that head ended: a head pushed by anyone in between would leave this lock off what the
+  # pass carried, so it is refused here, before anything is pushed.
+  if [ "$member" = 1 ]; then
+    local to want got
+    for e in "$@"; do
+      to=$(jq -r --arg i "$e" '.[] | select(.input == $i) | .to' <<<"$edges_json")
+      want=$(jq -r --arg i "$to" '.landed[$i] // empty' "$RELOCK_PASS_PLAN")
+      got=$(lockrev "$REPO/flake.lock" "$e")
+      if [ -n "$want" ] && [ "$got" != "$want" ]; then
+        git -C "$REPO" checkout -q -- flake.lock
+        echo "FAILED — edge $e resolved ${got:0:9}, but $to landed ${want:0:9} in this pass: it moved during the pass"
+        return 1
+      fi
+    done
+  fi
   t0=$(now_ms)
   { measured=$(lock_commit) && measure_into "$work/measure.json" "$measured" && after=$(cat "$work/measure.json"); } || rc=1
   timed "measure edges" "$t0"
@@ -1121,12 +1144,12 @@ write_trace() { # $1 the pushed revision
 # this head's lock alone), so the plan and the local rule cannot disagree on what an edge is.
 if ! edges_json=$(jq -n --arg s "@repoName@" --slurpfile h "$heads" --slurpfile l "$REPO/flake.lock" \
   '{ start: $s, heads: $h[0], locks: { ($s): $l[0] } }' | jq -f "@planJq@" | jq -c --arg s "@repoName@" \
-  '[ .edges[] | select(.from == $s) | .input ] | unique'); then
+  '[ .edges[] | select(.from == $s) | { input, to } ] | unique_by(.input)'); then
   echo "FAILED to read this head's edges — nothing reconciled" >&2
   exit 1
 fi
-mapfile -t edge_inputs < <(jq -r '.[]' <<<"$edges_json")
-is_edge() { jq -e --arg i "$1" 'index($i) != null' <<<"$edges_json" >/dev/null; }
+mapfile -t edge_inputs < <(jq -r '.[].input' <<<"$edges_json")
+is_edge() { jq -e --arg i "$1" 'map(.input) | index($i) != null' <<<"$edges_json" >/dev/null; }
 third_party_inputs() { all_inputs | while read -r i; do is_edge "$i" || printf '%s\n' "$i"; done; }
 
 if [ "${#targets[@]}" -eq 0 ]; then

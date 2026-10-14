@@ -155,6 +155,12 @@ case "$*" in
       [ -n "$id" ] || continue
       h=$(jq -c --arg i "$id" '.heads[$i] // empty' "$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json")
       [ -n "$h" ] || continue
+      # Someone else pushes to the head while the pass runs: once, just before this resolution.
+      if [ -n "${STUB_RACE:-}" ] && [ "$id" = "$STUB_RACE" ] && [ ! -f "$T/raced" ]; then
+        bare="$T/remote/$(jq -r .repo <<<"$h").git"; touch "$T/raced"
+        c=$(git -C "$bare" commit-tree "develop^{tree}" -p develop -m "someone else's push")
+        git -C "$bare" update-ref refs/heads/develop "$c"
+      fi
       if tip=$("$T/bin/fake-tip" "$(jq -r .repo <<<"$h")" "$(jq -r .branch <<<"$h")" 2>/dev/null) \
         && [ "$(jq -r --arg i "$i" '.nodes[.nodes.root.inputs[$i]].locked.rev' flake.lock)" != "$tip" ]; then
         jq --arg i "$i" --arg r "$tip" '.nodes[.nodes.root.inputs[$i]].locked.rev = $r' flake.lock > l && mv l flake.lock
@@ -1075,6 +1081,18 @@ LOCK
   [[ "$output" == *"NOT ALIGNED — peer: node \`t_2\` pins t at t0, t is at "* ]]
   [ "$(grep -c 'NOT ALIGNED' <<<"$output")" -eq 1 ]
   [[ "$output" == *"not aligned: peer: node \`t_2\`"* ]]
+}
+
+@test "an edge that resolves past what its head landed in this pass is refused, before any push" {
+  mk_orphan
+  git -C "$T/work" checkout -q develop
+  peers peer peer2
+  STUB_UPDATE=rev STUB_RACE=t run "$T/relock" --downstream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAILED — edge t resolved "*", but t landed "*" in this pass: it moved during the pass"* ]]
+  [[ "$output" == *"peer2: NOT RUN — it pins peer"* ]]
+  [ "$(git -C "$T/remote/seedmatic/peer.git" log -1 --format=%s develop)" = "peer's lock" ]
+  [[ "$output" == *"NOT ALIGNED — peer: node \`t\` pins t at t1"* ]]
 }
 
 @test "a tip that cannot be read fails the alignment, never passes it" {
