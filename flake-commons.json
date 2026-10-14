@@ -1,39 +1,29 @@
 {
   "schema": "seedmatic.relock/v1",
   "head": "flake-commons",
-  "rev": "337f08b156f4a0e3281819cc31ed563989ccdcd4",
+  "rev": "f50b98300f8802befbb6d4e644884c21371ec547",
   "status": {
-    "wave": "flake-commons@2026-10-13T18:52:56Z",
-    "tool": "ab9ed4142b9736920e237973f2deafba0677f8306f73d3db5c719e9a30a711f0",
+    "wave": "flake-commons@2026-10-14T11:57:01Z",
+    "tool": "c980f36a158ba9ee5551726319f5c0e6d25c7767400145958bb524a78326e9ae",
     "bumped": {
-      "flake-utils": [
-        "11707dc2f618dd54ca8739b309ec4fc024de578b",
-        "b7a79d3fea1e214f6d668d521cecec0c01e26544"
-      ],
-      "flox": [
-        "744c37e325c194aec80cccf1074f14c7baa594c7",
-        "71fbf071397403858b30430c1dee7465a3e3bd50"
-      ],
-      "nixos-hardware": [
-        "4bc63156b109ee7b4103e3ec30565c8c92bde435",
-        "60a624466c08787ee8303393b7d4752d1826f14f"
-      ],
-      "nixpkgs": [
-        "7c8764b7c7b09b34f632464276218ef9090eaa11",
-        "7993f34ee47e28a3d607a525aadc6c94b73be728"
-      ],
-      "nixpkgs-unstable": [
-        "6510408d147d8c5e6d76043e899e9251756f6a75",
-        "7fd4004d0511991fff3a0524856a9be09e28c5f0"
-      ],
-      "treefmt-nix": [
-        "4cfe8d7065cc8ca91c0a50361b6dd74920eeb1f5",
-        "0d6d739a833ba9a9c93034862e4a7b061a062a1c"
+      "home-manager": [
+        "db7d5e2332710f5abb088f6b5de927d7f9511b35",
+        "32904dfe1cf86039f3c8c9f41f94e1cfd76dbb34"
       ]
     },
-    "dropped": [],
+    "pruned": {},
+    "dropped": [
+      "chromium-bin",
+      "darwin",
+      "determinate",
+      "disko",
+      "extra-container",
+      "flake-compat",
+      "flake-utils",
+      "flox"
+    ],
     "after": [],
     "unmeasured": [],
-    "seconds": 101
+    "seconds": 24
   }
 }
