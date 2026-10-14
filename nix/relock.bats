@@ -82,6 +82,7 @@ case "$*" in
     n=$(( $(cat "$T/measures" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/measures"
     [ -n "${STUB_EVAL_WARNING:-}" ] && echo "evaluation warning: $STUB_EVAL_WARNING" >&2
     [ "${STUB_MEASURE:-ok}" = fail-after-first ] && [ "$n" -gt 1 ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
+    [ "${STUB_MEASURE:-ok}" = fail ] && { echo "error: cannot evaluate packages" >&2; exit 1; }
     [ "${STUB_APPS:-ok}" = fail ] && { echo "error: cannot evaluate apps" >&2; exit 1; }
     [ "${STUB_CONFIGS:-ok}" = fail ] && [ "${STUB_HAS_CONFIGS:-false}" = true ] && { echo "error: cannot evaluate a configuration" >&2; exit 1; }
     drv=$(cat "$T/drv"); [ "${STUB_DRV_FROM_LOCK:-}" = 1 ] && drv=$(git -C "$p" show "$rev:flake.lock" | cksum | cut -d' ' -f1)
@@ -803,6 +804,18 @@ LOCK
   grep -qE '^evaluations: shape [0-9.]+s, .*baseline [0-9.]+s, measure a [0-9.]+s$' "$T/err"
 }
 
+@test "a requested head pays no baseline: its edges' measure is its starting point" {
+  with_edges
+  STUB_UPDATE=edges "$T/relock" --format=jsonl edges after >"$T/out" 2>"$T/err"
+  jq -e '.evals | map(.what) == ["shape", "probe packages aarch64-darwin", "probe apps aarch64-darwin", "measure edges"]' "$T/out"
+}
+
+@test "a requested head whose edges are current pays no full evaluation at all" {
+  STUB_UPDATE=none "$T/relock" --format=jsonl edges after >"$T/out" 2>"$T/err"
+  grep -q 'already current (flake-commons)' "$T/err"
+  jq -e '.evals | map(.what) | index("baseline") == null and index("measure edges") == null' "$T/out"
+}
+
 @test "a pass times the build of every member's relock" {
   mk_orphan
   git -C "$T/work" checkout -q develop
@@ -950,7 +963,7 @@ LOCK
 
 @test "an edge bump after which the head no longer evaluates is not carried" {
   with_edges
-  STUB_UPDATE=edges STUB_MEASURE=fail-after-first run "$T/relock" --no-push edges
+  STUB_UPDATE=edges STUB_MEASURE=fail run "$T/relock" --no-push edges
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAILED — this head does not evaluate with its edges bumped; nothing carried"* ]]
   [ "$(relock_commits)" -eq 0 ]

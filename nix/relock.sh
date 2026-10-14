@@ -873,8 +873,24 @@ relock_edges() { # $@ edge input names
     return 1
   fi
   baseline=$after
+  baseline_known=1
   committed=1
   echo "BUMPED — edges carried, no impact guard: $names"
+}
+
+# The starting point of the impact guard, measured only when a guarded input first needs it: a head a
+# pass requests runs `edges after`, and the measure of its edges IS its baseline, so a full evaluation
+# of HEAD would be thrown away (one per head of every pass, measured 2026-10-14).
+baseline=""
+baseline_known=0
+ensure_baseline() {
+  [ "$baseline_known" = 1 ] && return 0
+  local t0 rc=0
+  t0=$(now_ms)
+  baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)") || rc=1
+  timed baseline "$t0"
+  [ "$rc" = 0 ] || return 1
+  baseline_known=1
 }
 
 retry_deferred() {
@@ -896,6 +912,10 @@ retry_deferred() {
 relock_input() { # $1 input name
   printf '  %-18s ' "$1"
   local rc=0 before
+  if ! ensure_baseline; then
+    echo "FAILED to measure the starting point — nothing reconciled for it"
+    return 1
+  fi
   before=$(lockrev "$REPO/flake.lock" "$1")
   nix_update "$1" || rc=$?
   if [ "$rc" != 0 ]; then update_failed "$rc" "$1"; return; fi
@@ -1097,14 +1117,6 @@ echo
 
 if ! read_shape; then
   echo "FAILED to read what this head exports — nothing reconciled" >&2
-  exit 1
-fi
-t0=$(now_ms)
-baseline_rc=0
-baseline=$(evalmap "$(git -C "$REPO" rev-parse HEAD)") || baseline_rc=1
-timed baseline "$t0"
-if [ "$baseline_rc" != 0 ]; then
-  echo "FAILED to measure the starting point — nothing reconciled" >&2
   exit 1
 fi
 committed=0
