@@ -426,12 +426,17 @@ after_of() { # $1 head, then its apps
   jq --arg h "$h" --argjson a "$(printf '%s\n' "$@" | jq -R . | jq -sc .)" '.heads[$h].after = $a' "$f" > "$f.next" && mv "$f.next" "$f"
 }
 # `! cmd` asserts nothing in bats: bash exempts a negated command from errexit, so it never fails a test
-# unless it is the last line. refute does.
+# unless it is the last line. refute does — and only on a NO: the command must answer 1 (grep's "no
+# match", git rev-parse's "no such ref"). 0 is a refutation that held; any other code (grep's 2 on a
+# file that is not there) is no answer at all, and a property must not pass on one.
 refute() {
-  if "$@"; then
-    echo "refuted, but it held: $*" >&2
-    return 1
-  fi
+  local rc=0
+  "$@" || rc=$?
+  case $rc in
+    1) return 0 ;;
+    0) echo "refuted, but it held: $*" >&2; return 1 ;;
+    *) echo "refute got no answer (rc=$rc): $*" >&2; return 1 ;;
+  esac
 }
 never_updated() { ! grep -q "flake update" "$T/calls" 2>/dev/null; }
 relock_commits() { git -C "$T/work" log --format=%s | grep -c '^chore(' || true; }
