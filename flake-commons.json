@@ -1,20 +1,24 @@
 {
   "schema": "seedmatic.relock/v1",
   "head": "flake-commons",
-  "rev": "d2aefe87a7451b65a6910ef620f02b3ab43519df",
+  "rev": "dcad528a375a24e06fdfc6e1bbc3cbf11fb3e0f9",
   "status": {
-    "wave": "flake-commons@2026-10-14T12:34:17Z",
-    "tool": "86be1ecfd7d9b28e3810862652e40b9f25ae6bfd19a4787b0b1d99d3f965404c",
+    "wave": "flake-commons@2026-10-15T05:02:01Z",
+    "tool": "5dc283dbf05b6381aaeade7c72444f80b48a2b2c13bed1febcfdefcd243f0d64",
     "bumped": {
       "flox": [
-        "71fbf071397403858b30430c1dee7465a3e3bd50",
-        "af0fdbe58ab821decba7cd01f05fe26fb255aa53"
+        "af0fdbe58ab821decba7cd01f05fe26fb255aa53",
+        "8e41766d943cdd73e71da283cda3dff95a4820e9"
+      ],
+      "nixpkgs": [
+        "7993f34ee47e28a3d607a525aadc6c94b73be728",
+        "a033e66ab94a6bedf2c3d58d93a36319d3cbbbaf"
       ]
     },
     "pruned": {},
     "dropped": [],
     "after": [],
     "unmeasured": [],
-    "seconds": 20
+    "seconds": 67
   }
 }
