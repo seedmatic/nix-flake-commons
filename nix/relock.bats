@@ -425,6 +425,19 @@ after_of() { # $1 head, then its apps
   local h=$1 f="$T/gh/seedmatic/nix-flake-commons/fabric/heads/heads.json"; shift
   jq --arg h "$h" --argjson a "$(printf '%s\n' "$@" | jq -R . | jq -sc .)" '.heads[$h].after = $a' "$f" > "$f.next" && mv "$f.next" "$f"
 }
+# `! cmd` asserts nothing in bats: bash exempts a negated command from errexit, so it never fails a test
+# unless it is the last line. refute does — and only on a NO: the command must answer 1 (grep's "no
+# match", git rev-parse's "no such ref"). 0 is a refutation that held; any other code (grep's 2 on a
+# file that is not there) is no answer at all, and a property must not pass on one.
+refute() {
+  local rc=0
+  "$@" || rc=$?
+  case $rc in
+    1) return 0 ;;
+    0) echo "refuted, but it held: $*" >&2; return 1 ;;
+    *) echo "refute got no answer (rc=$rc): $*" >&2; return 1 ;;
+  esac
+}
 never_updated() { ! grep -q "flake update" "$T/calls" 2>/dev/null; }
 relock_commits() { git -C "$T/work" log --format=%s | grep -c '^chore(' || true; }
 tree_clean()     { [ -z "$(git -C "$T/work" status --porcelain --untracked-files=no)" ]; }
@@ -612,7 +625,7 @@ signed() { git -C "$T/remote/seedmatic/t.git" cat-file commit "$1" | grep -q '^g
   git -C "$T/work" log -1 --format=%b | grep -q "the lock lost 1 locked node(s): x"
   [ "$(jq -r '.status.pruned.a | join(",")' <<<"$(trace_of t)")" = x ]
   [ "$(relock_commits)" -eq 1 ]
-  ! git -C "$T/work" show HEAD:flake.lock | jq -e '.nodes.x' >/dev/null
+  [ "$(git -C "$T/work" show HEAD:flake.lock | jq -c '.nodes.x')" = null ]
   [ "$(remote_rev develop)" != "$before" ]
   [ "$(jq -r '.status.bumped | keys | join(",")' <<<"$(trace_of t)")" = a ]
 }
@@ -831,7 +844,7 @@ LOCK
 @test "a run says how long it took, and --format=jsonl puts its event on stdout and every word on stderr" {
   STUB_UPDATE=rev "$T/relock" --format=jsonl inputs >"$T/out" 2>"$T/err"
   grep -q 'BUMPED' "$T/err"
-  ! grep -q 'BUMPED' "$T/out"
+  refute grep -q 'BUMPED' "$T/out"
   grep -qE 'DONE — [0-9]+m[0-9]{2}s' "$T/err"
   [ "$(wc -l < "$T/out")" -eq 1 ]
   jq -e --arg r "$(remote_rev develop)" '.event == "head" and .head == "t" and .outcome == "done"
@@ -850,7 +863,7 @@ LOCK
   STUB_UPDATE=rev run "$T/relock" --no-push inputs
   [ "$status" -eq 0 ]
   [ "$(grep -c 'relock:measure all' "$T/calls")" -eq 2 ]
-  ! grep -qE 'relock:measure (packages|apps|configurations)' "$T/calls"
+  refute grep -qE 'relock:measure (packages|apps|configurations)' "$T/calls"
 }
 
 @test "a requested head pays no baseline: its edges' measure is its starting point" {
@@ -917,7 +930,7 @@ LOCK
   STUB_UPDATE=none run "$T/relock" --no-push inputs
   [ "$status" -eq 0 ]
   grep -q "Authorization: Bearer SIMULATED-GH-TOKEN" "$T/curl-stdin"
-  ! grep -q "SIMULATED-GH-TOKEN" "$T/curl-calls"
+  refute grep -q "SIMULATED-GH-TOKEN" "$T/curl-calls"
 }
 
 @test "the token is never printed" {
@@ -929,8 +942,8 @@ LOCK
   STUB_GH=fail STUB_UPDATE=none run "$T/relock" --no-push inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"no GitHub token"* ]]
-  ! grep -q "extra-access-tokens" "$T/nix-config"
-  ! grep -q "Authorization" "$T/curl-stdin"
+  refute grep -q "extra-access-tokens" "$T/nix-config"
+  refute grep -q "Authorization" "$T/curl-stdin"
 }
 
 # ── after the inputs ───────────────────────────────────────────────────────────────────────────────
@@ -965,7 +978,7 @@ LOCK
   after_of t after-x
   STUB_UPDATE=none STUB_AFTER=ok run "$T/relock"
   [ -f "$T/child-env.after" ]
-  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.after"
+  refute grep -q "SIMULATED-GH-TOKEN" "$T/child-env.after"
 }
 
 @test "a member runs the \`after\` of its head in fabric/heads, read from the pass's plan" {
@@ -1287,7 +1300,7 @@ LOCK
   [ "$status" -eq 0 ]
   [ "$(jq -c .order <<<"$output")" = '["t","t-orphan","peer","peer2"]' ]
   jq -e '.edges | index({from: "peer", to: "d", input: "d"}) != null' <<<"$output"
-  ! grep -q "contents/.*ref=fabric%2Fd" "$T/curl-calls"
+  refute grep -q "contents/.*ref=fabric%2Fd" "$T/curl-calls"
   grep -q "commits/fabric%2Fd" "$T/curl-calls"
   jq -e '.gaps | index("peer: node `d` pins d, whose tip is unknown") != null' <<<"$output"
 }
@@ -1335,9 +1348,9 @@ LOCK
   [[ "$output" == *"relock(peer): not inside this head — cloning seedmatic/peer (develop)"* ]]
   grep -q -- 'eval --raw --refresh github:seedmatic/nix-flake-commons/fc1#lib\.relockOf --apply .*"peer"' "$T/calls"
   # Never through a member's own flake: its lock may hold pins the new tool no longer satisfies.
-  ! grep -q -- 'github:seedmatic/peer/develop#' "$T/calls"
-  ! grep -q -- 'github:seedmatic/peer2/develop#' "$T/calls"
-  ! grep -q -- '--commit-lock-file' "$T/calls"
+  refute grep -q -- 'github:seedmatic/peer/develop#' "$T/calls"
+  refute grep -q -- 'github:seedmatic/peer2/develop#' "$T/calls"
+  refute grep -q -- '--commit-lock-file' "$T/calls"
   [[ "$output" == *"DONE (pass t@"* ]]
 }
 
@@ -1416,7 +1429,7 @@ LOCK
   printf '#!%s\nenv > "$T/child-env.peer"\n' "$(command -v bash)" > "$T/relock-peer"
   STUB_UPDATE=none run "$T/relock" --downstream
   [ -f "$T/child-env.peer" ]
-  ! grep -q "SIMULATED-GH-TOKEN" "$T/child-env.peer"
+  refute grep -q "SIMULATED-GH-TOKEN" "$T/child-env.peer"
   grep -q '^RELOCK_PASS_PLAN=' "$T/child-env.peer"
   grep -q '^RELOCK_HEAD=peer$' "$T/child-env.peer"
 }
@@ -1505,7 +1518,7 @@ HOOK
   STUB_UPDATE=rev run "$T/relock" inputs
   [ "$status" -eq 75 ]
   [[ "$output" == *"cannot tell whether fabric/relock exists"* ]]
-  ! git -C "$T/remote/seedmatic/t.git.gone" rev-parse -q --verify refs/heads/fabric/relock
+  refute git -C "$T/remote/seedmatic/t.git.gone" rev-parse -q --verify refs/heads/fabric/relock
 }
 
 @test "the trace never makes the operator's repository shallow" {
