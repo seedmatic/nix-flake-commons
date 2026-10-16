@@ -180,7 +180,7 @@ case "$*" in
       # A new revision at each run.
       revs)   n=$(( $(cat "$T/revn" 2>/dev/null || echo 1) + 1 )); echo "$n" > "$T/revn"
               jq --arg r "r$n" '.nodes.a.locked.rev = $r' flake.lock > l && mv l flake.lock; echo "d$n" > "$T/drv" ;;
-      # Only another system's package moves: what a darwin seat must not drop.
+      # Only another system's package moves: what a darwin host must not drop.
       linux-only) jq '.nodes.a.locked.rev = "r2"' flake.lock > l && mv l flake.lock; echo lin2 > "$T/drv-linux" ;;
       # A real propagation: the upstream head t bumps `a`; a head that pins t takes t's pushed head.
       propagate)
@@ -1457,7 +1457,7 @@ LOCK
 
 # ── review of 1a: every system is measured ─────────────────────────────────────────────────────────
 
-@test "a bump that moves ONLY another system's package is carried — a darwin seat must not drop it" {
+@test "a bump that moves ONLY another system's package is carried — a darwin host must not drop it" {
   STUB_SYSTEMS="aarch64-darwin aarch64-linux" STUB_UPDATE=linux-only run "$T/relock" inputs
   [ "$status" -eq 0 ]
   [[ "$output" == *"BUMPED"* ]]
