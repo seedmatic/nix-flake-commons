@@ -19,7 +19,6 @@
     flake-compat.url = "github:edolstra/flake-compat";
     flake-utils.url = "github:numtide/flake-utils";
 
-    nix.url = "github:NixOS/nix/2.32.4";
     nixos-hardware.url = "github:nixos/nixos-hardware";
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";
     nixpkgs-unstable.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1";
@@ -44,13 +43,6 @@
     chromium-bin = {
       url = "github:lrworth/chromium-bin-flake";
     };
-
-    lix-module = {
-      url = "https://git.lix.systems/lix-project/nixos-module/archive/2.93.0.tar.gz";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    determinate.url = "https://flakehub.com/f/DeterminateSystems/determinate/0";
 
     darwin = {
       url = "github:nix-darwin/nix-darwin/nix-darwin-26.05";
