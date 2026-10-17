@@ -25,10 +25,11 @@
 
     impermanence.url = "github:nix-community/impermanence";
       
-    # disko's 1.x RELEASES, as FlakeHub serves them: each relock takes the newest one. A bump that breaks the
-    # bringup images (their in-guest checks) is re-pinned then, with what broke.
+    # disko's RELEASES through its own moving `latest` tag: each relock takes the newest one, from upstream. Not
+    # FlakeHub's /1: on 2026-10-17 it served 6d224fe8, a commit made before the v1.13.0 tag and still saying 1.12.0.
+    # A bump that breaks the bringup images (their in-guest checks) is re-pinned then, with what broke.
     disko = {
-      url = "https://flakehub.com/f/nix-community/disko/1";
+      url = "github:nix-community/disko/latest";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   
