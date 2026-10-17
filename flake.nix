@@ -25,8 +25,10 @@
 
     impermanence.url = "github:nix-community/impermanence";
       
+    # disko's 1.x RELEASES, as FlakeHub serves them: each relock takes the newest one. A bump that breaks the
+    # bringup images (their in-guest checks) is re-pinned then, with what broke.
     disko = {
-      url = "github:nix-community/disko/v1.12.0";
+      url = "https://flakehub.com/f/nix-community/disko/1";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   
