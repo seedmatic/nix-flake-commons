@@ -130,17 +130,16 @@
       sweepConfigurations = pkgs.writeShellApplication {
         name = "sweep-configurations";
         runtimeInputs = [ pkgs.coreutils pkgs.gitMinimal pkgs.jq pkgs.nix ];
-        text = builtins.readFile (
-          pkgs.replaceVars ./nix/sweep-configurations.sh {
-            configurationsNix = "${./nix/configurations.nix}";
-          }
-        );
+        text = import ./nix/replace-vars-text.nix pkgs.lib ./nix/sweep-configurations.sh {
+          configurationsNix = "${./nix/configurations.nix}";
+        };
       };
     in {
       # Behaviour tests for relock, run by `nix flake check`. They cover what shellcheck — already a
       # gate of every build — cannot see: the failure paths, where every defect this script had was
       # a silence. The instances under test are built by the SAME factory; the heads they name live in
       # the test's fake fabric/heads.
+      checks.no-ifd-readfile = import ./nix/no-ifd-readfile.nix { inherit pkgs; src = ./.; };
       checks.relock =
         let
           relockOf = name: self.lib.relockOf system name;

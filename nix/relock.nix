@@ -33,13 +33,11 @@ pkgs.writeShellApplication {
     pkgs.jq
     pkgs.nix
   ];
-  text = builtins.readFile (
-    pkgs.replaceVars ./relock.sh {
-      inherit toolId toolSlug;
-      repoName = name;
-      system = pkgs.stdenv.hostPlatform.system;
-      planJq = "${./plan.jq}";
-      configurationsNix = "${./configurations.nix}";
-    }
-  );
+  text = import ./replace-vars-text.nix pkgs.lib ./relock.sh {
+    inherit toolId toolSlug;
+    repoName = name;
+    system = pkgs.stdenv.hostPlatform.system;
+    planJq = "${./plan.jq}";
+    configurationsNix = "${./configurations.nix}";
+  };
 }
