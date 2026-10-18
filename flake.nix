@@ -1,20 +1,6 @@
 {
   description = "nix system configurations";
 
-  nixConfig = {
-    substituters = [
-      "https://cache.nixos.org"
-      #      "https://kclejeune.cachix.org"
-      "https://cache.flox.dev"
-    ];
-
-    trusted-public-keys = [
-      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      #      "kclejeuneachix.org-1:fOCrECygdFZKbMxHClhiTS6oowOkJ/I/dh9q9b1I4ko="
-      "flox-cache-public-1:7F4OyH7ZCnFhcze3fJdfyXYLQw/aV7GEed86nQ7IsOs="
-    ];
-  };
-
   inputs = {
     flake-compat.url = "github:edolstra/flake-compat";
     flake-utils.url = "github:numtide/flake-utils";
@@ -118,6 +104,10 @@
         toolSlug = "seedmatic/nix-flake-commons";
       });
       lib.relockToolId = relockToolId;
+      # The upstream caches every seedmatic flake shares, as data: each consumer builds its own trust from them.
+      lib.upstreamCaches = import ./nix/upstream-caches.nix;
+      # A check each seedmatic flake runs on its own flake.nix: no nixConfig, which no machine of ours takes.
+      lib.noNixConfig = pkgs: flakeNix: import ./nix/no-nix-config.nix { inherit pkgs flakeNix; };
       # A head's relock APP built from THIS tool alone, on its nixpkgs: a pass builds every member's
       # this way, so a member whose own lock the new tool no longer satisfies can still be relocked.
       lib.relockOf = system: name: {
@@ -140,6 +130,7 @@
       # a silence. The instances under test are built by the SAME factory; the heads they name live in
       # the test's fake fabric/heads.
       checks.no-ifd-readfile = import ./nix/no-ifd-readfile.nix { inherit pkgs; src = ./.; };
+      checks.no-nix-config = self.lib.noNixConfig pkgs ./flake.nix;
       checks.relock =
         let
           relockOf = name: self.lib.relockOf system name;
