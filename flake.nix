@@ -108,6 +108,11 @@
       lib.upstreamCaches = import ./nix/upstream-caches.nix;
       # A check each seedmatic flake runs on its own flake.nix: no nixConfig, which no machine of ours takes.
       lib.noNixConfig = pkgs: flakeNix: import ./nix/no-nix-config.nix { inherit pkgs flakeNix; };
+      # A check each seedmatic flake runs on its own nixosConfigurations: no installer channel, which copies all of
+      # nixpkgs at every evaluation of the system.
+      lib.noInstallerChannel = pkgs: configurations: import ./nix/no-installer-channel.nix { inherit pkgs configurations; };
+      # nixpkgs' lxc-container.nix without the installer channel: every seedmatic LXC or Incus image imports this one.
+      nixosModules.lxc-container = ./nix/lxc-container.nix;
       # A head's relock APP built from THIS tool alone, on its nixpkgs: a pass builds every member's
       # this way, so a member whose own lock the new tool no longer satisfies can still be relocked.
       lib.relockOf = system: name: {
@@ -131,6 +136,29 @@
       # the test's fake fabric/heads.
       checks.no-ifd-readfile = import ./nix/no-ifd-readfile.nix { inherit pkgs; src = ./.; };
       checks.no-nix-config = self.lib.noNixConfig pkgs ./flake.nix;
+      # This flake has no NixOS configuration of its own: the check runs on none, its mutants still read.
+      checks.no-installer-channel = self.lib.noInstallerChannel pkgs { };
+      # The shared profile turns the channel off where nixpkgs' own leaves it on: one option read on each.
+      checks.lxc-container-module =
+        let
+          channelOf =
+            modules:
+            (nixpkgs.lib.nixosSystem {
+              system = "aarch64-linux";
+              inherit modules;
+            }).config.system.installer.channel.enable;
+          shared = channelOf [ self.nixosModules.lxc-container ];
+          stock = channelOf [ "${nixpkgs}/nixos/modules/virtualisation/lxc-container.nix" ];
+        in
+        pkgs.runCommand "lxc-container-module" { } (
+          if !shared && stock then
+            "touch $out"
+          else
+            ''
+              echo "FAIL the shared profile's channel is ${pkgs.lib.boolToString shared} (want false), nixpkgs' own ${pkgs.lib.boolToString stock} (want true)"
+              exit 1
+            ''
+        );
       checks.relock =
         let
           relockOf = name: self.lib.relockOf system name;
