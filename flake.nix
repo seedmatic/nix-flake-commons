@@ -138,24 +138,31 @@
       checks.no-nix-config = self.lib.noNixConfig pkgs ./flake.nix;
       # This flake has no NixOS configuration of its own: the check runs on none, its mutants still read.
       checks.no-installer-channel = self.lib.noInstallerChannel pkgs { };
-      # The shared profile turns the channel off where nixpkgs' own leaves it on: one option read on each.
+      # The shared profile turns the channel and clone-config off where nixpkgs' own leaves them on: options only.
       checks.lxc-container-module =
         let
-          channelOf =
+          leftovers =
             modules:
-            (nixpkgs.lib.nixosSystem {
-              system = "aarch64-linux";
-              inherit modules;
-            }).config.system.installer.channel.enable;
-          shared = channelOf [ self.nixosModules.lxc-container ];
-          stock = channelOf [ "${nixpkgs}/nixos/modules/virtualisation/lxc-container.nix" ];
+            let
+              c =
+                (nixpkgs.lib.nixosSystem {
+                  system = "aarch64-linux";
+                  inherit modules;
+                }).config;
+            in
+            {
+              channel = c.system.installer.channel.enable;
+              cloneConfig = c.installer.cloneConfig;
+            };
+          shared = leftovers [ self.nixosModules.lxc-container ];
+          stock = leftovers [ "${nixpkgs}/nixos/modules/virtualisation/lxc-container.nix" ];
         in
         pkgs.runCommand "lxc-container-module" { } (
-          if !shared && stock then
+          if shared == { channel = false; cloneConfig = false; } && stock == { channel = true; cloneConfig = true; } then
             "touch $out"
           else
             ''
-              echo "FAIL the shared profile's channel is ${pkgs.lib.boolToString shared} (want false), nixpkgs' own ${pkgs.lib.boolToString stock} (want true)"
+              echo "FAIL want the shared profile all off and nixpkgs' own all on: shared ${builtins.toJSON shared}, nixpkgs ${builtins.toJSON stock}"
               exit 1
             ''
         );
