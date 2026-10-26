@@ -2,9 +2,11 @@
 # Incus container. Through lxc-instance-common.nix, the stock profile imports installer/cd-dvd/channel.nix, on by
 # default, which copies all of nixpkgs (324 MiB) into the image and into the store at every evaluation of the system:
 # an evaluation of rke2lab's node image went from 174 s to 13 s without it (2026-10-26). Our machines evaluate flakes,
-# not channels. lib.noInstallerChannel keeps it off.
+# not channels. lib.noInstallerChannel keeps it off. Nor do they run nixos-rebuild: clone-config's
+# /etc/nixos/configuration.nix, which the stock profile also writes, is dead in them.
 { modulesPath, ... }:
 {
   imports = [ "${modulesPath}/virtualisation/lxc-container.nix" ];
   system.installer.channel.enable = false;
+  installer.cloneConfig = false;
 }
