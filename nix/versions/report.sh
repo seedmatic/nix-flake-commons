@@ -83,9 +83,12 @@ fi
 # The flag is padded as its own column of width 1 (jq's length counts the ⚠ as one character).
 jq -r -s '
   def pad($w): . + (" " * ([$w - length, 0] | max));
+  # The table shows a source as `<repo>:<file name>` (the JSONL keeps the full path): a source is a file a bump edits,
+  # and its directories only make the column wide. A `#…` locator (a lock input) is kept.
+  def short: (split(":") | .[0]) as $repo | (.[($repo | length) + 1:] | split("/") | last) as $file | "\($repo):\($file)";
   ([["", "WORLD", "NAME", "PINNED", "LATEST", "LEVEL", "STATUS", "SOURCE"]]
    + [.[] | [ (if .level == "major" and .status == "behind" then "⚠" else "" end),
-              .world, .name, (.pinned | .[0:24]), ((.latest // "?") | .[0:24]), (.level // "-"), .status, .source ]])
+              .world, .name, (.pinned | .[0:24]), ((.latest // "?") | .[0:24]), (.level // "-"), .status, (.source | short) ]])
   | . as $rows
   | [range(0; $rows[0] | length) as $c | [$rows[][$c] | length] | max] as $w
   | $rows[] | [range(0; length) as $c | .[$c] | pad($w[$c])] | join("  ") | sub(" +$"; "")
