@@ -87,7 +87,7 @@
   # A pass runs ONE tool everywhere, and that tool is known by its CODE, not by this repo's revision:
   # a commit here that touches none of its files must not make every head read as running another
   # relock.
-  outputs = { self, nixpkgs, flake-utils, home-manager, ... }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils, home-manager, ... }:
     let
       relockToolId = builtins.hashString "sha256" (
         builtins.concatStringsSep "" (map builtins.readFile [
@@ -111,6 +111,26 @@
       # A check each seedmatic flake runs on its own nixosConfigurations: no installer channel, which copies all of
       # nixpkgs at every evaluation of the system.
       lib.noInstallerChannel = pkgs: configurations: import ./nix/no-installer-channel.nix { inherit pkgs configurations; };
+      # The version contract (nix/versions/schema.json) and the nix world's lines in it: a consumer declares its carriers
+      # as `versions.carriers` and turns them into lines with this; the report merges every world.
+      lib.versionLines = import ./nix/versions/lines.nix { inherit (nixpkgs) lib; };
+      lib.versionSchema = ./nix/versions/schema.json;
+      # flake-commons' own carriers: the two nixpkgs every seedmatic flake follows, read through the root inputs.
+      # `latest` of the stable nixpkgs is its release branch's head, which only the report app reads (the network).
+      versions.carriers = [
+        {
+          name = "nixpkgs";
+          source = "nix-flake-commons:flake.lock#nixpkgs";
+          pinned = nixpkgs.rev or nixpkgs.lib.version;
+          upstream = "github:NixOS/nixpkgs#nixos-${nixpkgs.lib.trivial.release}";
+        }
+        {
+          name = "nixpkgs-unstable";
+          source = "nix-flake-commons:flake.lock#nixpkgs-unstable";
+          pinned = nixpkgs-unstable.rev or nixpkgs-unstable.lib.version;
+          upstream = "github:NixOS/nixpkgs#nixos-unstable";
+        }
+      ];
       # nixpkgs' lxc-container.nix without the installer channel: every seedmatic LXC or Incus image imports this one.
       nixosModules.lxc-container = ./nix/lxc-container.nix;
       # A head's relock APP built from THIS tool alone, on its nixpkgs: a pass builds every member's
@@ -139,6 +159,21 @@
       # This flake has no NixOS configuration of its own: the check runs on none, its mutants still read.
       checks.no-installer-channel = self.lib.noInstallerChannel pkgs { };
       # The shared profile turns the channel and clone-config off where nixpkgs' own leaves them on: options only.
+      # The version contract's comparison and schema, on fixtures.
+      checks.version-lines = import ./nix/versions/check.nix { inherit pkgs; versionLines = self.lib.versionLines; };
+      # The report: every world's lines merged, validated, sorted; the GitHub completion against stubs.
+      checks.versions-report =
+        let report = import ./nix/versions/report.nix { inherit pkgs; };
+        in pkgs.runCommand "versions-report-bats" { nativeBuildInputs = [ pkgs.bats pkgs.bash pkgs.coreutils pkgs.jq report ]; } ''
+          cp ${./nix/versions/report.bats} report.bats
+          HOME=$TMPDIR bats --print-output-on-failure report.bats
+          touch $out
+        '';
+      apps.versions-report = {
+        type = "app";
+        program = "${import ./nix/versions/report.nix { inherit pkgs; }}/bin/versions-report";
+        meta.description = "One report of every world's version lines (nix, clusters), in the contract of nix/versions/schema.json";
+      };
       checks.lxc-container-module =
         let
           leftovers =
