@@ -1,24 +1,24 @@
 {
   "schema": "seedmatic.relock/v1",
   "head": "flake-commons",
-  "rev": "dcad528a375a24e06fdfc6e1bbc3cbf11fb3e0f9",
+  "rev": "466afc9e843d7312b64e1295e3e17df1ea1aa7c5",
   "status": {
-    "wave": "flake-commons@2026-10-15T05:02:01Z",
-    "tool": "5dc283dbf05b6381aaeade7c72444f80b48a2b2c13bed1febcfdefcd243f0d64",
+    "wave": "flake-commons@2026-10-28T13:49:29Z",
+    "tool": "6625dd9228c531ccc31a2ab8112a9240110b3866f611bd80cff77e3894e02b59",
     "bumped": {
-      "flox": [
-        "af0fdbe58ab821decba7cd01f05fe26fb255aa53",
-        "8e41766d943cdd73e71da283cda3dff95a4820e9"
+      "nixpkgs-unstable": [
+        "55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+        "31ecbaca1bdefa45dffc409f0250bd8039ea0010"
       ],
       "nixpkgs": [
-        "7993f34ee47e28a3d607a525aadc6c94b73be728",
-        "a033e66ab94a6bedf2c3d58d93a36319d3cbbbaf"
+        "26f4107e47e3ad0ffd0db220469ba83b6f6d96e8",
+        "718f670e845328e9c2cecdd832835712b2cbd065"
       ]
     },
     "pruned": {},
     "dropped": [],
     "after": [],
     "unmeasured": [],
-    "seconds": 67
+    "seconds": 147
   }
 }
