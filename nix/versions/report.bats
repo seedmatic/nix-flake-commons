@@ -60,6 +60,19 @@ EOF
 	[[ "$output" != *'\x'* ]]
 }
 
+@test "the table shortens a source to its file name, the JSONL keeps the full path" {
+	printf '%s\n' '{"world":"clusters","name":"kubeVip","source":"rke2lab:osgi/domains/manifests/x/Component.java","pinned":"v1.3.1","latest":"v1.3.1","level":null,"status":"current","upstream":"none"}' >"$BATS_TEST_TMPDIR/long.jsonl"
+	run versions-report "$BATS_TEST_TMPDIR/long.jsonl"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"rke2lab:Component.java"* ]]
+	[[ "$output" != *"osgi/domains"* ]]
+	run versions-report --format=jsonl "$BATS_TEST_TMPDIR/long.jsonl"
+	[ "$(jq -r .source <<<"$output")" = "rke2lab:osgi/domains/manifests/x/Component.java" ]
+	run versions-report "$nix"
+	[[ "$output" == *"rke2lab:flake.lock#nixpkgs"* ]]
+	[[ "$output" == *"rke2lab:rke2-1-36.nix"* ]]
+}
+
 @test "the table's columns are aligned" {
 	run versions-report "$nix" "$clusters"
 	[ "$status" -eq 0 ]
