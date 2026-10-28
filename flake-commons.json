@@ -1,24 +1,44 @@
 {
   "schema": "seedmatic.relock/v1",
   "head": "flake-commons",
-  "rev": "466afc9e843d7312b64e1295e3e17df1ea1aa7c5",
+  "rev": "14645f4a9cdf96bed7aaced4d7710952fdfb8c61",
   "status": {
-    "wave": "flake-commons@2026-10-28T13:49:29Z",
+    "wave": "flake-commons@2026-10-28T13:49:40Z",
     "tool": "6625dd9228c531ccc31a2ab8112a9240110b3866f611bd80cff77e3894e02b59",
     "bumped": {
-      "nixpkgs-unstable": [
-        "55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
-        "31ecbaca1bdefa45dffc409f0250bd8039ea0010"
+      "darwin": [
+        "c3e90c89649b07d1a96e4b9dd6cd0d6e44b91a74",
+        "d31953cf55f9027a56e9be938daf5db8c5655663"
       ],
-      "nixpkgs": [
-        "26f4107e47e3ad0ffd0db220469ba83b6f6d96e8",
-        "718f670e845328e9c2cecdd832835712b2cbd065"
+      "flox": [
+        "ee4b114732bceedc341e0d9c3b9db7336c12f7f7",
+        "339bbab0b02028bd741da376a0e042b9f48f727d"
+      ],
+      "home-manager": [
+        "32904dfe1cf86039f3c8c9f41f94e1cfd76dbb34",
+        "24f2190587513b9c2f73db112a17844ae912d965"
+      ],
+      "impermanence": [
+        "7b1d382faf603b6d264f58627330f9faa5cba149",
+        "fa627f4c8b8e92f58f58a73d99ee4e1304e64eb2"
+      ],
+      "nixos-hardware": [
+        "60a624466c08787ee8303393b7d4752d1826f14f",
+        "8ba09466dc929acf5c8bb3e0cc40f472a7df3630"
+      ],
+      "nvfetcher": [
+        "e41af9779ea14adf1d8c3edb075713c2668d45b9",
+        "0e86fbbf93b56b344b6104443d317b16ca862ac9"
+      ],
+      "sops-nix": [
+        "44931708c62937c2b1bf7953902989fa5bb9ee1b",
+        "60182817ee048ac94b4c68ea76d5ef2e8aac730d"
       ]
     },
     "pruned": {},
     "dropped": [],
     "after": [],
     "unmeasured": [],
-    "seconds": 147
+    "seconds": 37
   }
 }
