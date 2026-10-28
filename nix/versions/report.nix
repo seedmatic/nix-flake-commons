@@ -10,7 +10,11 @@ pkgs.writeShellApplication {
     gnugrep
     jq
   ];
-  text = builtins.replaceStrings [ "@schema@" "@compareJq@" ] [ "${./schema.json}" "${./compare.jq}" ] (
+  text =
+    builtins.replaceStrings
+      [ "@schema@" "@compareJq@" "@highestJq@" ]
+      [ "${./schema.json}" "${./compare.jq}" "${./highest-release.jq}" ]
+      (
     builtins.readFile ./report.sh
   );
 }

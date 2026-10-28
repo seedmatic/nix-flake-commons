@@ -26,7 +26,9 @@ trap 'rm -rf "$work"' EXIT
 cat "${files[@]}" | grep -v '^[[:space:]]*$' >"$work/in.jsonl" || true
 
 # A GitHub head or release for the lines that need the network: `github:<owner>/<repo>#<branch>` reads the branch's
-# head commit; `github:<owner>/<repo>` reads the latest stable release's tag.
+# head commit; `github:<owner>/<repo>` reads the highest release whose tag IS a version (`v?X.Y(.Z)`, an optional
+# `+…` build suffix), never a draft or a prerelease. Not `releases/latest`: a repo that publishes two releases per
+# version (tektoncd/operator: `v0.81.2` and the chart's `tekton-operator-0.81.2`) points it at either.
 # VERSIONS_GITHUB_API names another API root (a test's local fixture); the default is GitHub's.
 api=${VERSIONS_GITHUB_API:-https://api.github.com}
 token=$(gh auth token 2>/dev/null || true)
@@ -45,7 +47,9 @@ while IFS= read -r line; do
     if [[ $ref == *#* ]]; then
       latest=$(github "repos/${ref%%#*}/commits/${ref#*#}" 2>/dev/null | jq -r '.sha // empty' || true)
     else
-      latest=$(github "repos/$ref/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' || true)
+      # The first page (30 releases, newest first) holds the highest version: no query string, so the path is the
+      # same against GitHub and a test's file:// fixture.
+      latest=$(github "repos/$ref/releases" 2>/dev/null | jq -r -f @highestJq@ || true)
     fi
     if [[ -n $latest ]]; then
       line=$(jq -c --arg l "$latest" '.latest = $l' <<<"$line")
