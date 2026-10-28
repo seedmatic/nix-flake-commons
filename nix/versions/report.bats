@@ -7,8 +7,11 @@ setup() {
 	# The GitHub API as local files: the app's own curl reads them through file://, no network, no stub on PATH
 	# (the app's PATH comes first). No token: there is no `gh` login in the sandbox.
 	api="$BATS_TEST_TMPDIR/api"
-	mkdir -p "$api/repos/rancher/rke2/releases"
-	printf '%s' '{"tag_name":"v1.36.5+rke2r1"}' >"$api/repos/rancher/rke2/releases/latest"
+	# A /releases list, as GitHub serves it (the app asks `releases`; curl reads it from file://).
+	mkdir -p "$api/repos/rancher/rke2" "$api/repos/tektoncd/operator"
+	printf '%s' '[{"tag_name":"v1.36.5+rke2r1","draft":false,"prerelease":false},{"tag_name":"v1.36.4+rke2r1","draft":false,"prerelease":false}]' >"$api/repos/rancher/rke2/releases"
+	# Two releases per version, the chart's tag listed first; a prerelease and a draft above both.
+	printf '%s' '[{"tag_name":"tekton-operator-0.81.2","draft":false,"prerelease":false},{"tag_name":"v0.81.2","draft":false,"prerelease":false},{"tag_name":"v0.82.0-rc.1","draft":false,"prerelease":true},{"tag_name":"v0.90.0","draft":true,"prerelease":false}]' >"$api/repos/tektoncd/operator/releases"
 	export VERSIONS_GITHUB_API="file://$api"
 	nix="$BATS_TEST_TMPDIR/nix.jsonl"
 	clusters="$BATS_TEST_TMPDIR/clusters.jsonl"
@@ -37,6 +40,15 @@ EOF
 	[ "$(jq -r .latest <<<"$rke2")" = "v1.36.5+rke2r1" ]
 	[ "$(jq -r .level <<<"$rke2")" = "micro" ]
 	[ "$(jq -r .status <<<"$rke2")" = "behind" ]
+}
+
+@test "a release tagged as a chart, a prerelease or a draft is never latest" {
+	printf '%s\n' '{"world":"clusters","name":"tektonOperator","source":"rke2lab:Component.java","pinned":"v0.81.1","latest":null,"level":null,"status":"unknown","upstream":"github:tektoncd/operator"}' >"$BATS_TEST_TMPDIR/tekton.jsonl"
+	run versions-report --format=jsonl "$BATS_TEST_TMPDIR/tekton.jsonl"
+	[ "$status" -eq 0 ]
+	[ "$(jq -r .latest <<<"$output")" = "v0.81.2" ]
+	[ "$(jq -r .status <<<"$output")" = "behind" ]
+	[ "$(jq -r .level <<<"$output")" = "micro" ]
 }
 
 @test "the table flags a major behind" {
