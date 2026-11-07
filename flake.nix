@@ -71,6 +71,11 @@
       url = "github:nxmatic/nix-maven-mvnd/develop";
     };
 
+    llm-agents = {
+      url = "github:numtide/llm-agents.nix";
+      inputs.nixpkgs.follows = "nixpkgs-unstable";
+    };
+
   };
 
   # The aggregator's first outputs: the shared `relock` tool, and this repo's own use of it.
